@@ -112,26 +112,6 @@ public final class SuperclassVisibility {
     }
 
     private func inheritanceNames(for sym: Symbol) -> [String] {
-        let collector = SuperInheritanceCollector(targetOffset: sym.declOffset)
-        collector.walk(sym.file.syntax)
-        return collector.collected
-    }
-}
-
-private final class SuperInheritanceCollector: SyntaxVisitor {
-    let targetOffset: Int
-    var collected: [String] = []
-    init(targetOffset: Int) {
-        self.targetOffset = targetOffset
-        super.init(viewMode: .sourceAccurate)
-    }
-    override func visit(_ node: ClassDeclSyntax) -> SyntaxVisitorContinueKind {
-        if node.name.positionAfterSkippingLeadingTrivia.utf8Offset == targetOffset {
-            if let inh = node.inheritanceClause {
-                for entry in inh.inheritedTypes { collected.append(entry.type.trimmedDescription) }
-            }
-            return .skipChildren
-        }
-        return .visitChildren
+        InheritanceClause.names(atOffset: sym.declOffset, in: sym.file.syntax)
     }
 }

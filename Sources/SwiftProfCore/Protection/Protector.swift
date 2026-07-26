@@ -320,10 +320,9 @@ public final class Protector {
     private var inheritanceCache: [Int: [String]] = [:]
     private func inheritanceNames(for sym: Symbol) -> [String] {
         if let cached = inheritanceCache[sym.id] { return cached }
-        let visitor = InheritanceCollector(targetOffset: sym.declOffset)
-        visitor.walk(sym.file.syntax)
-        inheritanceCache[sym.id] = visitor.collected
-        return visitor.collected
+        let names = InheritanceClause.names(atOffset: sym.declOffset, in: sym.file.syntax)
+        inheritanceCache[sym.id] = names
+        return names
     }
 
     /// Collect the EXTERNAL (stdlib/SDK, not-in-our-table) protocols `sym` conforms to, following
@@ -375,51 +374,6 @@ public final class Protector {
 
     public func reason(for sym: Symbol) -> String? {
         reasonForId[sym.id]
-    }
-}
-
-private final class InheritanceCollector: SwiftSyntax.SyntaxVisitor {
-    let targetOffset: Int
-    var collected: [String] = []
-    init(targetOffset: Int) {
-        self.targetOffset = targetOffset
-        super.init(viewMode: .sourceAccurate)
-    }
-    private func capture(_ inh: InheritanceClauseSyntax?) {
-        guard let inh else { return }
-        for entry in inh.inheritedTypes {
-            collected.append(entry.type.trimmedDescription)
-        }
-    }
-    override func visit(_ node: ClassDeclSyntax) -> SyntaxVisitorContinueKind {
-        if node.name.positionAfterSkippingLeadingTrivia.utf8Offset == targetOffset {
-            capture(node.inheritanceClause); return .skipChildren
-        }
-        return .visitChildren
-    }
-    override func visit(_ node: ActorDeclSyntax) -> SyntaxVisitorContinueKind {
-        if node.name.positionAfterSkippingLeadingTrivia.utf8Offset == targetOffset {
-            capture(node.inheritanceClause); return .skipChildren
-        }
-        return .visitChildren
-    }
-    override func visit(_ node: StructDeclSyntax) -> SyntaxVisitorContinueKind {
-        if node.name.positionAfterSkippingLeadingTrivia.utf8Offset == targetOffset {
-            capture(node.inheritanceClause); return .skipChildren
-        }
-        return .visitChildren
-    }
-    override func visit(_ node: EnumDeclSyntax) -> SyntaxVisitorContinueKind {
-        if node.name.positionAfterSkippingLeadingTrivia.utf8Offset == targetOffset {
-            capture(node.inheritanceClause); return .skipChildren
-        }
-        return .visitChildren
-    }
-    override func visit(_ node: ProtocolDeclSyntax) -> SyntaxVisitorContinueKind {
-        if node.name.positionAfterSkippingLeadingTrivia.utf8Offset == targetOffset {
-            capture(node.inheritanceClause); return .skipChildren
-        }
-        return .visitChildren
     }
 }
 

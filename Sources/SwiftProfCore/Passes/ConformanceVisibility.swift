@@ -87,53 +87,6 @@ public final class ConformanceVisibility {
     }
 
     private func inheritanceNames(for sym: Symbol) -> [String] {
-        let collector = ConfInheritanceCollector(targetOffset: sym.declOffset)
-        collector.walk(sym.file.syntax)
-        return collector.collected
-    }
-}
-
-private final class ConfInheritanceCollector: SyntaxVisitor {
-    let targetOffset: Int
-    var collected: [String] = []
-    init(targetOffset: Int) {
-        self.targetOffset = targetOffset
-        super.init(viewMode: .sourceAccurate)
-    }
-    private func capture(_ inh: InheritanceClauseSyntax?) {
-        guard let inh else { return }
-        for entry in inh.inheritedTypes {
-            collected.append(entry.type.trimmedDescription)
-        }
-    }
-    override func visit(_ node: ClassDeclSyntax) -> SyntaxVisitorContinueKind {
-        if node.name.positionAfterSkippingLeadingTrivia.utf8Offset == targetOffset {
-            capture(node.inheritanceClause); return .skipChildren
-        }
-        return .visitChildren
-    }
-    override func visit(_ node: ActorDeclSyntax) -> SyntaxVisitorContinueKind {
-        if node.name.positionAfterSkippingLeadingTrivia.utf8Offset == targetOffset {
-            capture(node.inheritanceClause); return .skipChildren
-        }
-        return .visitChildren
-    }
-    override func visit(_ node: StructDeclSyntax) -> SyntaxVisitorContinueKind {
-        if node.name.positionAfterSkippingLeadingTrivia.utf8Offset == targetOffset {
-            capture(node.inheritanceClause); return .skipChildren
-        }
-        return .visitChildren
-    }
-    override func visit(_ node: EnumDeclSyntax) -> SyntaxVisitorContinueKind {
-        if node.name.positionAfterSkippingLeadingTrivia.utf8Offset == targetOffset {
-            capture(node.inheritanceClause); return .skipChildren
-        }
-        return .visitChildren
-    }
-    override func visit(_ node: ProtocolDeclSyntax) -> SyntaxVisitorContinueKind {
-        if node.name.positionAfterSkippingLeadingTrivia.utf8Offset == targetOffset {
-            capture(node.inheritanceClause); return .skipChildren
-        }
-        return .visitChildren
+        InheritanceClause.names(atOffset: sym.declOffset, in: sym.file.syntax)
     }
 }
