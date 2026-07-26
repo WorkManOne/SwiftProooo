@@ -142,9 +142,7 @@ public final class OverrideLinker {
     /// Module-aware, fail-closed class lookup (same discipline as
     /// `SuperclassVisibility.preferredClass` / `ConformanceVisibility.preferredProtocol`).
     private func preferredClass(named name: String, forModule module: String) -> Symbol? {
-        let classes = table.types(named: name).filter { $0.kind == .class }
-        if let same = classes.first(where: { $0.module.name == module }) { return same }
-        return classes.count == 1 ? classes[0] : nil
+        table.preferredType(kind: .class, named: name, inModule: module)
     }
 
     /// Method signature compatibility for override pairing: external labels equal and no KNOWN

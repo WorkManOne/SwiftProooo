@@ -183,6 +183,18 @@ public final class SymbolTable {
         typesByName[name] ?? []
     }
 
+    /// Module-aware, fail-closed pick of the type of `kind` named `name`: the same-module candidate
+    /// wins; otherwise a UNIQUE cross-module candidate; otherwise nil (never guess among several).
+    /// One implementation for the inheritance-chain passes — `.class` for SuperclassVisibility /
+    /// OverrideLinker, `.protocol` for ConformanceVisibility / WitnessLinker / Protector. NOT for
+    /// use-site concrete-type resolution, which is `TypeResolver.preferredConcreteType` (that also
+    /// consults the USR index, A4). `module` is the `--module` LABEL by design in this syntactic tier.
+    public func preferredType(kind: SymbolKind, named name: String, inModule module: String) -> Symbol? {
+        let cands = types(named: name).filter { $0.kind == kind }
+        if let same = cands.first(where: { $0.module.name == module }) { return same }
+        return cands.count == 1 ? cands[0] : nil
+    }
+
     /// All function/method symbols with the given name (overload search index — C-2).
     public func callables(named name: String) -> [Symbol] {
         callablesByName[name] ?? []

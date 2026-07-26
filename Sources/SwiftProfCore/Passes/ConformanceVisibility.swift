@@ -79,9 +79,7 @@ public final class ConformanceVisibility {
     /// candidate wins; a single cross-module candidate is accepted; multiple cross-module candidates
     /// with none in `module` are ambiguous → nil (never `.first`).
     static func preferredProtocol(in table: SymbolTable, named name: String, forModule module: String) -> Symbol? {
-        let protos = table.types(named: name).filter { $0.kind == .protocol }
-        if let same = protos.first(where: { $0.module.name == module }) { return same }
-        return protos.count == 1 ? protos[0] : nil
+        table.preferredType(kind: .protocol, named: name, inModule: module)
     }
 
     private func preferredProtocol(named name: String, forModule module: String) -> Symbol? {
