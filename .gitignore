@@ -5,3 +5,11 @@ Package.resolved
 .DS_Store
 out/
 Temp.swift
+
+# Not tracked: docs/reports and the large end-to-end sample-app fixtures (kept on
+# disk for manual CLI runs; the automated SwiftProfCoreTests suite does not use them).
+*.docx
+/docs/
+/Tests/IceTrays/
+/Tests/IceTrays1/
+/Tests/PullTheTicket/
