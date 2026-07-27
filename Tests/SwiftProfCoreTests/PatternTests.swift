@@ -1470,6 +1470,36 @@ final class PatternTests: XCTestCase {
                        "every `.alpha` shorthand (default value + call arg) must be rewritten:\n\(r)")
     }
 
+    func testProtocolDefaultImpl_bareCallInsideDefaultBody_rewritesToSharedObf() throws {
+        // The "default arguments for a protocol requirement" idiom: the requirement has no
+        // defaults, the protocol's OWN extension declares the same signature WITH defaults and
+        // forwards to the witness by a BARE call. That bare call sees two same-named candidates
+        // (requirement + default impl) that no argument signal can tell apart, so
+        // `disambiguateByArgTypes` returned nil and the call was left original — while both decls
+        // renamed to the SAME obf (WitnessLinker.linkProtocolDefaults) → "cannot find 'f1' in
+        // scope". Same-obf candidates are ambiguous to PICK but unambiguous in OUTCOME; the
+        // member-access form already knew that (`resolveMemberForUse`), the bare-call form did not.
+        let source = """
+        enum E1 { case alpha, beta }
+        protocol P1 {
+            func f1(for par1: E1, par2: Bool)
+        }
+        extension P1 {
+            func f1(for par1: E1 = .alpha, par2: Bool = true) {
+                f1(for: par1, par2: par2)
+            }
+        }
+        """
+        let r = try runPipeline(source)
+        let declObf = try firstGroup(#"func (\w+)\(for "#, in: r)
+        let callObf = try firstGroup(#"(\w+)\(for: "#, in: r)
+        XCTAssertNotEqual(callObf, "f1", "the forwarding bare call must be obfuscated:\n\(r)")
+        XCTAssertEqual(callObf, declObf,
+                       "bare call must rewrite to the shared requirement/default obf:\n\(r)")
+        XCTAssertFalse(r.contains("f1("),
+                       "no f1 may survive (requirement, default impl, forwarding call):\n\(r)")
+    }
+
     func testOverload_trailingDefaultedParam_callResolvesToCorrectOverload() throws {
         // Two `handle` overloads: `handle(_ url: URL, with: = [:]) -> Bool` and `handle(_ p: S2)`.
         // A call `handle(u)` with u: URL must resolve to the URL overload. The defaulted `with:`

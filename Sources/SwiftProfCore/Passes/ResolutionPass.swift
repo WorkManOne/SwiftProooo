@@ -835,6 +835,19 @@ private final class ResolutionVisitor: SyntaxVisitor {
         return labels
     }
 
+    /// The rewrite target when EVERY same-named candidate maps to the SAME obf: ambiguous to PICK,
+    /// unambiguous in OUTCOME, so rewrite to it instead of failing closed. This is how an
+    /// obf-unified group resolves — a protocol requirement unified with its own default
+    /// implementation (`WitnessLinker.linkProtocolDefaults`), a requirement unified with its
+    /// witnesses, an override chain unified by `OverrideLinker` — where no argument signal can ever
+    /// tell the candidates apart because their signatures are identical by construction.
+    /// Returns nil when the candidates disagree (or none is renamed): the caller then
+    /// disambiguates / fails closed as before.
+    private func unambiguousSharedObfTarget(_ candidates: [Symbol]) -> Symbol? {
+        guard let first = candidates.first, let firstObf = map.obf(for: first) else { return nil }
+        return candidates.allSatisfy { map.obf(for: $0) == firstObf } ? first : nil
+    }
+
     /// Resolve a function call to a unique Symbol. First matches argument labels: prefers
     /// candidates visible in the scope chain, falls back to a global search (inherited / cross-
     /// type / extension overloads we don't model in the scope tree). When labels alone leave more
@@ -856,6 +869,7 @@ private final class ResolutionVisitor: SyntaxVisitor {
         }
         if scopeMatches.count == 1 { return scopeMatches[0] }
         if scopeMatches.count > 1 {
+            if let shared = unambiguousSharedObfTarget(scopeMatches) { return shared }
             let r = disambiguateByArgTypes(scopeMatches, call: call)
             reportOverloadProblem(name: name, call: call, candidates: scopeMatches, result: r)
             return r
@@ -885,6 +899,7 @@ private final class ResolutionVisitor: SyntaxVisitor {
             return argTypesContradict(globalMatches[0], call: call) ? nil : globalMatches[0]
         }
         if globalMatches.count > 1 {
+            if let shared = unambiguousSharedObfTarget(globalMatches) { return shared }
             let r = disambiguateByArgTypes(globalMatches, call: call)
             reportOverloadProblem(name: name, call: call, candidates: globalMatches, result: r)
             return r
@@ -909,11 +924,7 @@ private final class ResolutionVisitor: SyntaxVisitor {
             s = cur.parent
         }
         if candidates.count <= 1 { return target }   // not overloaded — safe
-        // All candidates share one obf ⇒ the rewrite target is unambiguous.
-        if let firstObf = map.obf(for: candidates[0]),
-           candidates.allSatisfy({ map.obf(for: $0) == firstObf }) {
-            return candidates[0]
-        }
+        if let shared = unambiguousSharedObfTarget(candidates) { return shared }
         // Overloaded with differing obfs — only rename if the expected function type picks exactly
         // one. Look for the enclosing `let/var x: (A, B) -> R = <ref>` annotation.
         guard let expected = expectedFunctionParamTypeNames(around: node) else { return nil }
@@ -1292,15 +1303,10 @@ private final class ResolutionVisitor: SyntaxVisitor {
     private func resolveMemberForUse(_ name: String, in typeScope: Scope, node: MemberAccessExprSyntax) -> Symbol? {
         let candidates = typeScope.members(named: name)
         if candidates.count <= 1 { return candidates.first }
-        // If EVERY same-named candidate maps to the SAME obf, the rewrite target is unambiguous no
-        // matter which overload the compiler selects — rewrite to it without disambiguating. This is
-        // how a protocol requirement unified with its own default implementation (WitnessLinker,
-        // `linkProtocolDefaults`) resolves: two candidates, one obf, and the call (possibly with a
-        // defaulted label omitted, which `labelsMatch` can't model) still rewrites correctly.
-        if let firstObf = map.obf(for: candidates[0]),
-           candidates.allSatisfy({ map.obf(for: $0) == firstObf }) {
-            return candidates[0]
-        }
+        // Checked BEFORE label filtering on purpose: a call may omit a defaulted label in a way
+        // `labelsMatch` can't model, and when every candidate shares one obf the outcome is right
+        // regardless of which overload the compiler selects.
+        if let shared = unambiguousSharedObfTarget(candidates) { return shared }
         guard candidates.allSatisfy({ Self.isCallable($0.kind) }), let call = enclosingCall(of: node) else {
             return nil
         }
