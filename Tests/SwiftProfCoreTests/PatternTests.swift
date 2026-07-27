@@ -1515,6 +1515,38 @@ final class PatternTests: XCTestCase {
         XCTAssertFalse(r.contains(".beta"), "returned `.beta` must be rewritten:\n\(r)")
     }
 
+    func testBareCall_innerScopeShadowsSameNamedGlobalFunction() throws {
+        // Swift's unqualified lookup STOPS at the innermost scope that declares the name: a member
+        // shadows a same-named global function entirely (verified with swiftc: calling the global's
+        // signature from inside the type is an error, not a fallback). `resolveCall` instead
+        // flattened candidates from EVERY scope level into one overload set, so the top-level
+        // `f2` joined the protocol's requirement + default impl. Three candidates with IDENTICAL
+        // signatures: no argument signal can separate them, and they do NOT all share one obf (the
+        // global has its own), so the shared-obf shortcut missed too → the forwarding call stayed
+        // original while both protocol decls renamed ⇒ "cannot find 'f2' in scope".
+        let source = """
+        enum E1 { case alpha, beta }
+        func f2(for par1: E1, par2: Bool) {}
+        protocol P1 {
+            func f2(for par1: E1, par2: Bool)
+        }
+        extension P1 {
+            func f2(for par1: E1 = .alpha, par2: Bool = true) {
+                f2(for: par1, par2: par2)
+            }
+        }
+        """
+        let r = try runPipeline(source)
+        let globalObf = try firstGroup(#"\nfunc (\w+)\(for "#, in: r)
+        let requirementObf = try firstGroup(#"protocol \w+ \{\n\s+func (\w+)\(for "#, in: r)
+        let callObf = try firstGroup(#"\n\s+(\w+)\(for: "#, in: r)
+        XCTAssertNotEqual(callObf, "f2", "the forwarding call must be obfuscated:\n\(r)")
+        XCTAssertEqual(callObf, requirementObf,
+                       "call must resolve to the protocol member that SHADOWS the global:\n\(r)")
+        XCTAssertNotEqual(callObf, globalObf,
+                          "call must NOT resolve to the shadowed global function:\n\(r)")
+    }
+
     func testProtocolDefaultImpl_bareCallInsideDefaultBody_rewritesToSharedObf() throws {
         // The "default arguments for a protocol requirement" idiom: the requirement has no
         // defaults, the protocol's OWN extension declares the same signature WITH defaults and

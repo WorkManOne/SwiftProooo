@@ -835,6 +835,37 @@ private final class ResolutionVisitor: SyntaxVisitor {
         return labels
     }
 
+    /// Same-named callables visible from `currentScope`, honouring LEXICAL SHADOWING: Swift's
+    /// unqualified lookup stops at the INNERMOST scope that declares the name, so an inner
+    /// declaration hides same-named outer ones ENTIRELY. Verified against swiftc: with a global
+    /// `func f(_ x: String)` and a member `func f(_ x: Int)`, the call `f("a")` inside the type is
+    /// an error, NOT a fallback to the global. So candidate sets must never straddle scope levels.
+    ///
+    /// Flattening every level into one overload set (the old behaviour) made an unrelated outer
+    /// namesake a phantom candidate. When its signature is IDENTICAL to the inner ones, no argument
+    /// signal can eliminate it and no shared obf covers it, so the call resolved to nothing and was
+    /// left original while its decls renamed. `Scope.lookup` already stops at the innermost level;
+    /// these callable walks are the two places that did not.
+    ///
+    /// `accept` filters WITHIN a level (label matching for calls). A level whose declarations all
+    /// fail `accept` is skipped rather than treated as a stop: strict Swift would stop and reject
+    /// the call, but our label model is incomplete (variadics), so skipping keeps the pre-existing
+    /// behaviour for shapes we cannot model instead of losing a rename.
+    private func lexicalCallableCandidates(named name: String,
+                                           accept: (Symbol) -> Bool = { _ in true }) -> [Symbol] {
+        var s: Scope? = currentScope
+        var seen = Set<Int>()
+        while let cur = s {
+            var level: [Symbol] = []
+            for sym in cur.symbols where sym.name == name && Self.isCallable(sym.kind) {
+                if seen.insert(sym.id).inserted, accept(sym) { level.append(sym) }
+            }
+            if !level.isEmpty { return level }
+            s = cur.parent
+        }
+        return []
+    }
+
     /// The rewrite target when EVERY same-named candidate maps to the SAME obf: ambiguous to PICK,
     /// unambiguous in OUTCOME, so rewrite to it instead of failing closed. This is how an
     /// obf-unified group resolves — a protocol requirement unified with its own default
@@ -856,16 +887,8 @@ private final class ResolutionVisitor: SyntaxVisitor {
     private func resolveCall(name: String, call: FunctionCallExprSyntax) -> Symbol? {
         let callLabels = Self.argumentLabels(of: call)
         let trailingStart = call.arguments.count
-        var scopeMatches: [Symbol] = []
-        var seen = Set<Int>()
-        var s: Scope? = currentScope
-        while let cur = s {
-            for sym in cur.symbols where sym.name == name && Self.isCallable(sym.kind) {
-                if !seen.contains(sym.id), labelsMatch(sym, callLabels, trailingStart: trailingStart) {
-                    scopeMatches.append(sym); seen.insert(sym.id)
-                }
-            }
-            s = cur.parent
+        let scopeMatches = lexicalCallableCandidates(named: name) {
+            labelsMatch($0, callLabels, trailingStart: trailingStart)
         }
         if scopeMatches.count == 1 { return scopeMatches[0] }
         if scopeMatches.count > 1 {
@@ -914,15 +937,7 @@ private final class ResolutionVisitor: SyntaxVisitor {
     /// decide, return nil (fail closed — never guess between overloads).
     private func resolveBareCallableReference(name: String, target: Symbol,
                                               node: DeclReferenceExprSyntax) -> Symbol? {
-        var candidates: [Symbol] = []
-        var seen = Set<Int>()
-        var s: Scope? = currentScope
-        while let cur = s {
-            for sym in cur.symbols where sym.name == name && Self.isCallable(sym.kind) {
-                if seen.insert(sym.id).inserted { candidates.append(sym) }
-            }
-            s = cur.parent
-        }
+        let candidates = lexicalCallableCandidates(named: name)
         if candidates.count <= 1 { return target }   // not overloaded — safe
         if let shared = unambiguousSharedObfTarget(candidates) { return shared }
         // Overloaded with differing obfs — only rename if the expected function type picks exactly
