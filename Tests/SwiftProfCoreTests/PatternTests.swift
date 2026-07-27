@@ -2934,4 +2934,52 @@ final class PatternTests: XCTestCase {
         XCTAssertFalse(rewritten.contains("render"),
                        "member on a var typed via a qualified constructor must resolve + rename:\n\(rewritten)")
     }
+
+    // MARK: - Diagnostics report (SURV lines)
+
+    /// Runs the pipeline with `--diagnose-overloads` and returns the contents of `Diagnostics.txt`.
+    private func runPipelineDiagnostics(_ source: String, moduleName: String = "M",
+                                        file: String = "Sample.swift") throws -> String {
+        let tempRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SwiftProf-\(UUID().uuidString)")
+        let moduleRoot = tempRoot.appendingPathComponent(moduleName)
+        try FileManager.default.createDirectory(at: moduleRoot, withIntermediateDirectories: true)
+        try source.write(to: moduleRoot.appendingPathComponent(file), atomically: true, encoding: .utf8)
+        let outputDir = tempRoot.appendingPathComponent("out")
+
+        let options = PipelineOptions(
+            modules: [ModuleSpec(name: moduleName, root: moduleRoot, writable: true)],
+            outputDirectory: outputDir, dryRun: false,
+            nameStyle: .debug, introspectSDK: false,
+            diagnoseOverloads: true
+        )
+        _ = try Pipeline(options: options, logger: StderrLogger(verbose: false)).run()
+        return try String(contentsOf: outputDir.appendingPathComponent("Diagnostics.txt"), encoding: .utf8)
+    }
+
+    /// A missed use-site whose name is NOT shielded: rollback reverts the group, the build stays
+    /// green, and the diagnostics name the coverage loss.
+    func testDiagnostics_unshieldedSurvivor_reportedAsReverted() throws {
+        let source = """
+        struct Box { var widgetPayload: Int = 0 }
+        func take(_ x: SomeExternalThing) -> Int { return x.widgetPayload }
+        """
+        let diag = try runPipelineDiagnostics(source)
+        XCTAssertTrue(diag.contains("SURV reverted name=\(Anon.of("widgetPayload"))"),
+                      "unshielded survivor must be reported as reverted:\n\(diag)")
+    }
+
+    /// The case `--diagnose-overloads` alone cannot see: the use-site was missed AND a shield stops
+    /// the rollback, so the desync ships. `camera` is an Apple API name (shield 1c), so the renamed
+    /// local property is NOT reverted while the surviving use-site keeps the original name.
+    func testDiagnostics_shieldedSurvivor_reportedAsBlockedRedBuildRisk() throws {
+        let source = """
+        struct Box { var camera: Int = 0 }
+        func take(_ x: SomeExternalThing) -> Int { return x.camera }
+        """
+        let diag = try runPipelineDiagnostics(source)
+        let line = diag.split(separator: "\n").first { $0.contains("SURV blocked name=\(Anon.of("camera"))") }
+        XCTAssertNotNil(line, "shielded survivor must be reported in the high-signal tier:\n\(diag)")
+        XCTAssertTrue(line?.contains("shield=1c") == true, "shield must be named: \(line ?? "")")
+    }
 }

@@ -352,8 +352,12 @@ public final class Pipeline {
         AmbiguityRollback(table: table, logger: logger).run(map: map, files: project.files)
         logger.log("after ambiguity rollback: \(map.obfBySymbolId.count)")
 
+        // Diagnostics go to a FILE, not the console: they are grepped after the run and can be
+        // thousands of lines, which would bury the progress output they are mixed into.
+        let diagnostics: DiagnosticsLog? = options.diagnoseOverloads ? DiagnosticsLog() : nil
         var renames = ResolutionPass(table: table, map: map, logger: logger,
                                      diagnoseOverloads: options.diagnoseOverloads,
+                                     diagnostics: diagnostics,
                                      indexContext: indexContext).run(on: project.files)
         logger.log("rename edits: \(renames.count)")
 
@@ -377,7 +381,8 @@ public final class Pipeline {
         if options.rollbackEnabled {
             let rolledBack = RollbackPass(
                 table: table, map: map, stdlibRegistry: registry, logger: logger,
-                aggressive: options.aggressiveRollback
+                aggressive: options.aggressiveRollback, diagnose: options.diagnoseOverloads,
+                diagnostics: diagnostics
             ).run(on: project.files)
             if rolledBack > 0 {
                 logger.log("rollback: \(rolledBack) names reverted")
@@ -394,6 +399,13 @@ public final class Pipeline {
         try conversion.write(to: options.outputDirectory.appendingPathComponent("ConversionMap.json"))
         let coverage = CoverageReport(table: table, map: map, protector: protector)
         try coverage.write(to: options.outputDirectory.appendingPathComponent("CoverageReport.txt"))
+
+        if let diagnostics, !diagnostics.isEmpty {
+            let written = try diagnostics.write(toDirectory: options.outputDirectory)
+            logger.log("wrote \(written.diagnostics) diagnostic lines to "
+                       + "\(options.outputDirectory.appendingPathComponent("Diagnostics.txt").path)"
+                       + " (--diagnose-overloads)")
+        }
 
         if options.explain {
             let decisions = DecisionReport(table: table, map: map, protector: protector,

@@ -9,15 +9,19 @@ public final class ResolutionPass {
     public let map: RenameMap
     public let logger: Logger
     public let diagnoseOverloads: Bool
+    /// Where `OVLD` lines go. Separate from `logger` on purpose: diagnostics are a grepped artifact
+    /// (`Diagnostics.txt`), progress output is read live. nil ⇒ fall back to `logger`.
+    public let diagnostics: Logger?
     /// A4 USR ground-truth, when `indexStorePath` is set. nil ⇒ syntactic resolution only.
     public let indexContext: IndexContext?
 
     public init(table: SymbolTable, map: RenameMap, logger: Logger, diagnoseOverloads: Bool = false,
-                indexContext: IndexContext? = nil) {
+                diagnostics: Logger? = nil, indexContext: IndexContext? = nil) {
         self.table = table
         self.map = map
         self.logger = logger
         self.diagnoseOverloads = diagnoseOverloads
+        self.diagnostics = diagnostics
         self.indexContext = indexContext
     }
 
@@ -41,7 +45,7 @@ public final class ResolutionPass {
         for file in files where file.module.writable {
             guard let fileScope = table.fileScopes[ObjectIdentifier(file)] else { continue }
             let visitor = ResolutionVisitor(file: file, table: table, map: map, fileScope: fileScope,
-                                            logger: logger, diagnose: diagnoseOverloads,
+                                            diagLog: diagnostics ?? logger, diagnose: diagnoseOverloads,
                                             indexContext: indexContext)
             visitor.walk(file.syntax)
             renames.append(contentsOf: visitor.renames)
@@ -55,7 +59,8 @@ private final class ResolutionVisitor: SyntaxVisitor {
     let file: SourceFile
     let table: SymbolTable
     let map: RenameMap
-    let logger: Logger
+    /// Diagnostics sink (`Diagnostics.txt` when set by the pipeline), NOT the progress logger.
+    let diagLog: Logger
     let diagnose: Bool
     let typeResolver: TypeResolver
     /// Cache of module-scoped resolvers (`resolveParamType` / `typealiasUnwrap` need a resolver in
@@ -90,12 +95,12 @@ private final class ResolutionVisitor: SyntaxVisitor {
     private let useSiteFilePath: String?
     private let useSiteConverter: SourceLocationConverter?
 
-    init(file: SourceFile, table: SymbolTable, map: RenameMap, fileScope: Scope, logger: Logger,
+    init(file: SourceFile, table: SymbolTable, map: RenameMap, fileScope: Scope, diagLog: Logger,
          diagnose: Bool = false, indexContext: IndexContext? = nil) {
         self.file = file
         self.table = table
         self.map = map
-        self.logger = logger
+        self.diagLog = diagLog
         self.diagnose = diagnose
         self.indexContext = indexContext
         // Build the converter only when the index is engaged (it parses positions; skip the cost
@@ -126,21 +131,14 @@ private final class ResolutionVisitor: SyntaxVisitor {
     /// Deterministic anonymizing hash for a source identifier — keeps NDA logs leak-free while
     /// staying stable across log lines so the same symbol reads as the same `#token`. Common
     /// stdlib type names pass through unchanged (not sensitive, useful signal).
-    private static let anonPassthrough: Set<String> = [
-        "String", "Int", "Bool", "Double", "Float", "CGFloat", "Data", "Date", "URL", "UUID",
-        "Void", "Any", "AnyObject", "Character", "Substring", "TimeInterval", "_"
-    ]
-    private func anon(_ s: String) -> String {
-        if Self.anonPassthrough.contains(s) { return s }
-        var h: UInt64 = 1469598103934665603
-        for b in s.utf8 { h = (h ^ UInt64(b)) &* 1099511628211 }
-        return "#" + String(h & 0xFFFFFF, radix: 16)
-    }
+    /// Shared with every other diagnostic emitter (see `Anon`) so the same identifier hashes to the
+    /// same token in `OVLD` and `SURV` lines and the two can be correlated without real names.
+    private func anon(_ s: String) -> String { Anon.of(s) }
     private func anonLabels(_ labels: [String?]) -> String {
         "[" + labels.map { $0.map { anon($0) } ?? "_" }.joined(separator: ",") + "]"
     }
     private func diag(_ msg: @autoclosure () -> String) {
-        if diagnose { logger.log("OVLD \(msg())") }
+        if diagnose { diagLog.log("OVLD \(msg())") }
     }
 
     private var currentScope: Scope { scopeStack.last! }
@@ -1150,7 +1148,7 @@ private final class ResolutionVisitor: SyntaxVisitor {
 
         let off = call.calledExpression.positionAfterSkippingLeadingTrivia.utf8Offset
         let renamedDetails = renamed.map { describeCandidateFit($0, call: call) }.joined(separator: " ; ")
-        logger.log("OVLD unresolved name=\(anon(name)) off=\(off) labels=\(anonLabels(Self.argumentLabels(of: call))) cands=\(candidates.count) renamed=\(renamed.count): \(renamedDetails)")
+        diagLog.log("OVLD unresolved name=\(anon(name)) off=\(off) labels=\(anonLabels(Self.argumentLabels(of: call))) cands=\(candidates.count) renamed=\(renamed.count): \(renamedDetails)")
     }
 
     /// Per-arg fit detail for a single candidate (recomputes scoring locally) — only used by the
