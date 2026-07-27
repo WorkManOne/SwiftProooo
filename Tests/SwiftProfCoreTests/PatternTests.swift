@@ -2751,4 +2751,80 @@ final class PatternTests: XCTestCase {
         XCTAssertTrue(rewritten.contains("raw[0]") || rewritten.range(of: #"p\d+\[0\]"#, options: .regularExpression) != nil,
                       "external subscript must be left as-is (base may rename, result must not be guessed):\n\(rewritten)")
     }
+
+    // MARK: - Declaring-scope resolution of stored type names (nested types)
+
+    /// A member's stored declared-type name is written relative to ITS declaring scope: a bare
+    /// nested type (`var leaf: Leaf` inside `enum Box`) is invisible from any other scope. Resolving
+    /// it from the use-site (`Holder`) failed → `branch.leaf.payload` didn't resolve → desync.
+    /// Must resolve `Leaf` in the member's declaring scope so the chain (and `payload`) renames.
+    func testMemberChain_memberTypedAsSiblingNestedType_resolvesInDeclaringScope() throws {
+        let source = """
+        enum Box {
+            struct Leaf { var payload: Int }
+            struct Branch { var leaf: Leaf }
+        }
+        final class Holder {
+            var branch: Box.Branch
+            init(branch: Box.Branch) { self.branch = branch }
+            func read() -> Int { return branch.leaf.payload }
+        }
+        """
+        let rewritten = try runPipeline(source)
+        XCTAssertFalse(rewritten.contains("var leaf"), "intermediate nested-type member must be renamed")
+        XCTAssertFalse(rewritten.contains("payload"),
+                       "member reached through a nested-type-typed member must resolve + rename:\n\(rewritten)")
+    }
+
+    /// The reported bug in full: a `var` with an INFERRED type (from a typealias-named constructor),
+    /// a member chain through NESTED types whose members are written with UNQUALIFIED nested type
+    /// names, then a collection SUBSCRIPT, then an optional-chained mutating call. Every layer must
+    /// resolve so the mutating func renames at the subscript use-site.
+    func testSubscriptElement_throughNestedTypeChain_typealiasInferredVar_resolves() throws {
+        let source = """
+        enum E1 {
+            enum E2 { case a, b }
+            struct S1 {
+                let par2: E2
+                var flag: Bool
+                mutating func mutate(flag: Bool) { self.flag = flag }
+            }
+            struct S3 { var items: [S1] }
+            struct S2 { var box: S3 }
+        }
+        extension Collection { subscript(safe i: Index) -> Element? { indices.contains(i) ? self[i] : nil } }
+        final class Engine {
+            typealias A3 = E1.S3
+            typealias A2 = E1.S2
+            private var root = A2(box: A3(items: []))
+            func run() {
+                root.box.items.indices.forEach {
+                    root.box.items[safe: $0]?.mutate(flag: true)
+                }
+            }
+        }
+        """
+        let rewritten = try runPipeline(source)
+        XCTAssertFalse(rewritten.contains("func mutate"), "mutating func decl must be renamed")
+        XCTAssertFalse(rewritten.contains("mutate"),
+                       "mutating func at the subscript-through-nested-chain use-site must be renamed:\n\(rewritten)")
+    }
+
+    /// A `var` whose type is inferred from a QUALIFIED constructor call (`NS.Widget(...)`) must get
+    /// that type, so a member on it (`w.render()`) resolves. (Bare `Widget(...)` already worked; the
+    /// member-access callee `NS.Widget` was previously mistaken for a method call → no inference.)
+    func testTypeInference_qualifiedConstructorInitializer_resolves() throws {
+        let source = """
+        enum NS {
+            struct Widget { var label: String; func render() {} }
+        }
+        final class View {
+            var w = NS.Widget(label: "x")
+            func draw() { w.render() }
+        }
+        """
+        let rewritten = try runPipeline(source)
+        XCTAssertFalse(rewritten.contains("render"),
+                       "member on a var typed via a qualified constructor must resolve + rename:\n\(rewritten)")
+    }
 }

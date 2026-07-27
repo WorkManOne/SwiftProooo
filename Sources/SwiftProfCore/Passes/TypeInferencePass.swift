@@ -26,9 +26,14 @@ public final class TypeInferencePass {
         for sym in table.symbols where table.declaredType[sym.id] == nil {
             guard let expr = table.initializerExpr[sym.id], let scope = sym.scope else { continue }
             if let typeSym = resolver.typeSymbol(of: expr, in: scope) {
-                table.declaredType[sym.id] = typeSym.name
+                // Store the QUALIFIED name (`NS.Widget`), not the simple one: `declaredType` is a
+                // string re-resolved later from a possibly-different scope, and a bare nested-type
+                // name (`Widget`) is invisible outside its own nesting. Top-level types qualify to
+                // just their name (no change). Fixes inference from `var x = NS.Widget(...)`.
+                let name = Self.qualifiedName(of: typeSym)
+                table.declaredType[sym.id] = name
                 inferred += 1
-                logger.log("[infer-init] \(sym.name)#\(sym.id) → \(typeSym.name)", verbose: true)
+                logger.log("[infer-init] \(sym.name)#\(sym.id) → \(name)", verbose: true)
             } else {
                 logger.log("[infer-init-fail] \(sym.name)#\(sym.id) — could not resolve init expr", verbose: true)
             }
@@ -48,6 +53,20 @@ public final class TypeInferencePass {
         if inferred > 0 {
             logger.log("TypeInferencePass: \(inferred) symbols typed")
         }
+    }
+
+    /// Fully-qualified name of a type Symbol (`NS.Widget`, `E1.S2`), built from its enclosing-TYPE
+    /// chain so the stored string resolves from any scope. A type declared at top level (or nested
+    /// only inside functions, which can't be qualified) yields just its own name — no change from
+    /// the previous simple-name behavior.
+    static func qualifiedName(of typeSym: Symbol) -> String {
+        var parts = [typeSym.name]
+        var owner = typeSym.scope?.owner
+        while let o = owner, o.kind.isTypeLike {
+            parts.insert(o.name, at: 0)
+            owner = o.scope?.owner
+        }
+        return parts.joined(separator: ".")
     }
 
     /// Returns the element type name of a sequence expression. Handles:

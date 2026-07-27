@@ -102,6 +102,17 @@ public final class TypeResolver {
                let base = memberCall.base {
                 return typeSymbol(of: base, in: scope)
             }
+            // `Foo.Bar(args)` — a QUALIFIED type reference being CONSTRUCTED (e.g. `E1.S2(...)`), not
+            // a method call. Distinguished from `recv.method(...)` by the whole callee resolving to a
+            // type-like Symbol (its last segment is upper-cased by convention — a cheap pre-filter).
+            // Must precede the method-return case, which would otherwise treat `S2` as a method of E1.
+            if let memberCall = call.calledExpression.as(MemberAccessExprSyntax.self),
+               memberCall.declName.baseName.text != "init",
+               let firstCh = memberCall.declName.baseName.text.first, firstCh.isUppercase,
+               let typeSym = typeSymbol(forQualifiedName: call.calledExpression.trimmedDescription, in: scope),
+               typeSym.kind.isTypeLike {
+                return typeSym
+            }
             // `receiver.method(args)` → method's return-type Symbol (when we tracked it). Without
             // this, chains like `obj.foo().bar` couldn't resolve `.bar` against `foo()`'s return
             // type, so use-sites past a method call were left un-renamed. Picks the method by
@@ -156,7 +167,10 @@ public final class TypeResolver {
             if let sym = scope.lookup(name: name) {
                 if sym.kind.isTypeLike { return unwrapTypealias(sym, in: scope) }
                 if let typeName = table.declaredType[sym.id] {
-                    return typeSymbol(forQualifiedName: typeName, in: scope)
+                    // Resolve the stored type name in the symbol's DECLARING scope, not the
+                    // use-site: a bare nested type (`var p: S3` inside `enum E1`) is written
+                    // relative to where it was declared and isn't visible from other scopes.
+                    return typeSymbol(forQualifiedName: typeName, in: sym.scope ?? scope)
                 }
                 // Registered-but-untyped local binding (unannotated closure param, case-let
                 // binding): try HOF closure-param inference before giving up — registering the
@@ -197,7 +211,9 @@ public final class TypeResolver {
             guard let memberSym = baseScope.member(named: memberName) else { return nil }
             if memberSym.kind.isTypeLike { return unwrapTypealias(memberSym, in: scope) }
             if let typeName = table.declaredType[memberSym.id] {
-                return typeSymbol(forQualifiedName: typeName, in: scope)
+                // Declaring scope, not use-site (see the DeclRef branch above): a member typed as a
+                // sibling nested type (`var p2: S3` inside `enum E1`) only resolves from E1's scope.
+                return typeSymbol(forQualifiedName: typeName, in: memberSym.scope ?? scope)
             }
             return nil
         }
@@ -589,6 +605,15 @@ public final class TypeResolver {
     /// Get the textual type name of the receiver expression. Tries declared type first
     /// (the most useful path — we want `[Purchase]`, not `Purchase` after type lookup).
     private func receiverTypeName(of expr: ExprSyntax, in scope: Scope) -> String? {
+        receiverTypeInfo(of: expr, in: scope)?.name
+    }
+
+    /// Like `receiverTypeName`, but also returns the scope the type name should be RESOLVED in — the
+    /// declaring scope of the symbol whose type it is. A member's stored type is written relative to
+    /// where it was declared (a bare nested name like `S3`/`[S1]` on `enum E1`'s member is invisible
+    /// from the use-site), so a consumer that resolves the name to a Symbol must use this scope, not
+    /// the use-site's. (`receiverTypeName` keeps its string-only shape for callers that don't resolve.)
+    private func receiverTypeInfo(of expr: ExprSyntax, in scope: Scope) -> (name: String, declScope: Scope)? {
         if let ref = expr.as(DeclReferenceExprSyntax.self) {
             let name = Self.stripBackticks(ref.baseName.text)
             // `$x` / `_x` projection / storage — same wrapped type as `x`.
@@ -596,8 +621,9 @@ public final class TypeResolver {
             if lookupName.hasPrefix("$") || lookupName.hasPrefix("_") {
                 lookupName = String(lookupName.dropFirst())
             }
-            if let sym = scope.lookup(name: lookupName), !sym.kind.isTypeLike {
-                return table.declaredType[sym.id]
+            if let sym = scope.lookup(name: lookupName), !sym.kind.isTypeLike,
+               let t = table.declaredType[sym.id] {
+                return (t, sym.scope ?? scope)
             }
             return nil
         }
@@ -607,14 +633,14 @@ public final class TypeResolver {
             // Equally common: `Type.cases` if user-defined sometimes. Stick to .allCases.
             if memberName == "allCases",
                let baseTypeSym = typeSymbol(of: base, in: scope) {
-                return "[\(baseTypeSym.name)]"
+                return ("[\(baseTypeSym.name)]", baseTypeSym.scope ?? scope)
             }
             // General: resolve base, look up member's declared type.
             if let baseSym = typeSymbol(of: base, in: scope),
-               let baseScope = canonicalInnerScope(of: baseSym) {
-                if let memberSym = baseScope.member(named: memberName) {
-                    return table.declaredType[memberSym.id]
-                }
+               let baseScope = canonicalInnerScope(of: baseSym),
+               let memberSym = baseScope.member(named: memberName),
+               let t = table.declaredType[memberSym.id] {
+                return (t, memberSym.scope ?? scope)
             }
             return nil
         }
@@ -633,21 +659,25 @@ public final class TypeResolver {
     /// subscript result: a wrong type here would drive a wrong rename RollbackPass can't catch.
     private func subscriptResultType(of sub: SubscriptCallExprSyntax, in scope: Scope) -> Symbol? {
         // The base's RAW declared type string (brackets preserved — `typeSymbol(of:)` eagerly
-        // unwraps `[T]`→`T`, hiding the collection-ness we must branch on). nil ⇒ unknown base ⇒ bail.
-        guard let raw = receiverTypeName(of: sub.calledExpression, in: scope) else { return nil }
+        // unwraps `[T]`→`T`, hiding the collection-ness we must branch on) PLUS the scope that string
+        // must resolve in (the base member's declaring scope — a bare nested element name like `S1`
+        // is invisible from the use-site). nil ⇒ unknown base ⇒ bail.
+        guard let info = receiverTypeInfo(of: sub.calledExpression, in: scope) else { return nil }
+        let raw = info.name, declScope = info.declScope
         // 1. Collection / Optional element (same parser HOF closure-typing uses — one source of truth).
         if let elem = Self.extractElement(from: raw) {
-            return typeSymbol(forQualifiedName: elem, in: scope)
+            return typeSymbol(forQualifiedName: elem, in: declScope)
         }
         // 2. Dictionary value (extractElement bails on dicts by design — a dict's Element is (K,V),
         //    but its SUBSCRIPT yields V?).
         if let value = Self.dictionaryValueType(from: raw) {
-            return typeSymbol(forQualifiedName: value, in: scope)
+            return typeSymbol(forQualifiedName: value, in: declScope)
         }
-        // 3. Local type with a recorded subscript signature → its declared return type.
-        if let baseSym = typeSymbol(forQualifiedName: raw, in: scope),
+        // 3. Local type with a recorded subscript signature → its declared return type (written in the
+        //    type's own scope, so resolve there).
+        if let baseSym = typeSymbol(forQualifiedName: raw, in: declScope),
            let ret = subscriptReturnType(ofType: baseSym, forCall: sub) {
-            return typeSymbol(forQualifiedName: ret, in: scope)
+            return typeSymbol(forQualifiedName: ret, in: canonicalInnerScope(of: baseSym) ?? declScope)
         }
         return nil
     }
