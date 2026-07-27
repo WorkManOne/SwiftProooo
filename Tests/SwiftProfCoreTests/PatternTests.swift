@@ -1470,6 +1470,51 @@ final class PatternTests: XCTestCase {
                        "every `.alpha` shorthand (default value + call arg) must be rewritten:\n\(r)")
     }
 
+    func testEnumCaseShorthand_qualifiedNestedParamType_defaultValueResolves() throws {
+        // A contextual type may be QUALIFIED (`S1.E2`), which parses as MemberTypeSyntax, not
+        // IdentifierTypeSyntax. `scalarElementType` only understood the unqualified form, so the
+        // `.alpha` default value of a parameter typed as a NESTED enum got no context and stayed
+        // original while the case decl renamed → desync. RollbackPass rescues it only into a full
+        // revert, and not even that when the case name is shielded (1c Apple-API names like
+        // `alpha`) → red build. The same source with a TOP-LEVEL enum already worked, which is
+        // exactly what makes this a nesting-only blind spot.
+        let r = try runPipeline("""
+        struct S1 {
+            enum E2 { case alpha, beta }
+        }
+        protocol P1 {
+            func f2(for par1: S1.E2, par2: Bool)
+        }
+        extension P1 {
+            func f2(for par1: S1.E2 = .alpha, par2: Bool = true) {
+                f2(for: par1, par2: par2)
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("case alpha"), "nested enum case must be obfuscated:\n\(r)")
+        XCTAssertFalse(r.contains(".alpha"),
+                       "`.alpha` default value of a qualified-typed param must be rewritten:\n\(r)")
+    }
+
+    func testEnumCaseShorthand_qualifiedNestedType_annotationAndReturnResolve() throws {
+        // Same invariant, the other two contextual sites: a `let x: S1.E2 = .alpha` type annotation
+        // and a `-> S1.E2 { return .beta }` return position. The return branch open-coded its own
+        // IdentifierTypeSyntax extraction instead of going through `scalarElementType`, so it had
+        // the identical blind spot.
+        let r = try runPipeline("""
+        struct S1 {
+            enum E2 { case alpha, beta }
+        }
+        struct Holder {
+            let mode: S1.E2 = .alpha
+            func pick() -> S1.E2 { return .beta }
+        }
+        """)
+        XCTAssertFalse(r.contains("case alpha"), "nested enum case must be obfuscated:\n\(r)")
+        XCTAssertFalse(r.contains(".alpha"), "annotated `.alpha` must be rewritten:\n\(r)")
+        XCTAssertFalse(r.contains(".beta"), "returned `.beta` must be rewritten:\n\(r)")
+    }
+
     func testProtocolDefaultImpl_bareCallInsideDefaultBody_rewritesToSharedObf() throws {
         // The "default arguments for a protocol requirement" idiom: the requirement has no
         // defaults, the protocol's OWN extension declares the same signature WITH defaults and

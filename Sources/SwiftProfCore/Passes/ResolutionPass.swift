@@ -1525,10 +1525,9 @@ private final class ResolutionVisitor: SyntaxVisitor {
             // no earlier context matched, fail closed (nil).
             if let fn = node.as(FunctionDeclSyntax.self),
                let returnClause = fn.signature.returnClause,
-               let ident = returnClause.type.as(IdentifierTypeSyntax.self),
-               ident.genericArgumentClause == nil {
+               let returned = Self.scalarElementType(of: returnClause.type) {
                 let implicitReturn = fn.body?.statements.count == 1
-                return (sawReturn || implicitReturn) ? ident.name.text : nil
+                return (sawReturn || implicitReturn) ? returned : nil
             }
             // Don't escape past the file root.
             if node.is(SourceFileSyntax.self) { return nil }
@@ -1553,11 +1552,24 @@ private final class ResolutionVisitor: SyntaxVisitor {
     }
 
     /// Simple element-type NAME for contextual `.case` resolution: `E` → "E", `[E]` → "E",
-    /// `E?` → "E", `[E]?` → "E". Returns nil for generic-argument identifiers, tuples, dictionaries,
-    /// functions and anything else we don't model — fail closed (don't guess a contextual type).
+    /// `E?` → "E", `[E]?` → "E", `S1.E2` → "S1.E2". Returns nil for generic-argument identifiers,
+    /// tuples, dictionaries, functions and anything else we don't model — fail closed (don't guess
+    /// a contextual type).
+    ///
+    /// The single chokepoint for "type syntax in a contextual position → type NAME": every branch
+    /// of `contextualTypeName` that reads a written-out type must go through it, or a QUALIFIED
+    /// nested type is silently a blind spot at that branch only.
     static func scalarElementType(of type: TypeSyntax) -> String? {
         if let id = type.as(IdentifierTypeSyntax.self) {
             return id.genericArgumentClause == nil ? id.name.text : nil
+        }
+        // `S1.E2` — a nested type written qualified parses as MemberType, NOT Identifier. Keep the
+        // full dotted text: the consumer (`TypeResolver.typeSymbol(forQualifiedName:)`) walks dotted
+        // names, and the bare last segment alone would be scope-trapped (B-FIX-23 discipline).
+        if let member = type.as(MemberTypeSyntax.self) {
+            guard member.genericArgumentClause == nil,
+                  scalarElementType(of: member.baseType) != nil else { return nil }
+            return member.trimmedDescription
         }
         if let arr = type.as(ArrayTypeSyntax.self) {
             return scalarElementType(of: arr.element)
