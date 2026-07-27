@@ -14,15 +14,64 @@ public final class ResolutionPass {
     public let diagnostics: Logger?
     /// A4 USR ground-truth, when `indexStorePath` is set. nil ⇒ syntactic resolution only.
     public let indexContext: IndexContext?
+    /// Rewrite a member access by NAME when the name belongs to a project-unique member of an
+    /// external-type extension and the receiver cannot be typed (`--no-unique-external-members`
+    /// disables it). See `uniqueExternalExtensionMembers`.
+    public let uniqueExternalMembers: Bool
 
     public init(table: SymbolTable, map: RenameMap, logger: Logger, diagnoseOverloads: Bool = false,
-                diagnostics: Logger? = nil, indexContext: IndexContext? = nil) {
+                diagnostics: Logger? = nil, indexContext: IndexContext? = nil,
+                uniqueExternalMembers: Bool = true) {
         self.table = table
         self.map = map
         self.logger = logger
         self.diagnoseOverloads = diagnoseOverloads
         self.diagnostics = diagnostics
         self.indexContext = indexContext
+        self.uniqueExternalMembers = uniqueExternalMembers
+    }
+
+    /// name → the single declaration that owns it, for members of external-type extensions whose
+    /// name is UNIQUE among every declaration in the project (B-FIX-31).
+    ///
+    /// Why a name-based rule is warranted here and nowhere else: an extension on an external
+    /// PROTOCOL (`extension View { func frostBound() -> some View }` — the SwiftUI modifier idiom)
+    /// is used on expressions whose type is `some View`, built by chained SDK calls. There is no
+    /// syntactic way to type such a receiver, so type-matched resolution can NEVER reach those
+    /// use-sites: the declaration renames, all 40 use-sites survive, and RollbackPass reverts the
+    /// whole thing — the member stays readable forever.
+    ///
+    /// The guards make the rewrite safe: the name is declared exactly ONCE project-wide (any second
+    /// declaration of any kind disqualifies it), it lives in an eligible external extension (no
+    /// conformance in that extension family), and it survived the Planner — which already refuses
+    /// Apple/stdlib API names (`allKnownMemberNames`, i.e. every member name of every loaded
+    /// `.swiftinterface` when SDK introspection is on). A `.name` member access in compiling source
+    /// must therefore denote this declaration. The residual risk is a member of an SDK framework
+    /// that ships no interface (ObjC-only) sharing the exact custom name — hence the flag to bisect.
+    /// Keyed by name, then by MODULE: a multi-target iOS app routinely compiles the same source into
+    /// several writable targets, so "declared once" means once per module — the use-site takes the
+    /// declaration from its OWN module (the cross-target same-module tiebreak used everywhere else).
+    /// A name is admitted only when EVERY declaration of it project-wide is such a member, so a
+    /// second, unrelated declaration anywhere still disqualifies it.
+    static func uniqueExternalExtensionMembers(in table: SymbolTable,
+                                               map: RenameMap) -> [String: [String: Symbol]] {
+        var byName: [String: [Symbol]] = [:]
+        for sym in table.symbols { byName[sym.name, default: []].append(sym) }
+        var result: [String: [String: Symbol]] = [:]
+        for (name, syms) in byName {
+            let eligible = syms.allSatisfy { sym in
+                guard let scope = sym.scope else { return false }
+                return table.isExternalExtensionScope(scope) && map.obf(for: sym) != nil
+            }
+            guard eligible else { continue }
+            var byModule: [String: Symbol] = [:]
+            var ambiguous = false
+            for sym in syms {
+                if byModule.updateValue(sym, forKey: sym.module.name) != nil { ambiguous = true }
+            }
+            if !ambiguous { result[name] = byModule }
+        }
+        return result
     }
 
     public func run(on files: [SourceFile]) -> [Rename] {
@@ -42,11 +91,14 @@ public final class ResolutionPass {
         }
 
         // 2) Use-site renames — walk each writable file's syntax tree.
+        let uniqueExternal = uniqueExternalMembers
+            ? Self.uniqueExternalExtensionMembers(in: table, map: map) : [:]
         for file in files where file.module.writable {
             guard let fileScope = table.fileScopes[ObjectIdentifier(file)] else { continue }
             let visitor = ResolutionVisitor(file: file, table: table, map: map, fileScope: fileScope,
                                             diagLog: diagnostics ?? logger, diagnose: diagnoseOverloads,
-                                            indexContext: indexContext)
+                                            indexContext: indexContext,
+                                            uniqueExternalMembers: uniqueExternal)
             visitor.walk(file.syntax)
             renames.append(contentsOf: visitor.renames)
         }
@@ -94,15 +146,20 @@ private final class ResolutionVisitor: SyntaxVisitor {
     let indexContext: IndexContext?
     private let useSiteFilePath: String?
     private let useSiteConverter: SourceLocationConverter?
+    /// Project-unique members of external-type extensions (see
+    /// `ResolutionPass.uniqueExternalExtensionMembers`); empty when the feature is off.
+    private let uniqueExternalMembers: [String: [String: Symbol]]
 
     init(file: SourceFile, table: SymbolTable, map: RenameMap, fileScope: Scope, diagLog: Logger,
-         diagnose: Bool = false, indexContext: IndexContext? = nil) {
+         diagnose: Bool = false, indexContext: IndexContext? = nil,
+         uniqueExternalMembers: [String: [String: Symbol]] = [:]) {
         self.file = file
         self.table = table
         self.map = map
         self.diagLog = diagLog
         self.diagnose = diagnose
         self.indexContext = indexContext
+        self.uniqueExternalMembers = uniqueExternalMembers
         // Build the converter only when the index is engaged (it parses positions; skip the cost
         // on the syntactic baseline). Use locals to avoid reading self before super.init.
         let path: String?
@@ -253,25 +310,31 @@ private final class ResolutionVisitor: SyntaxVisitor {
     /// an unresolvable subject, an unknown case, or a payload arity that doesn't line up with the
     /// pattern records nothing.
     private func recordEnumPayloadBindingTypes(of caseNode: SwitchCaseSyntax) {
+        guard let label = caseNode.label.as(SwitchCaseLabelSyntax.self),
+              let subject = Self.enclosingSwitchSubject(of: caseNode) else { return }
+        for item in label.caseItems {
+            recordEnumPayloadBindingTypes(pattern: item.pattern, matching: subject)
+        }
+    }
+
+    /// Core of the above, shared with the `if/guard/while case .run(let m) = value` condition form:
+    /// one pattern matched against one expression. Same fail-closed contract.
+    private func recordEnumPayloadBindingTypes(pattern: PatternSyntax, matching subject: ExprSyntax) {
         guard !shadowBindingTypeFrames.isEmpty,
-              let label = caseNode.label.as(SwitchCaseLabelSyntax.self),
-              let subject = Self.enclosingSwitchSubject(of: caseNode),
               let enumSym = typeResolver.typeSymbol(of: subject, in: currentScope),
               enumSym.kind == .enum,
-              let enumScope = innerScope(of: enumSym) else { return }
-        for item in label.caseItems {
-            guard let (caseName, bindings) = Self.enumPatternBindings(of: item.pattern),
-                  let caseSym = enumScope.members(named: caseName).first(where: { $0.kind == .enumCase }),
-                  let types = table.enumCaseAssociatedTypes[caseSym.id],
-                  types.count == bindings.count else { continue }
-            for (binding, type) in zip(bindings, types) {
-                guard let binding, let type else { continue }
-                // Resolve in the CASE's scope, store the name that resolves anywhere.
-                let resolved = typeResolver.typeSymbol(forQualifiedName: type,
-                                                       in: caseSym.scope ?? currentScope)
-                let name = resolved.map { TypeInferencePass.qualifiedName(of: $0) } ?? type
-                shadowBindingTypeFrames[shadowBindingTypeFrames.count - 1][binding] = name
-            }
+              let enumScope = innerScope(of: enumSym),
+              let (caseName, bindings) = Self.enumPatternBindings(of: pattern),
+              let caseSym = enumScope.members(named: caseName).first(where: { $0.kind == .enumCase }),
+              let types = table.enumCaseAssociatedTypes[caseSym.id],
+              types.count == bindings.count else { return }
+        for (binding, type) in zip(bindings, types) {
+            guard let binding, let type else { continue }
+            // Resolve in the CASE's scope, store the name that resolves anywhere.
+            let resolved = typeResolver.typeSymbol(forQualifiedName: type,
+                                                   in: caseSym.scope ?? currentScope)
+            let name = resolved.map { TypeInferencePass.qualifiedName(of: $0) } ?? type
+            shadowBindingTypeFrames[shadowBindingTypeFrames.count - 1][binding] = name
         }
     }
 
@@ -502,6 +565,15 @@ private final class ResolutionVisitor: SyntaxVisitor {
     override func visitPost(_ node: GuardStmtSyntax) {
         guard !shadowFrames.isEmpty else { return }
         for cond in node.conditions {
+            // `guard case .run(let m) = c else { … }` — the payload binding, deferred here for the
+            // same reason: inside the `else` body `m` is NOT in scope, so a same-named property
+            // referenced there must keep its own type (typing it as the payload would rewrite its
+            // members to the payload enum's obfs — a wrong rename RollbackPass cannot catch).
+            if let matching = cond.condition.as(MatchingPatternConditionSyntax.self) {
+                recordEnumPayloadBindingTypes(pattern: matching.pattern,
+                                              matching: matching.initializer.value)
+                continue
+            }
             guard let binding = cond.condition.as(OptionalBindingConditionSyntax.self),
                   let initializer = binding.initializer,
                   let ident = binding.pattern.as(IdentifierPatternSyntax.self) else { continue }
@@ -511,8 +583,17 @@ private final class ResolutionVisitor: SyntaxVisitor {
         }
     }
 
-    /// True when an optional binding belongs to a `guard` condition (vs `if let` / `while let`).
-    private func isInGuardCondition(_ node: OptionalBindingConditionSyntax) -> Bool {
+    /// `if case .run(let m) = value` / `while case …` — the payload binding of a MATCHING pattern
+    /// condition, typed exactly like a `switch` case's (B-FIX-29 covered only `switch`). In
+    /// `visitPost` so the matched expression has been resolved first, and skipped for a `guard`,
+    /// whose bindings are deferred to `visitPost(GuardStmt)` (see there).
+    override func visitPost(_ node: MatchingPatternConditionSyntax) {
+        guard !isInGuardCondition(node) else { return }
+        recordEnumPayloadBindingTypes(pattern: node.pattern, matching: node.initializer.value)
+    }
+
+    /// True when a condition belongs to a `guard` (vs `if let` / `while let` / `if case`).
+    private func isInGuardCondition(_ node: some SyntaxProtocol) -> Bool {
         var p: Syntax? = node.parent
         while let cur = p {
             if cur.is(GuardStmtSyntax.self) { return true }
@@ -1471,6 +1552,12 @@ private final class ResolutionVisitor: SyntaxVisitor {
                        let canonical = innerScope(of: owner),
                        let target = resolveMemberForUse(memberName, in: canonical, node: node) {
                         emitRename(for: memberToken, target: target)
+                    } else if let extScope = enclosingExternalExtensionScope(),
+                              let target = resolveMemberForUse(memberName, in: extScope, node: node) {
+                        // Inside an extension of an EXTERNAL type there IS no owner symbol, so
+                        // `self.member` resolves against the extension's own scope (B-FIX-31).
+                        // Without it the decl renames while `self.member` survives → revert.
+                        emitRename(for: memberToken, target: target)
                     }
                     return .visitChildren
                 }
@@ -1505,6 +1592,9 @@ private final class ResolutionVisitor: SyntaxVisitor {
                    let typeScope = innerScope(of: baseTypeSym),
                    let member = resolveMemberForUse(memberName, in: typeScope, node: node) {
                     emitRename(for: memberToken, target: member)
+                } else if let member = resolveExternalExtensionMember(memberName, base: base, node: node)
+                            ?? uniqueExternalMember(memberName) {
+                    emitRename(for: memberToken, target: member)
                 }
                 return .visitChildren
             }
@@ -1513,6 +1603,13 @@ private final class ResolutionVisitor: SyntaxVisitor {
             if let baseSym = resolveTypeSymbol(of: base),
                let typeScope = innerScope(of: baseSym),
                let member = resolveMemberForUse(memberName, in: typeScope, node: node) {
+                emitRename(for: memberToken, target: member)
+            } else if let member = resolveExternalExtensionMember(memberName, base: base, node: node)
+                        ?? uniqueExternalMember(memberName) {
+                // No typeable receiver: the project-unique external-extension member is the only
+                // declaration that name can denote (see `uniqueExternalExtensionMembers`). This is
+                // what reaches the SwiftUI `extension View` modifier idiom, whose receivers are
+                // `some View` chains no syntactic resolver can type.
                 emitRename(for: memberToken, target: member)
             }
             return .visitChildren
@@ -1531,6 +1628,84 @@ private final class ResolutionVisitor: SyntaxVisitor {
             }
             return .visitChildren
         }
+    }
+
+    // MARK: - Members of extensions on EXTERNAL types (B-FIX-31)
+
+    /// The enclosing scope that is the body of an eligible external-type extension, if any.
+    private func enclosingExternalExtensionScope() -> Scope? {
+        var s: Scope? = currentScope
+        while let cur = s {
+            if cur.kind == .type, cur.owner == nil, table.isExternalExtensionScope(cur) { return cur }
+            s = cur.parent
+        }
+        return nil
+    }
+
+    /// A member declared in an extension of a type we do NOT own (`extension String { … }`,
+    /// `extension Array where Element == Mood { … }`), reached through `base`.
+    ///
+    /// Invariant: such an extension binds to a WRITTEN TYPE, not to a Symbol, so the use-site is
+    /// matched the same way — the receiver's written type must denote the extended type (for a
+    /// collection: a compatible collection KIND whose Element satisfies the extension's `Element ==`
+    /// constraint). Fail-closed at every step: a receiver we cannot type, a kind that doesn't match,
+    /// an element that isn't provably the same type, or several candidate declarations that don't
+    /// share one obf all yield nil, leaving the use-site original (RollbackPass then reverts the
+    /// group — under-obfuscation, never a wrong rename).
+    private func resolveExternalExtensionMember(_ name: String, base: ExprSyntax,
+                                                node: MemberAccessExprSyntax) -> Symbol? {
+        guard !table.externalExtensions.isEmpty,
+              let info = typeResolver.receiverTypeInfo(of: base, in: currentScope) else { return nil }
+        let receiver = typeResolver.expandedTypeName(info.name, in: info.declScope)
+        var candidates: [Symbol] = []
+        for ext in table.externalExtensions
+        where externalExtensionApplies(ext, toReceiverType: receiver.name, writtenIn: receiver.scope) {
+            candidates.append(contentsOf: ext.scope.members(named: name))
+        }
+        if candidates.count == 1 { return candidates[0] }
+        guard candidates.count > 1 else { return nil }
+        // Cross-target duplicates: a multi-target app compiles the same file into several writable
+        // modules, so the same extension member exists once per module, each with its own obf. The
+        // use-site takes its OWN module's copy — the same tiebreak `disambiguateByArgTypes` and
+        // `resolveQualifiedTypeChain` apply. Without it every such member is ambiguous ⇒ reverted.
+        let sameModule = candidates.filter { $0.module.name == file.module.name }
+        if sameModule.count == 1 { return sameModule[0] }
+        if !sameModule.isEmpty { candidates = sameModule }
+        if let shared = unambiguousSharedObfTarget(candidates) { return shared }
+        guard candidates.allSatisfy({ Self.isCallable($0.kind) }),
+              let call = enclosingCall(of: node) else { return nil }
+        return chooseOverload(candidates, call: call)
+    }
+
+    /// The project-unique external-extension member named `name`, taken from the USE-SITE's own
+    /// module (a multi-target app compiles the same source into several modules — each target's
+    /// copy has its own Symbol and its own obf). nil when the name isn't admitted or this module
+    /// declares no copy of it.
+    private func uniqueExternalMember(_ name: String) -> Symbol? {
+        guard let byModule = uniqueExternalMembers[name] else { return nil }
+        if let same = byModule[file.module.name] { return same }
+        return byModule.count == 1 ? byModule.values.first : nil
+    }
+
+    /// Does `ext` apply to a receiver whose written type is `raw` (written in `scope`)?
+    private func externalExtensionApplies(_ ext: SymbolTable.ExternalExtensionRef,
+                                          toReceiverType raw: String, writtenIn scope: Scope) -> Bool {
+        if let kind = CollectionMemberRegistry.collectionKind(of: raw) {
+            guard CollectionMemberRegistry.applicableExtensionBases(forKind: kind).contains(ext.baseName) else {
+                return false
+            }
+            guard let constraint = ext.elementConstraint else { return true }   // applies to any Element
+            guard let element = CollectionMemberRegistry.sequenceElement(of: raw) else { return false }
+            // Element identity, not string equality: the constraint and the receiver's element are
+            // written in DIFFERENT scopes and may be spelled differently (bare vs qualified, or
+            // through a typealias) — the B-FIX-27 comparator is exactly this question.
+            return TypeNameEquivalence.sameType(element, inScope: scope, module: file.module.name,
+                                                constraint, inScope: ext.declScope, module: ext.module,
+                                                table: table)
+        }
+        // A named external type (`extension String`, `extension Date`). An element constraint on a
+        // non-collection is a shape we don't model — fail closed.
+        return ext.elementConstraint == nil && bareTypeName(raw) == ext.baseName
     }
 
     /// A contextual type for a base-less `.member`: the written type NAME plus the scope that name

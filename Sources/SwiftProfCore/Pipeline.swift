@@ -81,6 +81,14 @@ public struct PipelineOptions {
     /// Off by default (extra work + a large file on big projects). See `DecisionReport`.
     public var explain: Bool
 
+    /// Rewrite a member access by NAME when that name is a PROJECT-UNIQUE member of an external-type
+    /// extension whose receiver cannot be typed — the SwiftUI `extension View { func frostBound() }`
+    /// modifier idiom, whose use-sites sit on `some View` chains no syntactic resolver can type
+    /// (B-FIX-31). Default ON: without it those declarations rename, every use-site survives and
+    /// RollbackPass reverts the group, so the members stay readable. Turn OFF (`--no-unique-external
+    /// -members`) to bisect a red build back to this heuristic.
+    public var uniqueExternalMembers: Bool
+
     public init(
         modules: [ModuleSpec],
         outputDirectory: URL,
@@ -103,7 +111,8 @@ public struct PipelineOptions {
         aggressiveRollback: Bool = false,
         indexStorePath: String? = nil,
         indexStoreGate: Bool = false,
-        explain: Bool = false
+        explain: Bool = false,
+        uniqueExternalMembers: Bool = true
     ) {
         self.modules = modules
         self.outputDirectory = outputDirectory
@@ -127,6 +136,7 @@ public struct PipelineOptions {
         self.indexStorePath = indexStorePath
         self.indexStoreGate = indexStoreGate
         self.explain = explain
+        self.uniqueExternalMembers = uniqueExternalMembers
     }
 }
 
@@ -286,6 +296,10 @@ public final class Pipeline {
         // Extension owners are now resolved — fold subscript signatures onto their owner types so
         // `base[args]` on a local type can resolve to a subscript's declared return type.
         table.finalizeSubscriptSignatures()
+        // Extensions whose owner did NOT resolve are extensions on EXTERNAL types. Their members are
+        // renameable via receiver-type matching (B-FIX-31) — collect them before ScopeUnification,
+        // which rewires only OWNED extension scopes.
+        table.finalizeExternalExtensions()
         ScopeUnification(table: table, logger: logger).run()
         ConformanceVisibility(table: table, logger: logger).run()
         SuperclassVisibility(table: table, logger: logger).run()
@@ -336,7 +350,8 @@ public final class Pipeline {
             table: table, protector: protector, pool: pool, logger: logger,
             ignoreNames: effectiveIgnoreNames,
             allowedKinds: options.obfuscatableKinds,
-            usrBySymbolId: gateUSRMap
+            usrBySymbolId: gateUSRMap,
+            apiNames: registry.allKnownMemberNames
         )
         let map = planner.plan()
         logger.log("planned renames: \(map.obfBySymbolId.count)")
@@ -358,7 +373,8 @@ public final class Pipeline {
         var renames = ResolutionPass(table: table, map: map, logger: logger,
                                      diagnoseOverloads: options.diagnoseOverloads,
                                      diagnostics: diagnostics,
-                                     indexContext: indexContext).run(on: project.files)
+                                     indexContext: indexContext,
+                                     uniqueExternalMembers: options.uniqueExternalMembers).run(on: project.files)
         logger.log("rename edits: \(renames.count)")
 
         // A6: validate every edit against the compiler's occurrence set; drop renames the index

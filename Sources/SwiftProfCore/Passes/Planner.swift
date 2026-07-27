@@ -18,6 +18,11 @@ public final class Planner {
     /// from this map is one the index can't vouch for ⇒ skip its rename (fail-closed). nil ⇒
     /// gate disabled (syntactic baseline).
     public let usrBySymbolId: [Int: String]?
+    /// Apple/stdlib API member names (`StdlibRegistry.allKnownMemberNames`) — RollbackPass shield
+    /// 1c. A member of an EXTERNAL-type extension carrying one of these names is not renamed: its
+    /// use-sites are matched by the receiver's written type, so a miss is likelier than for a local
+    /// type, and the shield would block the rollback rescue — the desync would SHIP (B-FIX-31).
+    public let apiNames: Set<String>
 
     public init(
         table: SymbolTable,
@@ -26,7 +31,8 @@ public final class Planner {
         logger: Logger,
         ignoreNames: Set<String> = [],
         allowedKinds: Set<SymbolKind> = [],
-        usrBySymbolId: [Int: String]? = nil
+        usrBySymbolId: [Int: String]? = nil,
+        apiNames: Set<String> = []
     ) {
         self.table = table
         self.protector = protector
@@ -35,6 +41,7 @@ public final class Planner {
         self.ignoreNames = ignoreNames
         self.allowedKinds = allowedKinds
         self.usrBySymbolId = usrBySymbolId
+        self.apiNames = apiNames
     }
 
     /// id → why a writable symbol was NOT planned (specific policy reason). Protected symbols are
@@ -62,8 +69,8 @@ public final class Planner {
                 skipReason[sym.id] = "generic parameter placeholder (local, not a rename target)"
                 continue
             }
-            if isExtensionOfExternalType(sym) {
-                skipReason[sym.id] = "member of an extension on an external (non-local) type"
+            if isExtensionOfExternalType(sym), let reason = externalExtensionSkipReason(sym) {
+                skipReason[sym.id] = reason
                 continue
             }
             if !allowedKinds.isEmpty && !allowedKinds.contains(sym.kind) {
@@ -102,10 +109,35 @@ public final class Planner {
     }
 
     /// True if the symbol is declared inside a type-scope whose owner is unknown — i.e. an
-    /// extension on a non-local type (`extension Array where ...`). Renaming such members
-    /// breaks use-sites because we cannot resolve `someArray.member` syntactically.
+    /// extension on a non-local type (`extension String`, `extension Array where Element == …`).
     private func isExtensionOfExternalType(_ sym: Symbol) -> Bool {
         guard let scope = sym.scope, scope.kind == .type, scope.owner == nil else { return false }
         return true
+    }
+
+    /// Why a member of an external-type extension may NOT be renamed — nil means it MAY (B-FIX-31).
+    ///
+    /// Such a member has no owning Symbol, so its use-sites are matched by the receiver's WRITTEN
+    /// type (`ResolutionVisitor.resolveExternalExtensionMember`). That works for a receiver we can
+    /// type and fails closed for one we cannot: the original name survives and RollbackPass reverts
+    /// the group. The exceptions below are the cases where that safety net does NOT hold, or where
+    /// there is no matching machinery at all:
+    ///   - the extension family declares a conformance ⇒ the member is a witness on a type we don't
+    ///     own (handled upstream: such extensions never enter `externalExtensions`);
+    ///   - the name is an Apple/stdlib API name ⇒ RollbackPass shield 1c blocks the revert, so a
+    ///     missed use-site would ship as a red build;
+    ///   - the kind is not a property/method ⇒ no receiver-matched use-site form to rewrite.
+    private func externalExtensionSkipReason(_ sym: Symbol) -> String? {
+        guard let scope = sym.scope, table.isExternalExtensionScope(scope) else {
+            return "member of an extension on an external (non-local) type"
+        }
+        switch sym.kind {
+        case .property, .method: break
+        default: return "member of an extension on an external type (kind '\(sym.kind.rawValue)' has no receiver-matched use-site)"
+        }
+        if apiNames.contains(sym.name) {
+            return "member of an extension on an external type whose name is an Apple/stdlib API name (rollback shield would block the rescue)"
+        }
+        return nil
     }
 }

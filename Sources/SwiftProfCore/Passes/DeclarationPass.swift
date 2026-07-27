@@ -234,8 +234,26 @@ private final class DeclVisitor: SyntaxVisitor {
         let scope = push(.type, owner: nil, node: node)
         let inheritedNames = node.inheritanceClause?.inheritedTypes.map { $0.type.trimmedDescription } ?? []
         table.registerExtension(scope: scope, extendedType: node.extendedType, file: file,
-                                inheritedNames: inheritedNames)
+                                inheritedNames: inheritedNames,
+                                elementConstraint: Self.elementConstraint(of: node.genericWhereClause))
         return .visitChildren
+    }
+
+    /// Right-hand side of an `Element == X` same-type requirement (`extension Array where Element ==
+    /// Mood`). This is what distinguishes two same-named members declared on `[Mood]` and `[String]`
+    /// at a use-site, so an extension on an external collection can be renamed at all (B-FIX-31).
+    /// Any other requirement shape (a conformance bound, `Self.Element`, several requirements we
+    /// can't reduce to one element) yields nil — the extension then applies to every element type.
+    private static func elementConstraint(of clause: GenericWhereClauseSyntax?) -> String? {
+        guard let clause else { return nil }
+        for requirement in clause.requirements {
+            guard let sameType = requirement.requirement.as(SameTypeRequirementSyntax.self) else { continue }
+            let lhs = sameType.leftType.trimmedDescription
+            guard lhs == "Element" || lhs == "Self.Element" else { continue }
+            let rhs = sameType.rightType.trimmedDescription
+            return rhs.isEmpty ? nil : rhs
+        }
+        return nil
     }
     override func visitPost(_ node: ExtensionDeclSyntax) { pop() }
 

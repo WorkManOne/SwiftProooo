@@ -97,6 +97,9 @@ struct Obfuscate: ParsableCommand {
     @Flag(name: .long, inversion: .prefixedNo, help: "Stronger rollback safety net for overload-heavy projects: any surviving name whose renamed callable namesake exists triggers a group revert, regardless of what kind the un-renamed sym is. Trades coverage for green build.")
     var aggressiveRollback: Bool?
 
+    @Flag(name: .long, inversion: .prefixedNo, help: "Rewrite a member access by NAME when the name is a PROJECT-UNIQUE member of an extension on an external type whose receiver can't be typed (the SwiftUI `extension View { func myModifier() }` idiom). ON by default — without it such members rename but every use-site survives and the rollback reverts them. Pass --no-unique-external-members to bisect a red build back to this heuristic.")
+    var uniqueExternalMembers: Bool?
+
     @Flag(name: .long, inversion: .prefixedNo, help: "Emit a per-symbol decision report (Decisions.txt + decisions.json in --output): for every writable declaration, exactly why it was obfuscated / protected / skipped / reverted.")
     var explain: Bool?
 
@@ -142,6 +145,7 @@ struct Obfuscate: ParsableCommand {
         cli.indexStoreGate = indexStoreGate
         cli.aggressiveRollback = aggressiveRollback
         cli.explain = explain
+        cli.uniqueExternalMembers = uniqueExternalMembers
         cli.verbose = verbose
 
         let merged = cli.merging(over: fileConfig)
@@ -187,7 +191,8 @@ struct Obfuscate: ParsableCommand {
             aggressiveRollback: merged.aggressiveRollback ?? false,
             indexStorePath: merged.indexStorePath,
             indexStoreGate: merged.indexStoreGate ?? false,
-            explain: merged.explain ?? false
+            explain: merged.explain ?? false,
+            uniqueExternalMembers: merged.uniqueExternalMembers ?? true
         )
         let result = try Pipeline(options: options, logger: logger).run()
         FileHandle.standardOutput.write(Data(result.coverage.formatted().utf8))

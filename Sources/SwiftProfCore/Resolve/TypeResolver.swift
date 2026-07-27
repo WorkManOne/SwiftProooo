@@ -157,6 +157,13 @@ public final class TypeResolver {
                     return typeSymbol(forQualifiedName: ret, in: scope)
                 }
             }
+            // `items.sorted()` / `items.first(where:)` — a stdlib collection member in call form.
+            // The receiver names no declaration, so none of the cases above can reach it; the
+            // registry's result shape does (B-FIX-30). Resolving `[Element]` still yields nil (a
+            // collection names no declaration) — only an ELEMENT result produces a Symbol here.
+            if let info = receiverTypeInfo(of: expr, in: scope) {
+                return typeSymbol(forQualifiedName: info.name, in: info.declScope)
+            }
         }
         if let ref = expr.as(DeclReferenceExprSyntax.self) {
             let rawName = Self.stripBackticks(ref.baseName.text)
@@ -226,15 +233,25 @@ public final class TypeResolver {
             return nil
         }
         if let member = expr.as(MemberAccessExprSyntax.self), let base = member.base {
-            guard let baseSym = typeSymbol(of: base, in: scope),
-                  let baseScope = canonicalInnerScope(of: baseSym) else { return nil }
             let memberName = Self.stripBackticks(member.declName.baseName.text)
-            guard let memberSym = baseScope.member(named: memberName) else { return nil }
-            if memberSym.kind.isTypeLike { return unwrapTypealias(memberSym, in: scope) }
-            if let typeName = table.declaredType[memberSym.id] {
-                // Declaring scope, not use-site (see the DeclRef branch above): a member typed as a
-                // sibling nested type (`var p2: S3` inside `enum E1`) only resolves from E1's scope.
-                return typeSymbol(forQualifiedName: typeName, in: memberSym.scope ?? scope)
+            if let baseSym = typeSymbol(of: base, in: scope),
+               let baseScope = canonicalInnerScope(of: baseSym) {
+                guard let memberSym = baseScope.member(named: memberName) else { return nil }
+                if memberSym.kind.isTypeLike { return unwrapTypealias(memberSym, in: scope) }
+                if let typeName = table.declaredType[memberSym.id] {
+                    // Declaring scope, not use-site (see the DeclRef branch above): a member typed as
+                    // a sibling nested type (`var p2: S3` inside `enum E1`) only resolves from E1's
+                    // scope.
+                    return typeSymbol(forQualifiedName: typeName, in: memberSym.scope ?? scope)
+                }
+                return nil
+            }
+            // The base resolved to NO declaration — the stdlib-collection case (`items.first?.m`,
+            // `dict.values`): a collection type names no declaration since B-FIX-28, so the member's
+            // result shape is the only way through the chain (B-FIX-30). Reached only when the base
+            // is not a local type, so it can never shadow the path above.
+            if let info = collectionMemberResult(member: memberName, receiver: base, in: scope) {
+                return typeSymbol(forQualifiedName: info.name, in: info.declScope)
             }
             return nil
         }
@@ -640,7 +657,18 @@ public final class TypeResolver {
     /// where it was declared (a bare nested name like `S3`/`[S1]` on `enum E1`'s member is invisible
     /// from the use-site), so a consumer that resolves the name to a Symbol must use this scope, not
     /// the use-site's. (`receiverTypeName` keeps its string-only shape for callers that don't resolve.)
-    private func receiverTypeInfo(of expr: ExprSyntax, in scope: Scope) -> (name: String, declScope: Scope)? {
+    ///
+    /// This is the ONE place that answers "what is the WRITTEN type name of this expression" — with
+    /// the brackets intact, unlike `typeSymbol(of:)`, which resolves to a declaration and therefore
+    /// answers nil for every collection (B-FIX-28). Subscript results, HOF element typing, the
+    /// for-in element inference and stdlib-collection chains all funnel through it, so a new
+    /// expression shape is taught here once rather than at each consumer.
+    public func receiverTypeInfo(of expr: ExprSyntax, in scope: Scope) -> (name: String, declScope: Scope)? {
+        // Wrappers that don't change the named type (`items?`, `items!`, `try f()`, `await f()`).
+        if let opt = expr.as(OptionalChainingExprSyntax.self) { return receiverTypeInfo(of: opt.expression, in: scope) }
+        if let force = expr.as(ForceUnwrapExprSyntax.self) { return receiverTypeInfo(of: force.expression, in: scope) }
+        if let tryE = expr.as(TryExprSyntax.self) { return receiverTypeInfo(of: tryE.expression, in: scope) }
+        if let awaitE = expr.as(AwaitExprSyntax.self) { return receiverTypeInfo(of: awaitE.expression, in: scope) }
         if let ref = expr.as(DeclReferenceExprSyntax.self) {
             let name = Self.stripBackticks(ref.baseName.text)
             // `$x` / `_x` projection / storage — same wrapped type as `x`.
@@ -669,9 +697,55 @@ public final class TypeResolver {
                let t = table.declaredType[memberSym.id] {
                 return (t, memberSym.scope ?? scope)
             }
-            return nil
+            // Stdlib collection member (`items.first`, `dict.values`) — the receiver names no
+            // declaration, so the general path above cannot answer it (B-FIX-30).
+            return collectionMemberResult(member: memberName, receiver: base, in: scope)
+        }
+        // `items.sorted()` / `items.first(where:)` — the same members in CALL form; then a call to
+        // one of OUR callables, whose declared return type names the receiver of the next step
+        // (`makeItems()[0].m`, `makeItems().map { $0.m }`).
+        if let call = expr.as(FunctionCallExprSyntax.self) {
+            if let m = call.calledExpression.as(MemberAccessExprSyntax.self), let base = m.base,
+               let result = collectionMemberResult(member: Self.stripBackticks(m.declName.baseName.text),
+                                                   receiver: base, in: scope) {
+                return result
+            }
+            if let callee = calleeCallable(for: call, in: scope),
+               let ret = table.functionReturnType[callee.id] {
+                return (ret, callee.scope ?? scope)
+            }
         }
         return nil
+    }
+
+    /// Result type of `receiver.member` when `receiver` is a stdlib collection whose member has a
+    /// modelled result shape (`CollectionMemberRegistry`). The name is returned with the RECEIVER's
+    /// declaring scope: the element name was written there (B-FIX-23 discipline). Fail-closed —
+    /// an unparsable receiver or an unmodelled member yields nil, never a guessed type.
+    private func collectionMemberResult(member: String, receiver: ExprSyntax,
+                                        in scope: Scope) -> (name: String, declScope: Scope)? {
+        guard let info = receiverTypeInfo(of: receiver, in: scope) else { return nil }
+        let expanded = expandedTypeName(info.name, in: info.declScope)
+        guard let result = CollectionMemberRegistry.resultTypeName(member: member,
+                                                                   receiverType: expanded.name) else { return nil }
+        return (result, expanded.scope)
+    }
+
+    /// A written type name with any typealias to a COMPOSITE type expanded (`typealias Items =
+    /// [Item]` → `[Item]`), together with the scope the expansion was written in. A collection name
+    /// resolves to no declaration (B-FIX-28), so an alias for one cannot be followed through
+    /// `unwrapTypealias` — it has to be expanded textually, exactly as `TypeNameEquivalence` does.
+    /// Bounded against cyclic aliases; a name that is not such an alias comes back unchanged.
+    public func expandedTypeName(_ raw: String, in scope: Scope) -> (name: String, scope: Scope) {
+        var name = raw
+        var declScope = scope
+        for _ in 0..<4 {
+            guard let sym = typeSymbol(forQualifiedName: name, in: declScope), sym.kind == .typealias_,
+                  let target = table.typealiasTarget[sym.id], target != name else { break }
+            name = target
+            declScope = sym.scope ?? declScope
+        }
+        return (name, declScope)
     }
 
     // MARK: - Subscript result typing

@@ -3466,6 +3466,324 @@ final class PatternTests: XCTestCase {
         XCTAssertFalse(r.contains("item.label"), "member through the NESTED loop variable must be rewritten:\n\(r)")
     }
 
+    func testEnumCasePayload_ifCaseBinding_typedFromAssociatedValue() throws {
+        // `if case .run(let m) = c` binds the payload exactly as a `switch` case does, but only the
+        // switch form recorded the binding's type (B-FIX-29), so `m == .calm` had no context: the
+        // shorthand stayed original while `calm`'s decl renamed → the survivor reverted the payload
+        // enum's whole case group (a red build whenever the case name is shielded from rollback).
+        let r = try runPipeline("""
+        enum Mood { case calm, sharp }
+        enum Command { case run(Mood), stop }
+        func check(c: Command) -> Bool {
+            if case .run(let m) = c { return m == .calm }
+            return false
+        }
+        """)
+        XCTAssertFalse(r.contains("case calm"), "case calm must be obfuscated:\n\(r)")
+        XCTAssertFalse(r.contains(".calm"), "the if-case payload binding must type the operand:\n\(r)")
+    }
+
+    func testEnumCasePayload_guardCaseBinding_typedFromAssociatedValue() throws {
+        // Same for `guard case`, where the binding is in scope only AFTER the statement.
+        let r = try runPipeline("""
+        enum Mood { case calm, sharp }
+        enum Command { case run(Mood), stop }
+        func check(c: Command) -> Bool {
+            guard case .run(let m) = c else { return false }
+            return m == .calm
+        }
+        """)
+        XCTAssertFalse(r.contains("case calm"), "case calm must be obfuscated:\n\(r)")
+        XCTAssertFalse(r.contains(".calm"), "the guard-case payload binding must type the operand:\n\(r)")
+    }
+
+    func testEnumCasePayload_guardCaseBinding_elseBodyKeepsOuterMeaning() throws {
+        // The safety complement: a guard-case binding is NOT in scope inside the `else` body, so a
+        // same-named PROPERTY referenced there must keep its own type. Recording the payload type
+        // before the else body is visited would type `m` as the payload enum and rewrite `m.tag` to
+        // that enum's member — a wrong rename RollbackPass cannot catch.
+        let r = try runPipeline("""
+        enum Mood { case calm, sharp }
+        struct Marker { let tag: String }
+        enum Command { case run(Mood), stop }
+        final class Checker {
+            let m = Marker(tag: "x")
+            func check(c: Command) -> String {
+                guard case .run(let m) = c else { return self.m.tag }
+                return m == .calm ? "a" : "b"
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains(".calm"), "the guard-case payload binding must type the operand:\n\(r)")
+        XCTAssertFalse(r.contains("self.m.tag"), "the else-body property member must resolve to Marker's own member:\n\(r)")
+    }
+
+    // MARK: - Extensions on EXTERNAL types are renameable (B-FIX-31)
+    // Invariant: a member declared in an extension of a type we do NOT own (`extension String`,
+    // `extension Array where Element == Mood`) can still be renamed — its use-sites are matched by
+    // the receiver's WRITTEN type instead of by Symbol identity. Eligibility is fail-closed: the
+    // extension family must declare no conformance, and the member name must not be an Apple/stdlib
+    // API name (RollbackPass shield 1c would block the rescue of a missed use-site → red build).
+
+    /// First capture group of `pattern` in `text`, or nil.
+    private func firstMatch(_ pattern: String, in text: String) -> String? {
+        guard let re = try? NSRegularExpression(pattern: pattern),
+              let m = re.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
+              m.numberOfRanges > 1, let r = Range(m.range(at: 1), in: text) else { return nil }
+        return String(text[r])
+    }
+
+    func testExternalExtension_constrainedByElement_useSitesPickTheMatchingExtension() throws {
+        // The `Tests/IceTrays/.../FloeSupportViews.swift` shape: two `extension Array where Element
+        // == …` declaring the SAME member name, differing only by Element. Both were skipped as
+        // "extension of an external type" (`scope.owner == nil`), so 2 declarations + 4 use-sites
+        // stayed readable. They must now rename to DIFFERENT obfs, and each use-site must pick by
+        // its receiver's element type.
+        let r = try runPipeline("""
+        enum Mood { case calm, sharp }
+        extension Array where Element == Mood {
+            var chipText: String { map { "\\($0)" }.joined(separator: ", ") }
+        }
+        extension Array where Element == String {
+            var chipText: String { joined(separator: ", ") }
+        }
+        struct Card {
+            let moods: [Mood]
+            let tags: [String]
+            func render() -> String { return moods.chipText + tags.chipText }
+        }
+        """)
+        XCTAssertFalse(r.contains("var chipText"), "both constrained-extension members must be obfuscated:\n\(r)")
+        XCTAssertFalse(r.contains(".chipText"), "both use-sites must be rewritten:\n\(r)")
+        let moodObf = firstMatch(#"Element == T\d+ \{\s*var (p\d+)"#, in: r)
+        let stringObf = firstMatch(#"Element == String \{\s*var (p\d+)"#, in: r)
+        XCTAssertNotNil(moodObf, "the Mood-constrained member must be renamed:\n\(r)")
+        XCTAssertNotNil(stringObf, "the String-constrained member must be renamed:\n\(r)")
+        XCTAssertNotEqual(moodObf, stringObf, "the two members are distinct declarations:\n\(r)")
+        let uses = firstMatch(#"return p\d+\.(p\d+) \+ p\d+\.p\d+"#, in: r)
+        let uses2 = firstMatch(#"return p\d+\.p\d+ \+ p\d+\.(p\d+)"#, in: r)
+        XCTAssertEqual(uses, moodObf, "the [Mood] receiver must pick the Mood-constrained member:\n\(r)")
+        XCTAssertEqual(uses2, stringObf, "the [String] receiver must pick the String-constrained member:\n\(r)")
+    }
+
+    func testExternalExtension_namedStdlibType_memberRenames() throws {
+        // `extension String { var commaParts }` — the same policy skip, for a NAMED external type.
+        // The receiver is matched by its written type name.
+        let r = try runPipeline("""
+        extension String {
+            var commaParts: [String] { split(separator: ",").map { String($0) } }
+        }
+        struct Row {
+            let raw: String
+            func parts() -> [String] { return raw.commaParts }
+        }
+        """)
+        XCTAssertFalse(r.contains("var commaParts"), "the extension member must be obfuscated:\n\(r)")
+        XCTAssertFalse(r.contains(".commaParts"), "the use-site must be rewritten:\n\(r)")
+    }
+
+    func testExternalExtension_declaredConformance_membersStayOriginal() throws {
+        // Fail-closed: an extension that adopts a protocol makes its members WITNESSES, and a
+        // stdlib type is not in our table, so WitnessLinker cannot pair them with the requirement.
+        // Renaming one breaks the conformance — so no extension of that type is eligible.
+        let r = try runPipeline("""
+        protocol Summable { func total() -> Int }
+        extension Array: Summable where Element == Int {
+            func total() -> Int { reduce(0, +) }
+        }
+        struct Basket {
+            let counts: [Int]
+            func sum() -> Int { return counts.total() }
+        }
+        """)
+        XCTAssertTrue(r.contains("func total() -> Int { reduce"),
+                      "a witness on an external type must stay original:\n\(r)")
+        XCTAssertTrue(r.contains(".total()"), "and so must its use-site:\n\(r)")
+    }
+
+    func testExternalExtension_appleApiNamedMember_staysOriginal() throws {
+        // Fail-closed: `title` is an Apple API name, so RollbackPass shield 1c would block the
+        // revert of a missed use-site — the desync would SHIP. Such a member is not renamed at all.
+        let r = try runPipeline("""
+        extension String {
+            var title: String { uppercased() }
+        }
+        struct Row {
+            let raw: String
+            func label() -> String { return raw.title }
+        }
+        """)
+        XCTAssertTrue(r.contains("var title"), "an Apple-named external-extension member stays original:\n\(r)")
+        XCTAssertTrue(r.contains(".title"), "and so does its use-site:\n\(r)")
+    }
+
+    func testExternalExtension_projectUniqueMember_rewritesUntypeableReceiver() throws {
+        // The SwiftUI `extension View { func frostBound() -> some View }` modifier idiom: every
+        // use-site sits on a chain of SDK calls whose type no syntactic resolver can produce, so
+        // type-matched resolution can never reach them — the decl renames, all use-sites survive and
+        // the whole thing reverts. A name declared EXACTLY once project-wide, in an external-type
+        // extension, that survived the Planner's Apple-name filter can only denote that one member.
+        let r = try runPipeline("""
+        extension Renderable {
+            func frostBound() -> Self { return self }
+        }
+        struct Card {
+            func render() -> Renderable { return makeSurface().padded(2).frostBound() }
+        }
+        """)
+        XCTAssertFalse(r.contains("func frostBound"), "the modifier decl must be obfuscated:\n\(r)")
+        XCTAssertFalse(r.contains(".frostBound()"), "its untypeable use-site must be rewritten too:\n\(r)")
+    }
+
+    func testExternalExtension_nonUniqueMemberName_untypeableReceiverStaysOriginal() throws {
+        // The guard: the name-based rewrite requires the name to be declared exactly ONCE in the
+        // project. A second declaration of any kind (here a local struct's method) makes an
+        // untypeable `.frostBound()` ambiguous, so nothing is rewritten by name (the group then
+        // reverts — under-obfuscation, never a wrong rename).
+        let r = try runPipeline("""
+        extension Renderable {
+            func frostBound() -> Self { return self }
+        }
+        struct Panel {
+            func frostBound() -> Int { return 1 }
+        }
+        struct Card {
+            func render() -> Renderable { return makeSurface().padded(2).frostBound() }
+        }
+        """)
+        XCTAssertTrue(r.contains(".frostBound()"), "an ambiguous name is not rewritten by name:\n\(r)")
+        XCTAssertTrue(r.contains("func frostBound"), "and the declarations revert, staying consistent:\n\(r)")
+    }
+
+    func testExternalExtension_duplicatedAcrossTargets_eachModuleUsesItsOwnCopy() throws {
+        // A multi-target iOS app compiles the same source into several writable targets, so an
+        // external-type extension member exists once PER MODULE, each with its own obf. Without the
+        // same-module tiebreak every such member is ambiguous at every use-site ⇒ reverted, which is
+        // exactly the shape of the tracked IceTrays / IceTrays1 pair.
+        let tempRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SwiftProf-\(UUID().uuidString)")
+        let modA = tempRoot.appendingPathComponent("ModA")
+        let modB = tempRoot.appendingPathComponent("ModB")
+        try FileManager.default.createDirectory(at: modA, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: modB, withIntermediateDirectories: true)
+        let source = """
+        extension String {
+            var commaParts: [String] { split(separator: ",").map { String($0) } }
+        }
+        struct Row {
+            let raw: String
+            func parts() -> [String] { return raw.commaParts }
+        }
+        """
+        try source.write(to: modA.appendingPathComponent("A.swift"), atomically: true, encoding: .utf8)
+        try source.write(to: modB.appendingPathComponent("B.swift"), atomically: true, encoding: .utf8)
+        let specs = [
+            ModuleSpec(name: "ModA", root: modA, writable: true),
+            ModuleSpec(name: "ModB", root: modB, writable: true),
+        ]
+        let options = PipelineOptions(modules: specs,
+                                      outputDirectory: tempRoot.appendingPathComponent("out"),
+                                      dryRun: false, nameStyle: .debug, introspectSDK: false)
+        _ = try Pipeline(options: options, logger: StderrLogger(verbose: false)).run()
+        for url in [modA.appendingPathComponent("A.swift"), modB.appendingPathComponent("B.swift")] {
+            let r = try String(contentsOf: url, encoding: .utf8)
+            XCTAssertFalse(r.contains("var commaParts"), "each target's member must be obfuscated:\n\(r)")
+            XCTAssertFalse(r.contains(".commaParts"), "and each use-site rewritten in its own module:\n\(r)")
+        }
+    }
+
+    func testExternalExtension_localTypeExtension_unaffected() throws {
+        // Guard rail: extensions of OUR OWN types keep resolving by Symbol identity (owner != nil),
+        // untouched by the external-extension path.
+        let r = try runPipeline("""
+        struct Widget { let size: Int }
+        extension Widget { var doubled: Int { size * 2 } }
+        func use(w: Widget) -> Int { return w.doubled }
+        """)
+        XCTAssertFalse(r.contains("var doubled"), "a local extension member must still be obfuscated:\n\(r)")
+        XCTAssertFalse(r.contains("w.doubled"), "and its use-site rewritten:\n\(r)")
+    }
+
+    // MARK: - Stdlib collection members: result shape (B-FIX-30)
+    // Invariant: a stdlib collection member's RESULT is a known function of the receiver's Element
+    // (`first`/`last`/`randomElement()` → Element, `sorted()`/`reversed()`/`filter{}` → a collection
+    // of the same Element, `keys`/`values` → the Dictionary's Key/Value collection). Anything not in
+    // the table stays unknown. The member itself is stdlib — never renamed.
+
+    func testCollectionMember_firstOptionalChain_memberResolves() throws {
+        // `items.first?.tagline` — the receiver is a collection, which names no declaration
+        // (B-FIX-28), so the chain died at `first` and `tagline` stayed original while its decl
+        // renamed → desync (a red build when the survivor is shielded).
+        let r = try runPipeline("""
+        struct Item { let tagline: String }
+        struct Holder {
+            let items: [Item]
+            func lead() -> String? { return items.first?.tagline }
+        }
+        """)
+        XCTAssertFalse(r.contains("let tagline"), "the element property decl must be obfuscated:\n\(r)")
+        XCTAssertFalse(r.contains(".tagline"), "the member through `first` must be rewritten:\n\(r)")
+        XCTAssertTrue(r.contains(".first?."), "the stdlib member itself must stay untouched:\n\(r)")
+    }
+
+    func testCollectionMember_sameElementResult_chainsToElement() throws {
+        // `reversed()` yields a collection with the SAME Element, so the chain continues through it.
+        let r = try runPipeline("""
+        struct Item { let tagline: String }
+        struct Holder {
+            let items: [Item]
+            func lead() -> String? { return items.reversed().first?.tagline }
+        }
+        """)
+        XCTAssertFalse(r.contains(".tagline"), "the member through `reversed().first` must be rewritten:\n\(r)")
+        XCTAssertTrue(r.contains(".reversed().first?."), "stdlib members stay untouched:\n\(r)")
+    }
+
+    func testCollectionMember_dictionaryValues_memberResolves() throws {
+        // `byKey.values.first?.tagline` — `values` is the Dictionary's Value collection.
+        let r = try runPipeline("""
+        struct Item { let tagline: String }
+        struct Holder {
+            let byKey: [String: Item]
+            func lead() -> String? { return byKey.values.first?.tagline }
+        }
+        """)
+        XCTAssertFalse(r.contains(".tagline"), "the member through `values.first` must be rewritten:\n\(r)")
+    }
+
+    func testCollectionMember_forInOverSortedSequence_elementMemberResolves() throws {
+        // The loop-variable inference reads the sequence's RAW declared type; through a collection
+        // member call it had none, so `item.tagline` never resolved.
+        let r = try runPipeline("""
+        struct Item { let tagline: String }
+        struct Holder {
+            let items: [Item]
+            func dump() {
+                for item in items.filter({ _ in true }) {
+                    print(item.tagline)
+                }
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("item.tagline"), "member through the loop variable must be rewritten:\n\(r)")
+    }
+
+    func testCollectionMember_unknownMember_staysFailClosed() throws {
+        // The safety complement: a collection member NOT in the table types nothing, so a member
+        // reached through it is left alone (under-obf) rather than typed by a guess. `Wrapper` here
+        // declares `tagline` too — a guessed receiver type would rewrite to the WRONG member.
+        let r = try runPipeline("""
+        struct Item { let tagline: String }
+        struct Wrapper { let tagline: Int }
+        struct Holder {
+            let items: [Item]
+            func size() -> Int { return items.count }
+        }
+        """)
+        XCTAssertTrue(r.contains("items.count") || r.contains(".count"),
+                      "a stdlib member with no modelled result shape stays untouched:\n\(r)")
+    }
+
     func testOverloadByArgType_arrayArgumentFromMemberAccess_picksArrayOverload() throws {
         // `f(h.items)` where `items: [Item]`. `argConstraint`'s type-NAME fallback only fired for a
         // bare DeclRef, so a member-access argument of collection type carried NO signal once

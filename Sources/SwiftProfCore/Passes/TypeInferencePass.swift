@@ -94,29 +94,15 @@ public final class TypeInferencePass {
 
     /// The raw declaredType string of the leaf-most identifier/property in a sequence expr, PLUS the
     /// scope that string was written in (the declaring scope of the symbol carrying it).
+    ///
+    /// Delegates to `TypeResolver.receiverTypeInfo`, the single place that answers "what is the
+    /// WRITTEN type name of this expression" (brackets intact). Sharing it means a sequence spelled
+    /// through a stdlib collection member (`for x in items.filter { … }`, `for v in dict.values`) or
+    /// through a call (`for x in makeItems()`) types its loop variable too, instead of each consumer
+    /// re-implementing a narrower walk (B-FIX-30).
     private func leafDeclaredType(of expr: ExprSyntax, in scope: Scope) -> (name: String, scope: Scope)? {
-        if let opt = expr.as(OptionalChainingExprSyntax.self) {
-            return leafDeclaredType(of: opt.expression, in: scope)
-        }
-        if let force = expr.as(ForceUnwrapExprSyntax.self) {
-            return leafDeclaredType(of: force.expression, in: scope)
-        }
-        if let ref = expr.as(DeclReferenceExprSyntax.self) {
-            let name = TypeResolver.stripBackticks(ref.baseName.text)
-            if let sym = scope.lookup(name: name), let type = table.declaredType[sym.id] {
-                return (type, sym.scope ?? scope)
-            }
-            return nil
-        }
-        if let member = expr.as(MemberAccessExprSyntax.self), let base = member.base {
-            guard let baseSym = resolver.typeSymbol(of: base, in: scope),
-                  let baseScope = resolver.canonicalInnerScope(of: baseSym) else { return nil }
-            let memberName = TypeResolver.stripBackticks(member.declName.baseName.text)
-            guard let memberSym = baseScope.member(named: memberName),
-                  let type = table.declaredType[memberSym.id] else { return nil }
-            return (type, memberSym.scope ?? scope)
-        }
-        return nil
+        guard let info = resolver.receiverTypeInfo(of: expr, in: scope) else { return nil }
+        return (info.name, info.declScope)
     }
 
     private func extractElement(from typeName: String) -> String? {

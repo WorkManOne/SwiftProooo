@@ -124,15 +124,95 @@ public final class SymbolTable {
         /// conformances declared on the extension, invisible from the extended type's primary decl
         /// — both ConformanceVisibility and WitnessLinker need them (B-FIX-6).
         public let inheritedNames: [String]
+        /// Right-hand side of an `Element == X` same-type requirement in the extension's
+        /// `where` clause (`extension Array where Element == Mood`), when present. Only meaningful
+        /// for an extension on a stdlib COLLECTION — it is what tells two same-named members on
+        /// `[Mood]` and `[String]` apart at a use-site (B-FIX-31).
+        public let elementConstraint: String?
     }
     public private(set) var extensionRefs: [ExtensionRef] = []
+
+    /// An extension of a type that is NOT in our table — a stdlib/SDK type (`extension String`,
+    /// `extension Array where Element == Mood`). Its members ARE renameable: since the extended type
+    /// has no Symbol, use-sites are matched by the receiver's WRITTEN TYPE instead of by Symbol
+    /// identity (B-FIX-31). The scope is deliberately NOT unified with anything — an extension on
+    /// `Array` must never make its members visible on the ELEMENT type.
+    public struct ExternalExtensionRef {
+        public let scope: Scope
+        /// Extended type normalized to a base NAME: `Array` for both `Array`, `[Mood]` and
+        /// `Array<Mood>`; `Dictionary` for `[K: V]`; `String` for a plain named type.
+        public let baseName: String
+        /// The Element this extension is constrained to (from a `where Element == X` clause or from
+        /// the sugar/generic spelling). nil ⇒ applies to every element type.
+        public let elementConstraint: String?
+        /// Scope the two names above were written in (the extension's enclosing scope): a nested
+        /// element type spelled unqualified resolves only there (B-FIX-23 discipline).
+        public let declScope: Scope
+        public let module: String
+    }
+    public private(set) var externalExtensions: [ExternalExtensionRef] = []
+    private var externalExtensionScopes: Set<ObjectIdentifier> = []
 
     public init() {}
 
     public func registerExtension(scope: Scope, extendedType: TypeSyntax, file: SourceFile,
-                                  inheritedNames: [String] = []) {
+                                  inheritedNames: [String] = [], elementConstraint: String? = nil) {
         extensionRefs.append(ExtensionRef(scope: scope, extendedType: extendedType, file: file,
-                                          inheritedNames: inheritedNames))
+                                          inheritedNames: inheritedNames,
+                                          elementConstraint: elementConstraint))
+    }
+
+    /// Collect the extensions whose owner did NOT resolve — i.e. extensions on external types —
+    /// into `externalExtensions`. Call once after `ExtensionOwnerResolver` and BEFORE
+    /// `ScopeUnification` (which rewires only owned extension scopes).
+    ///
+    /// Fail-closed eligibility: an extension is skipped when IT, or any other extension of the SAME
+    /// extended type anywhere in the project, declares a conformance. Such members are witnesses of
+    /// a protocol on a type we don't own, so `WitnessLinker` cannot pair them with the requirement
+    /// and renaming one silently breaks the conformance.
+    public func finalizeExternalExtensions() {
+        var conformingBases = Set<String>()
+        for ext in extensionRefs where !ext.inheritedNames.isEmpty {
+            conformingBases.insert(Self.normalizedExtendedType(ext).base)
+        }
+        for ext in extensionRefs where ext.scope.owner == nil {
+            guard ext.inheritedNames.isEmpty, let declScope = ext.scope.parent else { continue }
+            let normalized = Self.normalizedExtendedType(ext)
+            guard !conformingBases.contains(normalized.base) else { continue }
+            externalExtensions.append(ExternalExtensionRef(
+                scope: ext.scope, baseName: normalized.base, elementConstraint: normalized.element,
+                declScope: declScope, module: ext.file.module.name
+            ))
+            externalExtensionScopes.insert(ObjectIdentifier(ext.scope))
+        }
+    }
+
+    /// True when `scope` is the body of an eligible external-type extension (see above).
+    public func isExternalExtensionScope(_ scope: Scope) -> Bool {
+        externalExtensionScopes.contains(ObjectIdentifier(scope))
+    }
+
+    /// Base name + element constraint of an extended type, folding the sugar and generic spellings
+    /// onto the same pair: `[Mood]` / `Array<Mood>` / `Array where Element == Mood` all normalize to
+    /// (`Array`, `Mood`); `[K: V]` to (`Dictionary`, nil); `String` to (`String`, nil).
+    static func normalizedExtendedType(_ ext: ExtensionRef) -> (base: String, element: String?) {
+        let written = ext.extendedType.trimmedDescription.trimmingCharacters(in: .whitespaces)
+        if written.hasPrefix("["), written.hasSuffix("]") {
+            let inner = String(written.dropFirst().dropLast())
+            if TypeResolver.topLevelIndex(of: ":", in: inner) != nil { return ("Dictionary", nil) }
+            return ("Array", inner.trimmingCharacters(in: .whitespaces))
+        }
+        guard let lt = written.firstIndex(of: "<"), written.hasSuffix(">") else {
+            return (written, ext.elementConstraint)
+        }
+        let base = String(written[..<lt])
+        let args = String(written[written.index(after: lt)...].dropLast())
+        // A single generic argument on a collection IS the Element (`Array<Mood>`); anything else
+        // (Dictionary's two arguments, an unparsable list) carries no element constraint.
+        if TypeResolver.topLevelIndex(of: ",", in: args) == nil {
+            return (base, args.trimmingCharacters(in: .whitespaces))
+        }
+        return (base, ext.elementConstraint)
     }
 
     /// Record a `subscript(...) -> R` declaration. `enclosingScope` is the type/extension scope that
