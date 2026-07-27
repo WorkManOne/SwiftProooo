@@ -61,6 +61,13 @@ public final class SymbolTable {
     /// properties are EXCLUDED — they never appear in synthesized CodingKeys, so they stay renameable
     /// too. Fail-closed: an instance binding we can't classify is treated as stored.
     public internal(set) var storedPropertyIds: Set<Int> = []
+    /// Associated-value TYPE names of an enum case, positionally (`case run(Mood)` → ["Mood"]); nil
+    /// entries are types we don't track. A case with a payload is CALLED like a function, so this is
+    /// the `functionParamTypes` of that call: without it a payload argument (`Command.run(.calm)`)
+    /// has no contextual type, the shorthand stays original while the case renames, and the survivor
+    /// reverts the enum's whole case group — plus the payload enum's, since the same argument site
+    /// blocks both.
+    public internal(set) var enumCaseAssociatedTypes: [Int: [String?]] = [:]
     /// IDs of generic-parameter placeholder symbols (`T` in `func f<T: P>(…)`, `<Element>` on a
     /// type). Registered as `.typealias_` (target = the constraint, so `r: T` member access
     /// resolves through the protocol) but NEVER renamed — a generic param is a local placeholder,

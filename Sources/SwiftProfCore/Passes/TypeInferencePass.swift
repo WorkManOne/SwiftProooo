@@ -46,7 +46,7 @@ public final class TypeInferencePass {
                 inferred += 1
                 logger.log("[infer-loop] \(sym.name)#\(sym.id) → \(elementName)", verbose: true)
             } else {
-                let leaf = leafDeclaredTypeName(of: seq, in: scope) ?? "<nil>"
+                let leaf = leafDeclaredType(of: seq, in: scope)?.name ?? "<nil>"
                 logger.log("[infer-loop-fail] \(sym.name)#\(sym.id) — leaf=\(leaf)", verbose: true)
             }
         }
@@ -79,22 +79,32 @@ public final class TypeInferencePass {
         // usually a generic `Array<Element>` which we DON'T capture in declaredType (we only
         // store IdentifierTypeSyntax base names). Instead, peek at the declared type STRING
         // for the leaf reference and parse it for `[T]` / `Array<T>` / `Set<T>` syntax.
-        guard let typeName = leafDeclaredTypeName(of: expr, in: scope) else { return nil }
-        return extractElement(from: typeName)
+        guard let leaf = leafDeclaredType(of: expr, in: scope),
+              let element = extractElement(from: leaf.name) else { return nil }
+        // The element name is written in the scope of the SEQUENCE's declaration, so a nested type
+        // spelled unqualified (`[Section]` on `Container`) is invisible from the loop body. Resolve
+        // it there and store the QUALIFIED name, exactly as the initializer-driven inference does —
+        // otherwise every member reached through the loop variable stays un-renamed while the member
+        // decl renames, which is a red build whenever the name is shielded from rollback.
+        if let sym = resolver.typeSymbol(forQualifiedName: element, in: leaf.scope) {
+            return Self.qualifiedName(of: sym)
+        }
+        return element   // external/stdlib element (String, URL) — nothing to qualify
     }
 
-    /// Get the raw declaredType string of the leaf-most identifier/property in a sequence expr.
-    private func leafDeclaredTypeName(of expr: ExprSyntax, in scope: Scope) -> String? {
+    /// The raw declaredType string of the leaf-most identifier/property in a sequence expr, PLUS the
+    /// scope that string was written in (the declaring scope of the symbol carrying it).
+    private func leafDeclaredType(of expr: ExprSyntax, in scope: Scope) -> (name: String, scope: Scope)? {
         if let opt = expr.as(OptionalChainingExprSyntax.self) {
-            return leafDeclaredTypeName(of: opt.expression, in: scope)
+            return leafDeclaredType(of: opt.expression, in: scope)
         }
         if let force = expr.as(ForceUnwrapExprSyntax.self) {
-            return leafDeclaredTypeName(of: force.expression, in: scope)
+            return leafDeclaredType(of: force.expression, in: scope)
         }
         if let ref = expr.as(DeclReferenceExprSyntax.self) {
             let name = TypeResolver.stripBackticks(ref.baseName.text)
-            if let sym = scope.lookup(name: name) {
-                return table.declaredType[sym.id]
+            if let sym = scope.lookup(name: name), let type = table.declaredType[sym.id] {
+                return (type, sym.scope ?? scope)
             }
             return nil
         }
@@ -102,8 +112,9 @@ public final class TypeInferencePass {
             guard let baseSym = resolver.typeSymbol(of: base, in: scope),
                   let baseScope = resolver.canonicalInnerScope(of: baseSym) else { return nil }
             let memberName = TypeResolver.stripBackticks(member.declName.baseName.text)
-            guard let memberSym = baseScope.member(named: memberName) else { return nil }
-            return table.declaredType[memberSym.id]
+            guard let memberSym = baseScope.member(named: memberName),
+                  let type = table.declaredType[memberSym.id] else { return nil }
+            return (type, memberSym.scope ?? scope)
         }
         return nil
     }

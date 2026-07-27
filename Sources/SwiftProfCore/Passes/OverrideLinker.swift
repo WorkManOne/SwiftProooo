@@ -150,6 +150,11 @@ public final class OverrideLinker {
     /// Swift override has an identical signature, so a mismatch here means "not this overload" — and
     /// if it leaves no local base at all the group is reverted (fail-closed). Return type is not
     /// compared (covariant overrides are allowed).
+    ///
+    /// Type comparison goes through `TypeNameEquivalence.sameType` (B-FIX-27): the base and the
+    /// override are written in DIFFERENT lexical positions, so the same type is routinely spelled
+    /// differently (bare vs qualified, through a typealias). The old plain string compare missed
+    /// those pairs → no local base found → the whole chain reverted (under-obfuscation).
     private func signaturesCompatible(_ a: Symbol, _ b: Symbol) -> Bool {
         guard (table.functionParamLabels[a.id] ?? []) == (table.functionParamLabels[b.id] ?? []) else {
             return false
@@ -159,15 +164,12 @@ public final class OverrideLinker {
         guard ta.count == tb.count else { return false }
         for (x, y) in zip(ta, tb) {
             guard let x, let y else { continue }            // wildcard
-            if bareName(x) != bareName(y) { return false }
+            if TypeNameEquivalence.sameType(x, inScope: a.scope, module: a.module.name,
+                                            y, inScope: b.scope, module: b.module.name,
+                                            table: table) { continue }
+            return false
         }
         return true
-    }
-
-    private func bareName(_ s: String) -> String {
-        var n = s
-        while n.hasSuffix("?") || n.hasSuffix("!") { n = String(n.dropLast()) }
-        return n
     }
 
     // MARK: - Indexes

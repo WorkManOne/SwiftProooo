@@ -95,8 +95,13 @@ private final class DeclVisitor: SyntaxVisitor {
             return "[\(arr.element.trimmedDescription)]"
         }
         // `[K: V]` — keep the dictionary form so a subscript on it (`dict[k]`) can extract the Value
-        // type. Consumers that only understand arrays already bail on the `:` (extractElement,
-        // typeSymbol(forQualifiedName:)), so this is strictly more information, never a mis-resolution.
+        // type. Consumers that only understand arrays bail on the `:` (extractElement,
+        // typeSymbol(forQualifiedName:)) — which is NOT automatically harmless: a consumer that
+        // treats a nil entry as a WILDCARD reads this string as "a type I can't resolve" and flips
+        // from "matches anything" to "matches nothing". That is exactly how witness linking broke
+        // into a red build (B-FIX-27); signature comparison now decomposes the form structurally
+        // (`TypeNameEquivalence.sameType`). Check nil semantics at EVERY consumer before widening
+        // what this function returns.
         if let dict = t.as(DictionaryTypeSyntax.self) {
             return "[\(dict.key.trimmedDescription): \(dict.value.trimmedDescription)]"
         }
@@ -646,7 +651,13 @@ private final class DeclVisitor: SyntaxVisitor {
 
     override func visit(_ node: EnumCaseDeclSyntax) -> SyntaxVisitorContinueKind {
         for element in node.elements {
-            _ = makeSymbol(name: element.name.text, kind: .enumCase, identifierToken: element.name)
+            let sym = makeSymbol(name: element.name.text, kind: .enumCase, identifierToken: element.name)
+            // A case WITH associated values is CALLED like a function (`Command.run(.calm)`), so its
+            // payload types play the role of `functionParamTypes` for that call — they are what lets
+            // a shorthand payload argument learn its contextual enum.
+            if let params = element.parameterClause?.parameters {
+                table.enumCaseAssociatedTypes[sym.id] = params.map { Self.simpleTypeName($0.type) }
+            }
         }
         return .visitChildren
     }

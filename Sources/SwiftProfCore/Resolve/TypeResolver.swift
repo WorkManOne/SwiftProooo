@@ -113,6 +113,19 @@ public final class TypeResolver {
                typeSym.kind.isTypeLike {
                 return typeSym
             }
+            // `E.case(payload)` — an enum case WITH associated values is called like a function, and
+            // the expression's type is the ENUM itself, not a method return. Must precede the method
+            // case, which finds no callable and would give up: without this a `let c = E.case(x)`
+            // binding stays untyped, so a `switch c` cannot type its patterns and every shorthand in
+            // it survives → the case group reverts.
+            if let memberCall = call.calledExpression.as(MemberAccessExprSyntax.self),
+               let base = memberCall.base,
+               let baseSym = typeSymbol(of: base, in: scope), baseSym.kind == .enum,
+               let inner = canonicalInnerScope(of: baseSym),
+               inner.members(named: Self.stripBackticks(memberCall.declName.baseName.text))
+                    .contains(where: { $0.kind == .enumCase }) {
+                return baseSym
+            }
             // `receiver.method(args)` → method's return-type Symbol (when we tracked it). Without
             // this, chains like `obj.foo().bar` couldn't resolve `.bar` against `foo()`'s return
             // type, so use-sites past a method call were left un-renamed. Picks the method by
@@ -178,6 +191,14 @@ public final class TypeResolver {
                 // when the name was absent from the scope tree.
                 if sym.kind == .parameter,
                    let typeName = inferNamedClosureParamType(name: name, from: ref, in: scope) {
+                    return typeSymbol(forQualifiedName: typeName, in: scope)
+                }
+                // A REGISTERED but untyped binding whose type the caller knows out-of-band — an
+                // enum-case payload bound by `case .run(let m)`, recorded flow-sensitively by
+                // ResolutionVisitor. Without this the provider was reachable only for bindings that
+                // are absent from the scope tree (`if let`), so every payload binding stayed untyped.
+                if sym.kind == .parameter, let provider = localBindingTypeName,
+                   let typeName = provider(name) {
                     return typeSymbol(forQualifiedName: typeName, in: scope)
                 }
                 return nil
@@ -333,13 +354,19 @@ public final class TypeResolver {
         while name.hasSuffix("?") || name.hasSuffix("!") {
             name = String(name.dropLast())
         }
-        // Bare-array `[T]` → resolve T (caller will likely want Element type instead, but
-        // this best-effort makes simple cases work).
-        if name.hasPrefix("[") && name.hasSuffix("]") {
-            let inner = String(name.dropFirst().dropLast()).trimmingCharacters(in: .whitespaces)
-            if inner.contains(":") || inner.isEmpty { return nil }
-            return typeSymbol(forQualifiedName: inner, in: scope)
-        }
+        // A COLLECTION type names no declaration in our table: `[T]` is Array<T> (a stdlib type),
+        // NOT `T`. This function answers "which DECLARATION does this name refer to", and its
+        // result is fed straight into member lookup — so returning the Element for an array made
+        // `items.count` (where `items: [Item]` and `Item` declares `count`) resolve to `Item.count`
+        // and rewrite the use-site to that member's obf ⇒ "value of type '[Item]' has no member
+        // '<obf>'". A wrong rename, invisible to RollbackPass (both ends renamed consistently, no
+        // original survives). Dictionaries were already fail-closed here; arrays were not, and the
+        // plausible-looking substitution is exactly what hid the flaw (B-FIX-28).
+        //
+        // Callers that genuinely want the ELEMENT ask for it explicitly — `extractElement` /
+        // `dictionaryValueType` (HOF closure typing, subscript results, B-FIX-22). Fail closed here
+        // so member access on a collection stays unresolved (no rename) instead of guessing.
+        if name.hasPrefix("[") && name.hasSuffix("]") { return nil }
         // Strip generic argument clauses per segment (`Box<Foo>` → `Box`, `Outer<T>.Inner` →
         // `Outer.Inner`) so a member access through a generic-typed value resolves to the BASE
         // type's scope. Element substitution beyond this (typing `box.value` as the concrete `T`)
@@ -696,6 +723,29 @@ public final class TypeResolver {
         return matches.allSatisfy { $0.returnType == first.returnType } ? first.returnType : nil
     }
 
+    /// Key type of a Dictionary type string: `[K: V]` → "K", `Dictionary<K, V>` → "K". Mirror of
+    /// `dictionaryValueType` (same balanced scan, same fail-closed contract) — needed because a
+    /// shorthand `.case` in a dictionary LITERAL takes its context from the Key on one side of the
+    /// `:` and from the Value on the other.
+    static func dictionaryKeyType(from typeName: String) -> String? {
+        var name = typeName.trimmingCharacters(in: .whitespaces)
+        while name.hasSuffix("?") || name.hasSuffix("!") { name = String(name.dropLast()) }
+        if name.hasPrefix("[") && name.hasSuffix("]") {
+            let inner = String(name.dropFirst().dropLast())
+            guard let idx = topLevelIndex(of: ":", in: inner) else { return nil }
+            let key = String(inner[..<idx]).trimmingCharacters(in: .whitespaces)
+            return key.isEmpty ? nil : key
+        }
+        let prefix = "Dictionary<"
+        if name.hasPrefix(prefix) && name.hasSuffix(">") {
+            let inner = String(name.dropFirst(prefix.count).dropLast())
+            guard let idx = topLevelIndex(of: ",", in: inner) else { return nil }
+            let key = String(inner[..<idx]).trimmingCharacters(in: .whitespaces)
+            return key.isEmpty ? nil : key
+        }
+        return nil
+    }
+
     /// Value type of a Dictionary type string: `[K: V]` → "V", `Dictionary<K, V>` → "V". Uses a
     /// balanced scan for the TOP-LEVEL separator so nested generics/brackets don't mis-split. Returns
     /// nil (fail-closed) on anything it can't parse cleanly — a wrong value type would drive a wrong rename.
@@ -720,7 +770,8 @@ public final class TypeResolver {
 
     /// First index of `target` in `s` at bracket/angle/paren depth 0 (nil if none). Keeps a nested
     /// generic key like `[Wrap<A, B>: V]` from splitting on the inner comma/colon.
-    private static func topLevelIndex(of target: Character, in s: String) -> String.Index? {
+    /// Shared with `TypeNameEquivalence` (one balanced-scan implementation, B-FIX-27).
+    static func topLevelIndex(of target: Character, in s: String) -> String.Index? {
         var depth = 0
         for i in s.indices {
             let c = s[i]

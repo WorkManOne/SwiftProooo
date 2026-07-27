@@ -163,11 +163,13 @@ public final class WitnessLinker {
 
     /// Two method symbols have compatible signatures when their external labels match and no
     /// KNOWN parameter types differ. Unknown (untracked) types are treated as wildcards so we
-    /// never MISS a genuine witness whose type we couldn't model. When two type-name strings
-    /// differ TEXTUALLY (e.g. a witness writes `Inner` while the protocol requirement writes
-    /// `Outer.Inner` for the SAME nested enum), we resolve both names to Symbols and compare by
-    /// Symbol identity — string compare alone treats the same type as different and misses the
-    /// witness link.
+    /// never MISS a genuine witness whose type we couldn't model. Two type-name strings that
+    /// differ TEXTUALLY may still denote the SAME type (a witness writes `Inner` while the
+    /// requirement writes `Outer.Inner`; a witness writes a dictionary key through a typealias) —
+    /// `TypeNameEquivalence.sameType` decides that structurally, resolving each LEAF to a Symbol.
+    /// Comparing the whole string (or handing a composite name to the leaf resolver, which bails
+    /// on it) misses the witness link and lets both sides mint their own obf ⇒ "does not conform"
+    /// (B-FIX-27).
     private func signaturesCompatible(_ a: Symbol, _ b: Symbol) -> Bool {
         guard (table.functionParamLabels[a.id] ?? []) == (table.functionParamLabels[b.id] ?? []) else {
             return false
@@ -177,31 +179,12 @@ public final class WitnessLinker {
         guard ta.count == tb.count else { return true }
         for (x, y) in zip(ta, tb) {
             guard let x, let y else { continue }   // wildcard
-            let bx = bareName(x), by = bareName(y)
-            if bx == by { continue }
-            // Different strings — handles bare-vs-qualified, typealias resolution, etc.
-            if let xSym = resolveTypeName(bx, fromScope: a.scope, moduleHint: a.module.name),
-               let ySym = resolveTypeName(by, fromScope: b.scope, moduleHint: b.module.name),
-               xSym.id == ySym.id {
-                continue
-            }
+            if TypeNameEquivalence.sameType(x, inScope: a.scope, module: a.module.name,
+                                            y, inScope: b.scope, module: b.module.name,
+                                            table: table) { continue }
             return false
         }
         return true
-    }
-
-    private func bareName(_ s: String) -> String {
-        var n = s
-        while n.hasSuffix("?") || n.hasSuffix("!") { n = String(n.dropLast()) }
-        return n
-    }
-
-    /// Resolve a type-name string written at `scope`'s lexical position to a Symbol (handles
-    /// bare names visible via scope chain, dotted qualified names, optional/array suffixes).
-    private func resolveTypeName(_ name: String, fromScope scope: Scope?, moduleHint: String) -> Symbol? {
-        guard let scope = scope else { return nil }
-        return TypeResolver(table: table, preferredModule: moduleHint)
-            .typeSymbol(forQualifiedName: name, in: scope)
     }
 
     private func membersOfType(_ sym: Symbol) -> [Symbol] {

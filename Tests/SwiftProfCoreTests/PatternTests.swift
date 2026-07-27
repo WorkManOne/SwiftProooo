@@ -2982,4 +2982,527 @@ final class PatternTests: XCTestCase {
         XCTAssertNotNil(line, "shielded survivor must be reported in the high-signal tier:\n\(diag)")
         XCTAssertTrue(line?.contains("shield=1c") == true, "shield must be named: \(line ?? "")")
     }
+
+    // MARK: - Composite parameter types in signature matching (B-FIX-27)
+
+    /// Every `func <name>` declared in the rewritten source, in order.
+    private static func declaredFuncNames(in source: String) -> [String] {
+        source.split(separator: "\n").compactMap { line -> String? in
+            guard let r = line.range(of: "func ") else { return nil }
+            let name = line[r.upperBound...].prefix { $0 != "(" && $0 != "<" && $0 != " " }
+            return name.isEmpty ? nil : String(name)
+        }
+    }
+
+    func testWitness_dictionaryParamWithTypealiasKey_linksToRequirement() throws {
+        // A witness writes the dictionary KEY through a typealias (`[T1: E3.S4]`) while the
+        // requirement writes it qualified (`[E3.S2.E1: E3.S4]`). The two spellings denote the same
+        // type, so this IS the witness — but `signaturesCompatible` compared the WHOLE type-name
+        // string and its fallback (`typeSymbol(forQualifiedName:)`) bails on any name containing a
+        // top-level `:`, so a dictionary name never resolves to a Symbol and the typealias unwrap
+        // was never reached. Result: no witness link → requirement and witness each minted their
+        // OWN obf → "Type 'C1' does not conform to protocol 'P1'" (a wrong-rename red RollbackPass
+        // cannot catch — no original name survives).
+        let source = """
+        enum E3 {
+            struct S2 { enum E1 { case alpha, beta } }
+            struct S4 { let v1: Int }
+        }
+        struct S1 { let v2: Int }
+        typealias KeyAlias = E3.S2.E1
+        protocol P1 {
+            func f1(_ par2: [S1], par1: [E3.S2.E1: E3.S4]?) -> [S1]
+        }
+        final class C1: P1 {
+            func f1(_ par2: [S1], par1: [KeyAlias: E3.S4]?) -> [S1] { return par2 }
+        }
+        """
+        let r = try runPipeline(source)
+        let names = Self.declaredFuncNames(in: r)
+        XCTAssertFalse(r.contains("func f1("), "f1 must be obfuscated:\n\(r)")
+        XCTAssertEqual(Set(names).count, 1,
+                       "requirement and witness must share ONE obf, got \(names):\n\(r)")
+    }
+
+    func testWitness_dictionaryParamDifferentValueType_staysUnlinked() throws {
+        // The complement: structural comparison must not over-link. `g1(par1: [K1: V2])` is an
+        // unrelated overload of the witness `g1(par1: [K1: V1])` — same name, same labels, different
+        // Value type — and must keep its OWN obf. Treating an unresolvable dictionary name as a
+        // wildcard would collapse both onto the requirement's obf → "invalid redeclaration".
+        let source = """
+        enum K1 { case alpha }
+        struct V1 { let v1: Int }
+        struct V2 { let v2: Int }
+        protocol P2 {
+            func g1(par1: [K1: V1])
+        }
+        final class C2: P2 {
+            func g1(par1: [K1: V1]) {}
+            func g1(par1: [K1: V2]) {}
+        }
+        """
+        let r = try runPipeline(source)
+        let names = Self.declaredFuncNames(in: r)
+        XCTAssertFalse(r.contains("func g1("), "g1 must be obfuscated:\n\(r)")
+        XCTAssertEqual(Set(names).count, 2,
+                       "witness shares the requirement's obf; the unrelated overload keeps its own, got \(names):\n\(r)")
+    }
+
+    func testArrayTypedProperty_collectionMemberNotRewrittenToElementMember() throws {
+        // `items: [Item]` + `Item` declaring `count` — `items.count` is Array.count, NOT Item.count.
+        // `typeSymbol(forQualifiedName:)` used to answer `[Item]` with the ELEMENT's Symbol, so the
+        // member lookup found `Item.count` and rewrote the use-site to that member's obf ⇒ "value of
+        // type '[Item]' has no member '<obf>'". A wrong rename, invisible to RollbackPass: both ends
+        // were renamed consistently, so no original name survived to trip the scan (B-FIX-28).
+        let source = """
+        struct Item {
+            let count: Int
+        }
+        struct Holder {
+            let items: [Item]
+            func total() -> Int { return items.count }
+        }
+        """
+        let r = try runPipeline(source)
+        XCTAssertTrue(r.contains(".count"),
+                      "Array.count must stay untouched — it is not Item's member:\n\(r)")
+        // The asymmetry is the point: Item's OWN `count` is still obfuscated at its declaration,
+        // only the collection access is left alone. (`count` is an Apple API name, so RollbackPass
+        // shield 1c blocks the revert the surviving use-site would otherwise trigger.)
+        XCTAssertFalse(r.contains("let count: Int"),
+                       "Item.count declaration should still be renamed:\n\(r)")
+    }
+
+    func testWitness_typealiasToArrayParam_stillLinks() throws {
+        // Guards the compensation for B-FIX-28: with the array substitution gone, `ItemList` no
+        // longer unwraps to a Symbol shared with `[Item2]`, so signature comparison expands the
+        // alias TEXTUALLY instead. Without that, this witness would stop linking — trading one red
+        // build for another.
+        let source = """
+        struct Item2 { let v1: Int }
+        typealias ItemList = [Item2]
+        protocol P3 {
+            func k1(par1: ItemList) -> Int
+        }
+        final class C3: P3 {
+            func k1(par1: [Item2]) -> Int { return par1.count }
+        }
+        """
+        let r = try runPipeline(source)
+        let names = Self.declaredFuncNames(in: r)
+        XCTAssertFalse(r.contains("func k1("), "k1 must be obfuscated:\n\(r)")
+        XCTAssertEqual(Set(names).count, 1,
+                       "requirement and witness must share ONE obf across the array typealias, got \(names):\n\(r)")
+    }
+
+    func testOverride_dictionaryParamTypealias_chainSharesObf() throws {
+        // Same invariant on the OverrideLinker side: the override writes the dictionary key through
+        // a typealias, the base writes it qualified. Its comparison was a plain string compare (no
+        // Symbol resolution at all), so the pair never matched → no local base → group revert
+        // (under-obfuscation, green build). Now they unify.
+        let source = """
+        enum NS1 {
+            enum K2 { case alpha }
+            struct V3 { let v1: Int }
+        }
+        typealias KeyAlias2 = NS1.K2
+        class B1 {
+            func h1(par1: [NS1.K2: NS1.V3]) {}
+        }
+        final class D1: B1 {
+            override func h1(par1: [KeyAlias2: NS1.V3]) {}
+        }
+        """
+        let r = try runPipeline(source)
+        let names = Self.declaredFuncNames(in: r)
+        XCTAssertFalse(r.contains("func h1("), "h1 must be obfuscated:\n\(r)")
+        XCTAssertEqual(Set(names).count, 1,
+                       "base and override must share ONE obf, got \(names):\n\(r)")
+    }
+
+    // MARK: - Contextual `.case` through literals and constructors (B-FIX-29)
+
+    func testEnumCaseShorthand_inArrayLiteralCallArgument_resolves() throws {
+        // `f(xs: [.alpha])` — the shorthand sits inside an ARRAY LITERAL argument, so its context is
+        // the ELEMENT of the parameter's type. The call-argument branch of `contextualTypeName`
+        // hands the parameter type text (`[E]`) straight to the resolver, which (correctly, since
+        // B-FIX-28) answers nil for a collection name. Every sibling branch peels the written
+        // wrappers via `scalarElementType`; this one did not, so the case decl renamed while
+        // `.alpha` survived → revert (under-obf) or, when the case name is shielded, a red build.
+        let r = try runPipeline("""
+        enum E { case alpha, beta }
+        func f(xs: [E]) { _ = xs }
+        func use() { f(xs: [.alpha, .beta]) }
+        """)
+        XCTAssertFalse(r.contains("case alpha"), "case alpha must be obfuscated:\n\(r)")
+        XCTAssertFalse(r.contains(".alpha"), "`.alpha` inside the array-literal argument must be rewritten:\n\(r)")
+        XCTAssertFalse(r.contains(".beta"), "`.beta` inside the array-literal argument must be rewritten:\n\(r)")
+    }
+
+    func testEnumCaseShorthand_inDictionaryLiteralCallArgument_keyAndValueResolve() throws {
+        // `[.alpha: .beta]` — the KEY takes the parameter's Key type and the VALUE its Value type.
+        // The two sides must peel differently, so the literal path (not just "unwrap one level")
+        // is what determines the context.
+        let r = try runPipeline("""
+        enum K { case alpha }
+        enum V { case beta }
+        func f(m: [K: V]) { _ = m }
+        func use() { f(m: [.alpha: .beta]) }
+        """)
+        XCTAssertFalse(r.contains("case alpha"), "key case must be obfuscated:\n\(r)")
+        XCTAssertFalse(r.contains(".alpha"), "dictionary-literal KEY shorthand must be rewritten:\n\(r)")
+        XCTAssertFalse(r.contains(".beta"), "dictionary-literal VALUE shorthand must be rewritten:\n\(r)")
+    }
+
+    func testEnumCaseShorthand_inNestedArrayLiteralArgument_resolves() throws {
+        // `[[.alpha]]` against `[[E]]` — two peels, so the peel count must follow the literal
+        // nesting rather than being a single fixed unwrap.
+        let r = try runPipeline("""
+        enum E { case alpha }
+        func f(rows: [[E]]) { _ = rows }
+        func use() { f(rows: [[.alpha]]) }
+        """)
+        XCTAssertFalse(r.contains("case alpha"), "case alpha must be obfuscated:\n\(r)")
+        XCTAssertFalse(r.contains(".alpha"), "`.alpha` in the nested array literal must be rewritten:\n\(r)")
+    }
+
+    func testEnumCaseShorthand_inArrayLiteralForSetParameter_resolves() throws {
+        // An array literal also builds a `Set<E>` — the peel must understand the GENERIC collection
+        // spelling, not only the `[E]` sugar (`extractElement` already knows both).
+        let r = try runPipeline("""
+        enum E { case alpha }
+        func f(s: Set<E>) { _ = s }
+        func use() { f(s: [.alpha]) }
+        """)
+        XCTAssertFalse(r.contains("case alpha"), "case alpha must be obfuscated:\n\(r)")
+        XCTAssertFalse(r.contains(".alpha"), "`.alpha` in the Set literal must be rewritten:\n\(r)")
+    }
+
+    func testEnumCaseShorthand_inDictionaryAnnotationInitializer_resolves() throws {
+        // The annotation branch had the same blind spot for dictionaries: `scalarElementType` models
+        // arrays and optionals only, so `[K: V]` returned nil and the walk-up CONTINUED into outer
+        // contexts (a wrong context is worse than none).
+        let r = try runPipeline("""
+        enum K { case alpha }
+        enum V { case beta }
+        let m: [K: V] = [.alpha: .beta]
+        """)
+        XCTAssertFalse(r.contains(".alpha"), "annotation-dictionary KEY shorthand must be rewritten:\n\(r)")
+        XCTAssertFalse(r.contains(".beta"), "annotation-dictionary VALUE shorthand must be rewritten:\n\(r)")
+    }
+
+    func testEnumCaseShorthand_inMemberwiseInitArgument_resolves() throws {
+        // `Config(mode: .alpha)` — a struct's SYNTHESIZED memberwise init. `resolveCalleeParamType`
+        // knew only free functions and `obj.method(...)`; a type name is not a callable, so the
+        // shorthand got NO context. One un-covered constructor call reverts the whole enum's case
+        // group (the revert is per NAME, not per site), so this is the widest coverage hole of the
+        // contextual family.
+        let r = try runPipeline("""
+        enum Mode { case alpha, beta }
+        struct Config { let mode: Mode; let flag: Bool }
+        func make() -> Config { return Config(mode: .alpha, flag: true) }
+        """)
+        XCTAssertFalse(r.contains("case alpha"), "case alpha must be obfuscated:\n\(r)")
+        XCTAssertFalse(r.contains(".alpha"), "`.alpha` in the memberwise-init argument must be rewritten:\n\(r)")
+    }
+
+    func testEnumCaseShorthand_inExplicitInitArgument_picksOverloadByLabel() throws {
+        // Explicit inits are registered as `init` symbols WITH param types/labels — they only need
+        // looking up. Two inits with different labels prove the pick is label-driven, not first-wins.
+        let r = try runPipeline("""
+        enum Mode { case alpha }
+        enum Level { case beta }
+        struct Config {
+            init(mode: Mode) { _ = mode }
+            init(level: Level) { _ = level }
+        }
+        func make() { _ = Config(mode: .alpha); _ = Config(level: .beta) }
+        """)
+        XCTAssertFalse(r.contains(".alpha"), "`.alpha` must resolve through init(mode:):\n\(r)")
+        XCTAssertFalse(r.contains(".beta"), "`.beta` must resolve through init(level:):\n\(r)")
+    }
+
+    func testEnumCaseShorthand_inQualifiedNestedTypeConstructor_resolves() throws {
+        // `NS.Config(mode: .alpha)` — the constructed type is written QUALIFIED (a MemberAccess
+        // callee, not a DeclRef), and the property's declared type `Mode` is written INSIDE `NS`, so
+        // the contextual name only resolves in the DECLARING scope (B-FIX-23 discipline). Resolving
+        // it at the use-site scope finds nothing.
+        let r = try runPipeline("""
+        enum NS {
+            enum Mode { case alpha }
+            struct Config { let mode: Mode }
+        }
+        func make() -> NS.Config { return NS.Config(mode: .alpha) }
+        """)
+        XCTAssertFalse(r.contains("case alpha"), "case alpha must be obfuscated:\n\(r)")
+        XCTAssertFalse(r.contains(".alpha"), "`.alpha` in the qualified constructor must be rewritten:\n\(r)")
+    }
+
+    func testEnumCaseShorthand_methodParamTypedAsNestedType_resolvesInDeclaringScope() throws {
+        // Same scope rule on the EXISTING method branch: `handle(mode:)`'s parameter type `Mode` is
+        // written inside `NS`, invisible from the call site. The branch resolved the name at the
+        // use-site scope, so this shorthand was silently unresolved long before B-FIX-28.
+        let r = try runPipeline("""
+        enum NS {
+            enum Mode { case alpha }
+            struct Handler { func handle(mode: Mode) { _ = mode } }
+        }
+        func use(h: NS.Handler) { h.handle(mode: .alpha) }
+        """)
+        XCTAssertFalse(r.contains("case alpha"), "case alpha must be obfuscated:\n\(r)")
+        XCTAssertFalse(r.contains(".alpha"), "`.alpha` must resolve through the nested param type:\n\(r)")
+    }
+
+    func testEnumCaseShorthand_inSelfInitDelegation_resolves() throws {
+        // `self.init(mode: .alpha)` — the callee is a MemberAccess whose declName is `init` and
+        // whose base types to the enclosing type.
+        let r = try runPipeline("""
+        enum Mode { case alpha, beta }
+        struct Config {
+            let mode: Mode
+            init(mode: Mode) { self.mode = mode }
+            init() { self.init(mode: .alpha) }
+        }
+        """)
+        XCTAssertFalse(r.contains("case alpha"), "case alpha must be obfuscated:\n\(r)")
+        XCTAssertFalse(r.contains(".alpha"), "`.alpha` in the self.init delegation must be rewritten:\n\(r)")
+    }
+
+    func testEnumCaseShorthand_unknownConstructor_leavesCaseConsistent() throws {
+        // Fail-closed half: the constructed type is EXTERNAL (not in our table), so there is no
+        // parameter type to read. The shorthand must stay original AND the case declaration must end
+        // up original too — a rename on one side only is the desync that ships as a red build.
+        let r = try runPipeline("""
+        enum Mode { case zeta }
+        func use() { _ = Foreign(mode: .zeta) }
+        """)
+        XCTAssertTrue(r.contains(".zeta"), "unknown constructor gives no context — shorthand stays:\n\(r)")
+        XCTAssertTrue(r.contains("case zeta"), "the case decl must be reverted to match the survivor:\n\(r)")
+    }
+
+    func testEnumCaseShorthand_ambiguousInitOverloads_leavesCaseConsistent() throws {
+        // Fail-closed half 2: two inits share the label but take DIFFERENT enums, and both enums
+        // declare `zeta`. No argument signal can pick one, so no context may be invented — guessing
+        // here would rewrite `.zeta` to the wrong enum's obf (a wrong rename RollbackPass cannot
+        // catch). Decl and use-site must stay consistent.
+        let r = try runPipeline("""
+        enum E1 { case zeta }
+        enum E2 { case zeta }
+        struct S {
+            init(x: E1) { _ = x }
+            init(x: E2) { _ = x }
+        }
+        func use() { _ = S(x: .zeta) }
+        """)
+        XCTAssertTrue(r.contains(".zeta"), "ambiguous inits give no context — shorthand stays:\n\(r)")
+        XCTAssertEqual(r.components(separatedBy: "case zeta").count - 1, 2,
+                       "both same-named cases must be reverted to match the survivor:\n\(r)")
+    }
+
+    func testEnumCaseShorthand_inTernaryAssignmentRHS_resolves() throws {
+        // `self.mood = flag ? .calm : .sharp`. The whole statement is ONE raw-parsed SequenceExpr,
+        // and the ternary makes it 7 elements — the assignment branch only handled the exact
+        // 3-element shape, so both branches of the ternary lost their context. An assignment types
+        // its ENTIRE right-hand side from the left, however many elements the sequence has.
+        let r = try runPipeline("""
+        enum Mood { case calm, sharp }
+        struct Tuned {
+            var mood: Mood
+            mutating func set(flag: Bool) { self.mood = flag ? .calm : .sharp }
+        }
+        """)
+        XCTAssertFalse(r.contains("case calm"), "case calm must be obfuscated:\n\(r)")
+        XCTAssertFalse(r.contains(".calm"), "the ternary's then-branch must be rewritten:\n\(r)")
+        XCTAssertFalse(r.contains(".sharp"), "the ternary's else-branch must be rewritten:\n\(r)")
+    }
+
+    func testEnumCaseShorthand_comparisonOperandBeforeTernary_resolves() throws {
+        // Same sequence, comparison half: `slot == .morning ? a : b` is 5 elements, so the operand
+        // rule must look at the shorthand's NEIGHBOURS rather than assume a bare 3-element sequence.
+        let r = try runPipeline("""
+        enum Slot { case morning, evening }
+        func label(slot: Slot) -> Int { return slot == .morning ? 1 : 2 }
+        """)
+        XCTAssertFalse(r.contains("case morning"), "case morning must be obfuscated:\n\(r)")
+        XCTAssertFalse(r.contains(".morning"), "the comparison operand must be rewritten:\n\(r)")
+    }
+
+    func testEnumCaseShorthand_comparisonInsideAssignmentRHS_takesOperandNotLHS() throws {
+        // `self.mood = slot == .morning ? .calm : .sharp` — ONE sequence carrying BOTH contexts.
+        // `.morning` belongs to the comparison (type Slot), the ternary branches to the assignment
+        // (type Mood). The NEAREST binding context must win: letting the assignment claim the whole
+        // right-hand side types `.morning` as Mood, and had Mood also declared `morning` that would
+        // be a WRONG rename ("has no member") instead of a harmless miss.
+        let r = try runPipeline("""
+        enum Mood { case calm, sharp }
+        enum Slot { case morning, evening }
+        struct Tuned {
+            var mood: Mood
+            mutating func set(slot: Slot) { self.mood = slot == .morning ? .calm : .sharp }
+        }
+        """)
+        XCTAssertFalse(r.contains("case morning"), "case morning must be obfuscated:\n\(r)")
+        XCTAssertFalse(r.contains(".morning"), "the comparison operand must take the OPERAND's type:\n\(r)")
+        XCTAssertFalse(r.contains(".calm"), "the ternary branch must take the assignment LHS's type:\n\(r)")
+        XCTAssertFalse(r.contains(".sharp"), "both ternary branches must be rewritten:\n\(r)")
+    }
+
+    func testEnumCasePayload_switchCaseBinding_typedFromAssociatedValue() throws {
+        // `case .run(let m): return m == .calm` — `m` is bound to the case's associated value, so
+        // its type is that value's. Untyped, the comparison operand `.calm` had no context and the
+        // survivor reverted the payload enum's whole case group.
+        let r = try runPipeline("""
+        enum Mood { case calm, sharp }
+        enum Command { case run(Mood), stop }
+        func check(c: Command) -> Bool {
+            switch c {
+            case .run(let m): return m == .calm
+            case .stop: return false
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("case calm"), "case calm must be obfuscated:\n\(r)")
+        XCTAssertFalse(r.contains(".calm"), "the payload binding must type the comparison operand:\n\(r)")
+    }
+
+    func testEnumCasePayload_switchCaseLetPrefixBinding_typedFromAssociatedValue() throws {
+        // Same, written in the `case let .run(m)` prefix form (a different pattern shape).
+        let r = try runPipeline("""
+        enum Mood { case calm, sharp }
+        enum Command { case run(Mood), stop }
+        func check(c: Command) -> Bool {
+            switch c {
+            case let .run(m): return m == .calm
+            case .stop: return false
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("case calm"), "case calm must be obfuscated:\n\(r)")
+        XCTAssertFalse(r.contains(".calm"), "the prefix-form payload binding must type the operand:\n\(r)")
+    }
+
+    func testEnumCasePayload_qualifiedCaseConstructor_renamesCaseAndArgument() throws {
+        // `Command.run(.calm)` — a case WITH an associated value is called like a function. The
+        // callee is a member access whose member is an enum CASE, not a method, so nothing renamed
+        // `run`, and the payload argument had no type to take context from. The surviving `run`
+        // then reverted the whole `Command` case group AND the payload enum's cases with it.
+        let r = try runPipeline("""
+        enum Mood { case calm, sharp }
+        enum Command { case run(Mood), stop }
+        func make() -> Command { return Command.run(.calm) }
+        """)
+        XCTAssertFalse(r.contains("case run("), "the payload case decl must be obfuscated:\n\(r)")
+        XCTAssertFalse(r.contains(".run("), "the case constructor use-site must be rewritten:\n\(r)")
+        XCTAssertFalse(r.contains(".calm"), "the payload argument must take the case's associated type:\n\(r)")
+    }
+
+    func testEnumCasePayload_inferredEnumTypeDrivesSwitchContext() throws {
+        // A case constructor's static type is its ENUM, so `let c = Command.run(.calm)` types `c`
+        // and the switch over it can resolve `.stop`. Without it the subject was untyped and every
+        // pattern shorthand in the switch stayed original.
+        let r = try runPipeline("""
+        enum Mood { case calm }
+        enum Command { case run(Mood), stop }
+        func check() -> Bool {
+            let c = Command.run(.calm)
+            switch c {
+            case .run: return true
+            case .stop: return false
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("case stop"), "case stop must be obfuscated:\n\(r)")
+        XCTAssertFalse(r.contains(".stop"), "the switch pattern must be rewritten:\n\(r)")
+    }
+
+    func testEnumCasePayload_contextualShorthandCallee_resolvesArgument() throws {
+        // `let c: Command = .run(.calm)` — the CALLEE is itself a base-less shorthand, so the
+        // payload's context is one level deeper: resolve the callee's own contextual type first,
+        // then read the case's associated type.
+        let r = try runPipeline("""
+        enum Mood { case calm }
+        enum Command { case run(Mood), stop }
+        func make() -> Command {
+            let c: Command = .run(.calm)
+            return c
+        }
+        """)
+        XCTAssertFalse(r.contains(".calm"), "the payload of a shorthand case constructor must be rewritten:\n\(r)")
+        XCTAssertFalse(r.contains("case calm"), "case calm must be obfuscated:\n\(r)")
+    }
+
+    func testForInLoop_nestedElementMember_resolvesThroughQualifiedElementName() throws {
+        // The shape of `Tests/PullTheTicket/.../20_NestedFieldAccess.swift`, a RED BUILD in the
+        // tracked fixture: `for section in container.sections` typed `section` as the BARE element
+        // name `Section`, which is nested in `Container` and therefore invisible from the loop body's
+        // scope (B-FIX-23). So `section.title` never resolved while `title`'s decl renamed, and the
+        // survivor could not be reverted (`title`/`label` are Apple API names — RollbackPass shield
+        // 1c), shipping "value of type '<obf>' has no member 'title'". The inferred element name
+        // must be QUALIFIED, exactly as the initializer-driven inference already stores it.
+        let r = try runPipeline("""
+        struct Container {
+            struct Section {
+                let title: String
+                let items: [Item]
+            }
+            struct Item {
+                let label: String
+            }
+            let sections: [Section]
+        }
+        final class Renderer {
+            func render(_ container: Container) {
+                for section in container.sections {
+                    print(section.title)
+                    for item in section.items {
+                        print(item.label)
+                    }
+                }
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("let title"), "the nested property decl must be obfuscated:\n\(r)")
+        XCTAssertFalse(r.contains("section.title"), "member through the loop variable must be rewritten:\n\(r)")
+        XCTAssertFalse(r.contains("item.label"), "member through the NESTED loop variable must be rewritten:\n\(r)")
+    }
+
+    func testOverloadByArgType_arrayArgumentFromMemberAccess_picksArrayOverload() throws {
+        // `f(h.items)` where `items: [Item]`. `argConstraint`'s type-NAME fallback only fired for a
+        // bare DeclRef, so a member-access argument of collection type carried NO signal once
+        // B-FIX-28 stopped answering `[Item]` with `Item` — the overload pair tied and the whole
+        // group reverted (under-obf).
+        let r = try runPipeline("""
+        struct Item { let v1: Int }
+        struct Other { let v2: Int }
+        struct Holder { let items: [Item] }
+        final class C {
+            func f(_ x: [Item]) -> Int { return x.count }
+            func f(_ x: Other) -> Int { return x.v2 }
+            func use(h: Holder) -> Int { return f(h.items) }
+        }
+        """)
+        XCTAssertFalse(r.contains("func f("), "the overload pair must be obfuscated:\n\(r)")
+        XCTAssertFalse(r.contains("return f(h."), "the call must be rewritten to the array overload:\n\(r)")
+    }
+
+    func testOverloadByArgType_typealiasSpelledArrayParam_staysFailClosed() throws {
+        // The safety complement: the array overload spells its parameter through a typealias, so the
+        // written names differ textually (`Items` vs `[Item]`). A composite name that does not match
+        // must count as NO evidence, never as a contradiction — treating it as one would eliminate
+        // the RIGHT overload and hand the call to `Other` (a wrong rename). Fail-closed = the call
+        // stays original and RollbackPass reverts the pair, exactly as before.
+        let r = try runPipeline("""
+        struct Item { let v1: Int }
+        struct Other { let v2: Int }
+        typealias Items = [Item]
+        struct Holder { let items: [Item] }
+        final class C {
+            func f(_ x: Items) -> Int { return x.count }
+            func f(_ x: Other) -> Int { return x.v2 }
+            func use(h: Holder) -> Int { return f(h.items) }
+        }
+        """)
+        XCTAssertTrue(r.contains("return f(h."), "no argument signal can pick an overload — the call stays original:\n\(r)")
+        XCTAssertTrue(r.contains("func f("), "and the group is reverted, not half-renamed:\n\(r)")
+    }
 }

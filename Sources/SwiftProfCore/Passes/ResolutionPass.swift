@@ -242,6 +242,69 @@ private final class ResolutionVisitor: SyntaxVisitor {
         return nil
     }
 
+    /// Type the bindings of an enum-case pattern (`case .run(let m)`, `case let .run(m)`) from the
+    /// case's ASSOCIATED VALUE types, taken off the switch subject's enum. DeclarationPass registers
+    /// those bindings as untyped locals (F1 shadowing) and nothing ever typed them, so a member
+    /// access or a comparison through the payload had no context: the survivor then reverted the
+    /// PAYLOAD enum's whole case group.
+    ///
+    /// The stored name is QUALIFIED (`NS.Mood`), because the associated type is written in the
+    /// enum's own scope and the binding is read at the use-site (B-FIX-23 discipline). Fail-closed:
+    /// an unresolvable subject, an unknown case, or a payload arity that doesn't line up with the
+    /// pattern records nothing.
+    private func recordEnumPayloadBindingTypes(of caseNode: SwitchCaseSyntax) {
+        guard !shadowBindingTypeFrames.isEmpty,
+              let label = caseNode.label.as(SwitchCaseLabelSyntax.self),
+              let subject = Self.enclosingSwitchSubject(of: caseNode),
+              let enumSym = typeResolver.typeSymbol(of: subject, in: currentScope),
+              enumSym.kind == .enum,
+              let enumScope = innerScope(of: enumSym) else { return }
+        for item in label.caseItems {
+            guard let (caseName, bindings) = Self.enumPatternBindings(of: item.pattern),
+                  let caseSym = enumScope.members(named: caseName).first(where: { $0.kind == .enumCase }),
+                  let types = table.enumCaseAssociatedTypes[caseSym.id],
+                  types.count == bindings.count else { continue }
+            for (binding, type) in zip(bindings, types) {
+                guard let binding, let type else { continue }
+                // Resolve in the CASE's scope, store the name that resolves anywhere.
+                let resolved = typeResolver.typeSymbol(forQualifiedName: type,
+                                                       in: caseSym.scope ?? currentScope)
+                let name = resolved.map { TypeInferencePass.qualifiedName(of: $0) } ?? type
+                shadowBindingTypeFrames[shadowBindingTypeFrames.count - 1][binding] = name
+            }
+        }
+    }
+
+    /// Subject expression of the `switch` a case belongs to.
+    private static func enclosingSwitchSubject(of caseNode: SwitchCaseSyntax) -> ExprSyntax? {
+        var probe: Syntax? = Syntax(caseNode).parent
+        while let p = probe {
+            if let sw = p.as(SwitchExprSyntax.self) { return sw.subject }
+            probe = p.parent
+        }
+        return nil
+    }
+
+    /// `(caseName, bindingNames)` of an enum-case pattern with a payload, for both spellings:
+    /// `case .run(let m)` (binding inside) and `case let .run(m)` (binding specifier in front).
+    /// Non-binding positions (`_`, a literal) yield nil entries so the arity still lines up with the
+    /// case's associated values.
+    private static func enumPatternBindings(of pattern: PatternSyntax) -> (String, [String?])? {
+        var inner = pattern
+        if let valueBinding = inner.as(ValueBindingPatternSyntax.self) { inner = valueBinding.pattern }
+        guard let exprPattern = inner.as(ExpressionPatternSyntax.self),
+              let call = exprPattern.expression.as(FunctionCallExprSyntax.self),
+              let callee = call.calledExpression.as(MemberAccessExprSyntax.self),
+              callee.base == nil else { return nil }
+        let bindings: [String?] = call.arguments.map { argument in
+            guard let patternExpr = argument.expression.as(PatternExprSyntax.self) else { return nil }
+            var p = patternExpr.pattern
+            if let vb = p.as(ValueBindingPatternSyntax.self) { p = vb.pattern }
+            return p.as(IdentifierPatternSyntax.self).map { TypeResolver.stripBackticks($0.identifier.text) }
+        }
+        return (TypeResolver.stripBackticks(callee.declName.baseName.text), bindings)
+    }
+
     /// Record a binding's inferred type into the current frame (best-effort; nil inferences skipped).
     private func recordShadowBindingType(name: String, initializer: ExprSyntax) {
         guard !shadowBindingTypeFrames.isEmpty,
@@ -296,7 +359,11 @@ private final class ResolutionVisitor: SyntaxVisitor {
     override func visitPost(_ node: SubscriptDeclSyntax) { exitInnerScope(of: node) }
     override func visit(_ node: ClosureExprSyntax) -> SyntaxVisitorContinueKind { enterInnerScope(of: node); return .visitChildren }
     override func visitPost(_ node: ClosureExprSyntax) { exitInnerScope(of: node) }
-    override func visit(_ node: SwitchCaseSyntax) -> SyntaxVisitorContinueKind { enterInnerScope(of: node); return .visitChildren }
+    override func visit(_ node: SwitchCaseSyntax) -> SyntaxVisitorContinueKind {
+        enterInnerScope(of: node)
+        recordEnumPayloadBindingTypes(of: node)
+        return .visitChildren
+    }
     override func visitPost(_ node: SwitchCaseSyntax) { exitInnerScope(of: node) }
     override func visit(_ node: CatchClauseSyntax) -> SyntaxVisitorContinueKind { enterInnerScope(of: node); return .visitChildren }
     override func visitPost(_ node: CatchClauseSyntax) { exitInnerScope(of: node) }
@@ -1046,6 +1113,7 @@ private final class ResolutionVisitor: SyntaxVisitor {
                    pSym.kind != .protocol { return true }
             case .typeName(let tn):
                 if bareTypeName(pType) != tn,
+                   !Self.isCollectionTypeName(tn), !Self.isCollectionTypeName(pType),
                    let pSym = resolveParamType(pType, candidate: cand),
                    pSym.kind != .protocol { return true }
             case .unknown:
@@ -1096,6 +1164,9 @@ private final class ResolutionVisitor: SyntaxVisitor {
                     // pType unresolvable (primitive/external) → neutral
                 case .typeName(let tn):
                     if bareTypeName(pType) == tn { score += 1 }
+                    else if Self.isCollectionTypeName(tn) || Self.isCollectionTypeName(pType) {
+                        break  // composite spellings can differ for the SAME type → no evidence
+                    }
                     else if let pSym = resolveParamType(pType, candidate: cand),
                             pSym.kind != .protocol {
                         // pType is a user-defined CONCRETE Symbol but the arg is a different
@@ -1251,14 +1322,13 @@ private final class ResolutionVisitor: SyntaxVisitor {
         if let sym = typeResolver.typeSymbol(of: expr, in: currentScope) {
             return .typeSymbol(sym)
         }
-        // EXTERNAL/primitive-typed value (no local Symbol for its type, so the above returns nil):
-        // fall back to the declared type NAME so disambiguation can still match it against a
-        // candidate's param-type string. Without this a `URL`-typed argument gives NO signal and an
-        // overload `f(_: URL, …)` can't be distinguished from `f(_: S2)` → either a wrong pick or
-        // (now that labels are default-aware) an unresolved call. Bare value reference only.
-        if let ref = expr.as(DeclReferenceExprSyntax.self),
-           let valueSym = currentScope.lookup(name: stripBackticks(ref.baseName.text)),
-           let typeName = table.declaredType[valueSym.id] {
+        // No local Symbol for the expression's type. Two populations end up here: EXTERNAL/primitive
+        // types (`URL`, `String`) and — since B-FIX-28 — every COLLECTION type, because `[Item]`
+        // names no declaration. Fall back to the declared type NAME so disambiguation still gets a
+        // signal. `declaredTypeName` covers a bare reference, `obj.items`, a call's return type and
+        // the optional/try/await wrappers; the previous bare-DeclRef-only fallback left every
+        // member-access argument (`f(h.items)`) with no signal at all, tying the overload set.
+        if let typeName = typeResolver.declaredTypeName(of: expr, in: currentScope) {
             return .typeName(bareTypeName(typeName))
         }
         return .unknown
@@ -1273,8 +1343,21 @@ private final class ResolutionVisitor: SyntaxVisitor {
     private func bareTypeName(_ s: String) -> String {
         var n = s
         while n.hasSuffix("?") || n.hasSuffix("!") { n = String(n.dropLast()) }
+        // A collection SUGAR name is composite, not a generic instantiation: cutting `[Box<Foo>]`
+        // at the `<` yields the garbage `[Box`. Only a LEAF name sheds its generic arguments.
+        guard !n.hasPrefix("[") else { return n }
         if let lt = n.firstIndex(of: "<") { n = String(n[..<lt]) }  // `Box<Foo>` → `Box`
         return n
+    }
+
+    /// A COLLECTION type name (`[T]`, `[K: V]`, `Array<T>`, …). Such a name denotes no declaration
+    /// (B-FIX-28), so two collection names that differ textually may still be the same type
+    /// (`Items` vs `[Item]`, `Array<T>` vs `[T]`, a typealias vs its target). A textual mismatch on
+    /// one is therefore NO evidence — never a contradiction: eliminating a candidate on it would
+    /// hand the call to the wrong overload, a wrong rename RollbackPass cannot catch. Equality still
+    /// scores positively, so the common same-spelling case keeps disambiguating.
+    private static func isCollectionTypeName(_ s: String) -> Bool {
+        s.hasPrefix("[") || s.hasPrefix("Array<") || s.hasPrefix("Set<") || s.hasPrefix("Dictionary<")
     }
 
     /// Resolve a candidate's parameter-type string (as written in source) to a Symbol in the
@@ -1436,8 +1519,12 @@ private final class ResolutionVisitor: SyntaxVisitor {
         } else {
             // Shorthand `.member` — only rename if we positively identify the contextual type.
             // Globally-unique-name fallback was removed: stdlib enums often collide with our names.
-            if let typeName = contextualTypeName(for: node),
-               let typeSym = typeResolver.typeSymbol(forQualifiedName: typeName, in: currentScope),
+            // The context carries its own SCOPE: a type name read off another declaration (a
+            // callee's parameter, a stored property) is written where THAT declaration lives, so a
+            // nested type spelled unqualified resolves only there (B-FIX-23 discipline).
+            if let context = contextualType(for: node),
+               let typeSym = typeResolver.typeSymbol(forQualifiedName: context.name,
+                                                     in: context.scope ?? currentScope),
                let typeScope = innerScope(of: typeSym),
                let member = resolveMemberForUse(memberName, in: typeScope, node: node) {
                 emitRename(for: memberToken, target: member)
@@ -1446,20 +1533,73 @@ private final class ResolutionVisitor: SyntaxVisitor {
         }
     }
 
+    /// A contextual type for a base-less `.member`: the written type NAME plus the scope that name
+    /// must be RESOLVED in. The scope matters whenever the name is read off ANOTHER declaration (a
+    /// callee's parameter, a stored property): a nested type written unqualified is visible only
+    /// where it was written, so resolving it at the use-site silently finds nothing (B-FIX-23).
+    /// `scope == nil` means "written here", i.e. resolve at the use-site scope.
+    private struct ContextualType {
+        let name: String
+        let scope: Scope?
+    }
+
+    /// One level of LITERAL nesting between the shorthand and the declaration that types it:
+    /// `[.a]` is an element of the context type, `[.k: v]` its dictionary key, `[k: .v]` its value.
+    /// Collected innermost-first while walking up, applied outermost-first to the written type.
+    private enum LiteralPeel { case element, dictionaryKey, dictionaryValue }
+
+    /// Peel a written type name along the literal path the shorthand sits in. Fail-closed: a level
+    /// we cannot peel (a non-collection type, an unmodelled shape) yields nil rather than a guessed
+    /// context — a wrong context rewrites `.case` to ANOTHER enum's obf, which RollbackPass cannot
+    /// catch. This is the single chokepoint where a contextual type meets literal nesting; it
+    /// replaced `scalarElementType`, whose fixed "unwrap array/optional" could not tell a key from a
+    /// value, ignored the nesting DEPTH, and unwrapped even when no literal was involved.
+    private static func peeled(_ typeName: String, through peels: [LiteralPeel]) -> String? {
+        var name = typeName
+        for peel in peels.reversed() {
+            switch peel {
+            case .element:
+                guard let e = TypeResolver.extractElement(from: name) else { return nil }
+                name = e
+            case .dictionaryKey:
+                guard let k = TypeResolver.dictionaryKeyType(from: name) else { return nil }
+                name = k
+            case .dictionaryValue:
+                guard let v = TypeResolver.dictionaryValueType(from: name) else { return nil }
+                name = v
+            }
+        }
+        return name
+    }
+
     /// Walks up the parent chain looking for a context that tells us the type of a shorthand
     /// `.member` expression. Handles:
     ///   - `let x: T = .member` / `var x: T = .member` (PatternBinding type annotation)
-    ///   - `f(.member)` / `f(arg: .member)` (function-call positional argument; callee resolved
-    ///     to a local function/method whose nth parameter has a known simple type)
-    /// Returns the resolved type name or nil.
-    private func contextualTypeName(for memberAccess: MemberAccessExprSyntax) -> String? {
+    ///   - `f(.member)` / `f(arg: .member)` (function-call argument; callee resolved to a local
+    ///     function / method / INITIALIZER whose nth parameter has a known simple type)
+    ///   - the same through literal wrappers: `[.member]`, `[[.member]]`, `[.key: .value]`
+    /// Returns the resolved type name plus the scope to resolve it in, or nil.
+    private func contextualType(for memberAccess: MemberAccessExprSyntax) -> ContextualType? {
         var current: Syntax? = Syntax(memberAccess).parent
         // First wrapper we want to skip: LabeledExprSyntax (`label: .case` arg). Track if we
         // came via an argument list so we can resolve the call.
         var argumentIndex: Int? = nil
         var sawReturn = false
+        var peels: [LiteralPeel] = []
         while let node = current {
             if node.is(ReturnStmtSyntax.self) { sawReturn = true }
+            // Literal wrappers between the shorthand and its typing declaration.
+            if node.is(ArrayExprSyntax.self) { peels.append(.element) }
+            if let element = node.as(DictionaryElementSyntax.self) {
+                peels.append(Self.isDescendant(Syntax(memberAccess), of: Syntax(element.key))
+                             ? .dictionaryKey : .dictionaryValue)
+            }
+            if let tuple = node.as(TupleExprSyntax.self) {
+                // A single unlabeled element is just parentheses (transparent). A real tuple is a
+                // shape we don't model — fail closed rather than type the shorthand as the whole
+                // tuple.
+                guard tuple.elements.count == 1, tuple.elements.first?.label == nil else { return nil }
+            }
             // Switch case pattern: contextual type is the switch subject's type. Also covers the
             // `if/guard/while case .x = e` (MatchingPatternCondition) and `for case .x in seq`
             // forms — context = the matched value's type. If we cannot resolve it, return nil —
@@ -1469,10 +1609,10 @@ private final class ResolutionVisitor: SyntaxVisitor {
                 var probe = node.parent
                 while let p = probe {
                     if let sw = p.as(SwitchExprSyntax.self) {
-                        return resolveExpressionType(sw.subject)
+                        return resolveExpressionContext(sw.subject, peels: peels)
                     }
                     if let mc = p.as(MatchingPatternConditionSyntax.self) {
-                        return resolveExpressionType(mc.initializer.value)
+                        return resolveExpressionContext(mc.initializer.value, peels: peels)
                     }
                     probe = p.parent
                 }
@@ -1485,28 +1625,42 @@ private final class ResolutionVisitor: SyntaxVisitor {
             // context (a static member of that type) and renames to it → wrong-rename red.
             if let seq = node.as(SequenceExprSyntax.self) {
                 let elems = Array(seq.elements)
-                if elems.count == 3 {
-                    if elems[1].is(AssignmentExprSyntax.self) {
-                        // Assignment RHS: context is the LHS's type. A base-less `.case` is always
-                        // on the RHS (you can't assign to a shorthand). Covers `x = .case`,
-                        // `self.x = .case`, `obj.a.b = .case`.
-                        return resolveExpressionType(elems[0])
-                    }
-                    if let op = elems[1].as(BinaryOperatorExprSyntax.self),
+                // Which TOP-LEVEL element are we inside? A raw-parsed sequence is flat, so a ternary
+                // (`x = flag ? .a : .b` parses as 5+ elements, the `? .a :` part being one
+                // UnresolvedTernaryExpr) must not be mistaken for "not an assignment" — the old
+                // exact-3-element shape silently dropped the context for every ternary branch.
+                if let idx = elems.firstIndex(where: { Self.isDescendant(Syntax(memberAccess), of: Syntax($0)) }) {
+                    // Comparison / coalescing FIRST: it binds tighter than the assignment around it.
+                    // In `self.mood = slot == .morning ? .calm : .sharp` the `.morning` operand is
+                    // typed by `slot`, NOT by the assignment's left-hand side — letting the
+                    // assignment claim the whole right-hand side would type it as the LHS's enum and
+                    // rewrite it to a same-named case of the WRONG enum. The shorthand's IMMEDIATE
+                    // operator neighbour decides; the other operand is the element beyond it.
+                    if idx >= 2, let op = elems[idx - 1].as(BinaryOperatorExprSyntax.self),
                        Self.contextGivingOperators.contains(op.operator.text) {
-                        // Resolve the operand that is NOT the shorthand we came up from.
-                        let cameFromRHS = Self.isDescendant(Syntax(memberAccess), of: Syntax(elems[2]))
-                        let other = cameFromRHS ? elems[0] : elems[2]
-                        return resolveExpressionType(other)
+                        return resolveExpressionContext(elems[idx - 2], peels: peels)
+                    }
+                    if idx + 2 < elems.count, let op = elems[idx + 1].as(BinaryOperatorExprSyntax.self),
+                       Self.contextGivingOperators.contains(op.operator.text) {
+                        return resolveExpressionContext(elems[idx + 2], peels: peels)
+                    }
+                    // Assignment: everything right of `=` takes the LHS's type, however many
+                    // elements the RHS parsed into (a ternary makes it 5+, which the old exact
+                    // 3-element shape dropped). A base-less `.case` is always on the RHS — you
+                    // cannot assign to a shorthand.
+                    if elems.count > 2, idx >= 2, elems[1].is(AssignmentExprSyntax.self) {
+                        return resolveExpressionContext(elems[0], peels: peels)
                     }
                 }
             }
-            // Variable/property type annotation. Unwrap array/optional so `let xs: [E] = [.a]` and
-            // `let o: E? = .a` resolve the element/case context too, not just `let x: E = .a`.
+            // Variable/property type annotation. The literal path decides how much of the written
+            // type to peel: `let xs: [E] = [.a]` peels one element level, `let m: [K: V] = [.a: .b]`
+            // peels a key on one side and a value on the other, `let o: E? = .a` peels nothing (the
+            // optional marker is stripped by the resolver itself).
             if let binding = node.as(PatternBindingSyntax.self),
                let annotation = binding.typeAnnotation,
-               let elem = Self.scalarElementType(of: annotation.type) {
-                return elem
+               let name = Self.peeled(annotation.type.trimmedDescription, through: peels) {
+                return ContextualType(name: name, scope: nil)   // written here
             }
             // Function call argument context.
             if argumentIndex == nil, let labeled = node.as(LabeledExprSyntax.self) {
@@ -1515,8 +1669,10 @@ private final class ResolutionVisitor: SyntaxVisitor {
                 }
             }
             if let call = node.as(FunctionCallExprSyntax.self), let idx = argumentIndex {
-                if let typeName = resolveCalleeParamType(call: call, argIndex: idx) {
-                    return typeName
+                // The parameter type is written in the CALLEE's scope, so it travels with it.
+                if let param = resolveCalleeParamType(call: call, argIndex: idx),
+                   let name = Self.peeled(param.name, through: peels) {
+                    return ContextualType(name: name, scope: param.scope)
                 }
                 return nil  // Resolved call but couldn't get param type → give up.
             }
@@ -1527,8 +1683,8 @@ private final class ResolutionVisitor: SyntaxVisitor {
             // is obfuscated → the original name survives → RollbackPass reverts the case → under-obf,
             // or (short debug names) an obf collision = `invalid redeclaration` red build.
             if let param = node.as(FunctionParameterSyntax.self),
-               let elem = Self.scalarElementType(of: param.type) {
-                return elem
+               let name = Self.peeled(param.type.trimmedDescription, through: peels) {
+                return ContextualType(name: name, scope: nil)   // written here
             }
             // Function/method/init return type acts as context for a `.case` ONLY in return
             // position — an explicit `return .case` (sawReturn) or a single-expression implicit
@@ -1538,9 +1694,9 @@ private final class ResolutionVisitor: SyntaxVisitor {
             // no earlier context matched, fail closed (nil).
             if let fn = node.as(FunctionDeclSyntax.self),
                let returnClause = fn.signature.returnClause,
-               let returned = Self.scalarElementType(of: returnClause.type) {
+               let returned = Self.peeled(returnClause.type.trimmedDescription, through: peels) {
                 let implicitReturn = fn.body?.statements.count == 1
-                return (sawReturn || implicitReturn) ? returned : nil
+                return (sawReturn || implicitReturn) ? ContextualType(name: returned, scope: nil) : nil
             }
             // Don't escape past the file root.
             if node.is(SourceFileSyntax.self) { return nil }
@@ -1564,81 +1720,165 @@ private final class ResolutionVisitor: SyntaxVisitor {
         return false
     }
 
-    /// Simple element-type NAME for contextual `.case` resolution: `E` → "E", `[E]` → "E",
-    /// `E?` → "E", `[E]?` → "E", `S1.E2` → "S1.E2". Returns nil for generic-argument identifiers,
-    /// tuples, dictionaries, functions and anything else we don't model — fail closed (don't guess
-    /// a contextual type).
-    ///
-    /// The single chokepoint for "type syntax in a contextual position → type NAME": every branch
-    /// of `contextualTypeName` that reads a written-out type must go through it, or a QUALIFIED
-    /// nested type is silently a blind spot at that branch only.
-    static func scalarElementType(of type: TypeSyntax) -> String? {
-        if let id = type.as(IdentifierTypeSyntax.self) {
-            return id.genericArgumentClause == nil ? id.name.text : nil
-        }
-        // `S1.E2` — a nested type written qualified parses as MemberType, NOT Identifier. Keep the
-        // full dotted text: the consumer (`TypeResolver.typeSymbol(forQualifiedName:)`) walks dotted
-        // names, and the bare last segment alone would be scope-trapped (B-FIX-23 discipline).
-        if let member = type.as(MemberTypeSyntax.self) {
-            guard member.genericArgumentClause == nil,
-                  scalarElementType(of: member.baseType) != nil else { return nil }
-            return member.trimmedDescription
-        }
-        if let arr = type.as(ArrayTypeSyntax.self) {
-            return scalarElementType(of: arr.element)
-        }
-        if let opt = type.as(OptionalTypeSyntax.self) {
-            return scalarElementType(of: opt.wrappedType)
-        }
-        return nil
-    }
-
     /// Delegate to shared TypeResolver, providing current scope context.
     private func resolveTypeSymbol(of expr: ExprSyntax) -> Symbol? {
         typeResolver.typeSymbol(of: expr, in: currentScope)
     }
 
-    /// Convenience: type NAME for callers that still want a string (switch-case context, etc).
-    private func resolveExpressionType(_ expr: ExprSyntax) -> String? {
-        resolveTypeSymbol(of: expr)?.name
+    /// Contextual type from an EXPRESSION (switch subject, assignment LHS, comparison operand). The
+    /// type is a resolved Symbol, so its own scope is the right place to re-resolve the name from:
+    /// a nested type's bare name (`Mode` inside `enum NS`) does not resolve at the use-site.
+    private func resolveExpressionContext(_ expr: ExprSyntax, peels: [LiteralPeel]) -> ContextualType? {
+        guard let sym = resolveTypeSymbol(of: expr),
+              let name = Self.peeled(sym.name, through: peels) else { return nil }
+        return ContextualType(name: name, scope: sym.scope)
     }
 
-    /// Best-effort: if the callee is a local function/method symbol we can look up its parameter
-    /// types via SymbolTable.functionParamTypes. Returns the simple type name of the parameter
-    /// at `argIndex` if known.
-    private func resolveCalleeParamType(call: FunctionCallExprSyntax, argIndex: Int) -> String? {
-        // Direct call: `funcName(...)` — calledExpression is DeclReferenceExpr.
+    /// Parameter type at `argIndex` of whatever `call` calls — a function, a method, or an
+    /// INITIALIZER (explicit or the struct's synthesized memberwise one). The type NAME travels with
+    /// the scope it was written in, because that is the only scope it is guaranteed to resolve in.
+    private func resolveCalleeParamType(call: FunctionCallExprSyntax, argIndex: Int) -> ContextualType? {
+        // Direct call: `funcName(...)` / `TypeName(...)` — calledExpression is DeclReferenceExpr.
         if let ref = call.calledExpression.as(DeclReferenceExprSyntax.self) {
             let name = stripBackticks(ref.baseName.text)
             // Use full overload resolution (label + type aware) so we find the right overload
             // even when it's an extension / cross-module method not visible in the scope chain —
             // otherwise a shorthand `.case` argument can't learn its contextual enum type and is
             // left un-renamed while the enum case itself was renamed (`has no member` breakage).
-            guard let sym = resolveCall(name: name, call: call) ?? currentScope.lookup(name: name) else {
-                return nil
+            if let sym = resolveCall(name: name, call: call) ?? currentScope.lookup(name: name),
+               let types = table.functionParamTypes[sym.id], argIndex < types.count,
+               let type = types[argIndex] {
+                return ContextualType(name: type, scope: sym.scope)
             }
-            guard let types = table.functionParamTypes[sym.id], argIndex < types.count else { return nil }
-            return types[argIndex]
+            // CONSTRUCTOR call. A type name is not a callable, so neither branch above can see it
+            // and the argument had NO context at all — the single widest hole in contextual `.case`
+            // resolution, since one uncovered constructor call reverts the enum's whole case group.
+            if let typeSym = constructedType(named: name) {
+                return initializerParamType(ofType: typeSym, call: call, argIndex: argIndex)
+            }
+            return nil
         }
-        // Method call: `obj.method(...)` — resolve the receiver's type, pick the called overload
-        // by signature, and read its parameter type so a shorthand `.case` argument resolves too.
+        // Base-less callee: `let c: Command = .run(.calm)` — the callee is ITSELF a shorthand, so
+        // the payload's context sits one level deeper. Resolve the callee's own contextual type
+        // first, then read the case's associated type. Terminates: the callee is the call's
+        // `calledExpression`, never one of its arguments, so its walk-up skips this same call.
+        if let m = call.calledExpression.as(MemberAccessExprSyntax.self), m.base == nil {
+            guard let context = contextualType(for: m),
+                  let enumSym = typeResolver.typeSymbol(forQualifiedName: context.name,
+                                                        in: context.scope ?? currentScope),
+                  let type = enumCaseAssociatedType(named: stripBackticks(m.declName.baseName.text),
+                                                    in: enumSym, argIndex: argIndex) else { return nil }
+            return type
+        }
+        // Member-access callee: `obj.method(...)`, `Type.init(...)`, `NS.Type(...)`, `E.case(...)`.
         if let m = call.calledExpression.as(MemberAccessExprSyntax.self), let receiver = m.base {
             let methodName = stripBackticks(m.declName.baseName.text)
+            // `X.init(...)` / `self.init(...)` — an explicit initializer reference.
+            if methodName == "init" {
+                guard let typeSym = resolveTypeSymbol(of: receiver) else { return nil }
+                return initializerParamType(ofType: typeSym, call: call, argIndex: argIndex)
+            }
+            // `NS.Config(...)` — a QUALIFIED type being CONSTRUCTED, not a method call on `NS`.
+            // Same discrimination TypeResolver uses for this shape: the whole callee resolves to a
+            // type-like Symbol, with the upper-case last segment as a cheap pre-filter.
+            if let first = methodName.first, first.isUppercase,
+               let typeSym = typeResolver.typeSymbol(forQualifiedName: call.calledExpression.trimmedDescription,
+                                                     in: currentScope),
+               typeSym.kind.isTypeLike {
+                return initializerParamType(ofType: typeSym, call: call, argIndex: argIndex)
+            }
             guard let recvType = resolveTypeSymbol(of: receiver),
                   let scope = innerScope(of: recvType) else { return nil }
+            // `Command.run(payload)` — an enum case with associated values, called like a function.
+            if recvType.kind == .enum,
+               let type = enumCaseAssociatedType(named: methodName, in: recvType, argIndex: argIndex) {
+                return type
+            }
             let cands = scope.members(named: methodName).filter { Self.isCallable($0.kind) }
             if let sym = (cands.count == 1 ? cands.first : chooseOverload(cands, call: call)),
-               let types = table.functionParamTypes[sym.id], argIndex < types.count {
-                return types[argIndex]
+               let types = table.functionParamTypes[sym.id], argIndex < types.count,
+               let type = types[argIndex] {
+                return ContextualType(name: type, scope: sym.scope)
             }
             // Disambiguation failed but we only need the parameter TYPE: if every label-matching
             // candidate agrees on the type at argIndex, that's the answer regardless of which
             // overload the compiler picks. This rescues a `.case` argument to a protocol method that
             // has both a requirement and a same-signature default impl (two indistinguishable cands)
             // — otherwise the shorthand stays un-renamed while the case is obfuscated → desync.
-            return agreedParamType(cands, call: call, argIndex: argIndex)
+            if let agreed = agreedParamType(cands, call: call, argIndex: argIndex) {
+                return ContextualType(name: agreed, scope: cands.first?.scope)
+            }
+            return nil
         }
         return nil
+    }
+
+    /// Declared type of the associated value at `argIndex` of `enumSym`'s case `name` — the payload
+    /// of a case constructor. nil when the case has no payload at that position or its type isn't a
+    /// name we track (fail closed, as everywhere in contextual resolution).
+    private func enumCaseAssociatedType(named name: String, in enumSym: Symbol,
+                                        argIndex: Int) -> ContextualType? {
+        guard let scope = innerScope(of: enumSym),
+              let caseSym = scope.members(named: name).first(where: { $0.kind == .enumCase }),
+              let types = table.enumCaseAssociatedTypes[caseSym.id],
+              argIndex < types.count, let type = types[argIndex] else { return nil }
+        return ContextualType(name: type, scope: caseSym.scope)
+    }
+
+    /// The TYPE that a `Name(...)` callee constructs, or nil when `Name` names no type we know.
+    /// `Self(...)` constructs the enclosing type. A typealias is followed to its underlying type
+    /// (its initializers live there).
+    private func constructedType(named name: String) -> Symbol? {
+        if name == "Self" || name == "self" { return enclosingTypeScope()?.owner }
+        if let s = currentScope.lookup(name: name), s.kind.isTypeLike { return typealiasUnwrap(s) }
+        if let s = lookupType(named: name) { return typealiasUnwrap(s) }
+        return nil
+    }
+
+    /// Declared type of the parameter at `argIndex` of the initializer `call` selects on `typeSym`:
+    /// an explicit `init` picked by argument labels (extension inits included — they are real
+    /// initializers), or, for a struct that declares NO init in its primary declaration, the
+    /// compiler-synthesized MEMBERWISE init, whose labels are the stored property names and whose
+    /// types are their declared types.
+    ///
+    /// Fail-closed at every step: several label-matching inits that disagree on the type, an unknown
+    /// or external type, a class/enum without a matching init, an argument with no label on the
+    /// memberwise path — all yield nil. Inventing a context here would rewrite `.case` to ANOTHER
+    /// enum's obf, a wrong rename RollbackPass cannot catch (no original name survives).
+    private func initializerParamType(ofType typeSym: Symbol,
+                                      call: FunctionCallExprSyntax,
+                                      argIndex: Int) -> ContextualType? {
+        guard let typeScope = innerScope(of: typeSym) else { return nil }
+        let inits = typeScope.members(named: "init").filter { $0.kind == .initializer }
+        if !inits.isEmpty {
+            let callLabels = Self.argumentLabels(of: call)
+            let matching = inits.filter { labelsMatch($0, callLabels, trailingStart: call.arguments.count) }
+            if matching.count == 1, let types = table.functionParamTypes[matching[0].id],
+               argIndex < types.count, let type = types[argIndex] {
+                return ContextualType(name: type, scope: matching[0].scope)
+            }
+            if matching.count > 1, let agreed = agreedParamType(matching, call: call, argIndex: argIndex) {
+                return ContextualType(name: agreed, scope: matching[0].scope)
+            }
+            // Explicit inits exist and one of them matched the labels: the memberwise init is either
+            // suppressed or irrelevant, and we could not name the type — stop rather than guess.
+            if !matching.isEmpty { return nil }
+        }
+        // Memberwise init. Only a struct whose PRIMARY declaration has no explicit init gets one
+        // (an extension init does not suppress it — B-FIX-19 discipline, same side-table).
+        guard typeSym.kind == .struct, !table.structsWithMainDeclInit.contains(typeSym.id),
+              let label = Self.argumentLabel(of: call, at: argIndex) else { return nil }
+        guard let property = typeScope.symbols.first(where: {
+            $0.kind == .property && $0.name == label && table.storedPropertyIds.contains($0.id)
+        }), let type = table.declaredType[property.id] else { return nil }
+        return ContextualType(name: type, scope: property.scope)
+    }
+
+    /// Call-site label of the argument at `index` ("_"-style positional arguments have none).
+    private static func argumentLabel(of call: FunctionCallExprSyntax, at index: Int) -> String? {
+        guard index < call.arguments.count else { return nil }
+        let arg = call.arguments[call.arguments.index(call.arguments.startIndex, offsetBy: index)]
+        return arg.label.map { TypeResolver.stripBackticks($0.text) }
     }
 
     /// The parameter type at `argIndex` when ALL label-matching candidates agree on it (else nil).
