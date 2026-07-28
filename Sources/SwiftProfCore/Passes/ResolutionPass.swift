@@ -93,18 +93,123 @@ public final class ResolutionPass {
         // 2) Use-site renames — walk each writable file's syntax tree.
         let uniqueExternal = uniqueExternalMembers
             ? Self.uniqueExternalExtensionMembers(in: table, map: map) : [:]
+        // Volume filter for `UNRES` (see `reportUnresolved`). Built only under --diagnose-overloads
+        // so the default path pays nothing.
+        var renamedNames: Set<String> = []
+        if diagnoseOverloads {
+            for sym in table.symbols where map.obf(for: sym) != nil { renamedNames.insert(sym.name) }
+        }
+        var unresolved: [UnresolvedKey: UnresolvedHit] = [:]
         for file in files where file.module.writable {
             guard let fileScope = table.fileScopes[ObjectIdentifier(file)] else { continue }
             let visitor = ResolutionVisitor(file: file, table: table, map: map, fileScope: fileScope,
                                             diagLog: diagnostics ?? logger, diagnose: diagnoseOverloads,
                                             indexContext: indexContext,
-                                            uniqueExternalMembers: uniqueExternal)
+                                            uniqueExternalMembers: uniqueExternal,
+                                            renamedNames: renamedNames)
             visitor.walk(file.syntax)
             renames.append(contentsOf: visitor.renames)
+            // Merge per-file hits so the reported occurrence counts are PROJECT-wide: the same
+            // unresolved member name typically recurs across dozens of files, and a per-file report
+            // would hide exactly the "362 occurrences" signal that makes one name worth chasing.
+            for (key, hit) in visitor.unresolved {
+                if unresolved[key] != nil {
+                    unresolved[key]!.occurrences += hit.occurrences
+                } else {
+                    unresolved[key] = hit
+                }
+            }
         }
+        if diagnoseOverloads { reportUnresolved(unresolved) }
 
         return renames
     }
+
+    /// Emit the aggregated `UNRES` lines, most-frequent first, plus the local-only file legend.
+    ///
+    /// High-signal causes go at full volume; `candidate-has-no-obf` is the low-signal tier (`v `)
+    /// because it says the use-site is already correct — the same split `SURV blocked-explained`
+    /// makes, for the same reason.
+    private func reportUnresolved(_ hits: [UnresolvedKey: UnresolvedHit]) {
+        let out = diagnostics ?? logger
+        for (key, hit) in hits.sorted(by: { $0.value.occurrences > $1.value.occurrences }) {
+            var line = "UNRES cause=\(key.cause.rawValue) member=\(Anon.of(key.member))"
+            if let recv = key.receiver { line += " recv=\(Anon.of(recv))" }
+            if hit.candidates > 0 { line += " cands=\(hit.candidates)" }
+            line += " occ=\(hit.occurrences) file=\(Anon.of(hit.file)) line=\(hit.line)"
+            out.log(line, verbose: key.cause.isExplained)
+        }
+        // Same legend line kind as RollbackPass — one hash → path table for the whole report, split
+        // into `Diagnostics-files.txt` so a pasted `Diagnostics.txt` can never carry a real path.
+        for path in Set(hits.values.map(\.path)).sorted() {
+            out.log("SURV-FILE \(Anon.of(URL(fileURLWithPath: path).lastPathComponent)) \(path)",
+                    verbose: true)
+        }
+    }
+}
+
+/// Why the resolver left a use-site un-rewritten. A CLOSED set: every `UNRES` diagnostic line
+/// carries exactly one of these, so the report can be grepped and counted by cause.
+///
+/// `--diagnose-overloads` previously answered only two questions — "which overload sets were
+/// ambiguous" (`OVLD`) and "which original names survived into the output" (`SURV`) — and neither
+/// says why a given use-site was skipped. On a run where ~119 method names had surviving use-sites,
+/// `OVLD` produced a single line, because it fires only when >1 candidate matched the labels AND
+/// argument types could not pick one. Everything else resolved to nothing, silently.
+enum UnresolvedCause: String {
+    /// The receiver expression could not be typed at all, so no member scope was ever searched.
+    case receiverUntyped = "receiver-untyped"
+    /// The receiver typed fine, but its scope declares no member of that name (a member inherited
+    /// from a superclass, a receiver we typed to the wrong thing, or a declaration we never saw).
+    case noCandidateInScope = "no-candidate-in-scope"
+    /// Several same-named candidates of different KINDS survived the position filter (e.g. a
+    /// property and a nested type), so the rewrite target is genuinely ambiguous.
+    case mixedKindCandidates = "mixed-kind-candidates"
+    /// Several same-kind candidates and no argument signal picks one.
+    case ambiguousOverload = "ambiguous-overload"
+    /// Resolved to exactly one declaration which is deliberately not renamed (protected or
+    /// policy-skipped). Low-signal: the use-site is correct as it stands.
+    case candidateHasNoObf = "candidate-has-no-obf"
+    /// A base-less `.member` shorthand whose contextual type could not be determined.
+    case noContextualType = "no-contextual-type"
+
+    /// Low-signal causes go to the `v ` tier, mirroring `SURV blocked-explained`: a use-site we
+    /// resolved and deliberately left alone is not a lead, it is the answer.
+    var isExplained: Bool { self == .candidateHasNoObf }
+}
+
+/// Outcome of resolving one use-site: the rewrite target (if any) and, when the resolver declined,
+/// WHY. Returning the cause instead of a bare `Symbol?` is what lets a SINGLE reporting helper emit
+/// `UNRES` — the classification stays in the one function that has the knowledge, rather than being
+/// re-derived (and drifting) at each of the member-access branches.
+struct LookupOutcome {
+    let symbol: Symbol?
+    let cause: UnresolvedCause?
+    let candidates: Int
+
+    static func resolved(_ s: Symbol) -> LookupOutcome { .init(symbol: s, cause: nil, candidates: 1) }
+    static func failed(_ c: UnresolvedCause, candidates: Int = 0) -> LookupOutcome {
+        .init(symbol: nil, cause: c, candidates: candidates)
+    }
+}
+
+/// Identity of one `UNRES` line. Use-sites AGGREGATE by this triple, exactly as `SURV` aggregates by
+/// name: a project with 362 occurrences of one unresolved name must not produce 362 lines.
+struct UnresolvedKey: Hashable {
+    let cause: UnresolvedCause
+    let member: String
+    let receiver: String?
+}
+
+/// First location + occurrence count for one `UnresolvedKey`. `file` is the file NAME (hashed into
+/// the report, matching `SURV`); `path` is the real path and only ever reaches the separate,
+/// local-only `Diagnostics-files.txt` legend.
+struct UnresolvedHit {
+    var occurrences: Int
+    var file: String
+    var path: String
+    var line: Int
+    var candidates: Int
 }
 
 private final class ResolutionVisitor: SyntaxVisitor {
@@ -149,10 +254,21 @@ private final class ResolutionVisitor: SyntaxVisitor {
     /// Project-unique members of external-type extensions (see
     /// `ResolutionPass.uniqueExternalExtensionMembers`); empty when the feature is off.
     private let uniqueExternalMembers: [String: [String: Symbol]]
+    /// Every name a symbol somewhere was renamed under. `UNRES` reporting is filtered to these: a
+    /// use-site of a name nothing renamed cannot desync, and reporting the rest (every
+    /// `String.append`, every SwiftUI modifier) would bury the signal under thousands of lines.
+    /// Empty when `--diagnose-overloads` is off, so the filter also switches the feature off.
+    private let renamedNames: Set<String>
+    /// Aggregated `UNRES` hits for this file, merged by `ResolutionPass` across all files so the
+    /// occurrence counts are project-wide.
+    var unresolved: [UnresolvedKey: UnresolvedHit] = [:]
+    /// Lazily built (diagnostics only) so `UNRES` can report a real `line=`.
+    private lazy var diagConverter = SourceLocationConverter(fileName: file.url.path, tree: file.syntax)
 
     init(file: SourceFile, table: SymbolTable, map: RenameMap, fileScope: Scope, diagLog: Logger,
          diagnose: Bool = false, indexContext: IndexContext? = nil,
-         uniqueExternalMembers: [String: [String: Symbol]] = [:]) {
+         uniqueExternalMembers: [String: [String: Symbol]] = [:],
+         renamedNames: Set<String> = []) {
         self.file = file
         self.table = table
         self.map = map
@@ -160,6 +276,7 @@ private final class ResolutionVisitor: SyntaxVisitor {
         self.diagnose = diagnose
         self.indexContext = indexContext
         self.uniqueExternalMembers = uniqueExternalMembers
+        self.renamedNames = renamedNames
         // Build the converter only when the index is engaged (it parses positions; skip the cost
         // on the syntactic baseline). Use locals to avoid reading self before super.init.
         let path: String?
@@ -196,6 +313,40 @@ private final class ResolutionVisitor: SyntaxVisitor {
     }
     private func diag(_ msg: @autoclosure () -> String) {
         if diagnose { diagLog.log("OVLD \(msg())") }
+    }
+
+    /// The ONE place a declined use-site becomes an `UNRES` record. Every branch that gives up
+    /// routes here rather than logging inline, so the volume filter, the aggregation key, the
+    /// anonymization and the location lookup stay in a single spot — spraying `diagLog.log` across
+    /// the member-access branches is how the OVLD line kind ended up covering one case in twelve.
+    ///
+    /// Costs nothing on the default path: `diagnose` is false and `renamedNames` is empty.
+    private func reportUnresolved(_ cause: UnresolvedCause, name: String, token: TokenSyntax,
+                                  receiver: String? = nil, candidates: Int = 0) {
+        guard diagnose, renamedNames.contains(name) else { return }
+        let key = UnresolvedKey(cause: cause, member: name, receiver: receiver)
+        if unresolved[key] != nil {
+            unresolved[key]!.occurrences += 1
+            return
+        }
+        let pos = token.positionAfterSkippingLeadingTrivia
+        unresolved[key] = UnresolvedHit(occurrences: 1,
+                                        file: file.url.lastPathComponent,
+                                        path: file.url.path,
+                                        line: diagConverter.location(for: pos).line,
+                                        candidates: candidates)
+    }
+
+    /// Report a `LookupOutcome` that carries a cause. Returns the outcome's symbol so call sites
+    /// read as `if let m = report(lookupMember(…), …) { emitRename(…) }`.
+    @discardableResult
+    private func report(_ outcome: LookupOutcome, name: String, token: TokenSyntax,
+                        receiver: Symbol?) -> Symbol? {
+        if let cause = outcome.cause {
+            reportUnresolved(cause, name: name, token: token, receiver: receiver?.name,
+                             candidates: outcome.candidates)
+        }
+        return outcome.symbol
     }
 
     private var currentScope: Scope { scopeStack.last! }
@@ -274,6 +425,32 @@ private final class ResolutionVisitor: SyntaxVisitor {
     /// A value binding (local var/let or a parameter) — the kinds that obey the own-initializer rule
     /// and can legitimately be an invoked closure value. NOT callable declarations (method/function).
     static func isValueBinding(_ k: SymbolKind) -> Bool { k == .property || k == .parameter }
+
+    /// `currentScope.lookup` for a name in CALLEE position (`name(args)`).
+    ///
+    /// Swift's unqualified lookup stops at the innermost scope that declares the name, and
+    /// `Scope.lookup` returns that level's FIRST declaration in SOURCE ORDER — kind-blind. When one
+    /// level declares both a value and a callable of the name (`var pf2: Bool` next to
+    /// `func pf2(for:) -> Bool`, the shape a protocol overloading one name across kinds produces),
+    /// first-in-order is a coin flip: picking the value rewrites the call's callee to a PROPERTY's
+    /// obf, which is a wrong rename RollbackPass cannot catch. A callee denotes a callable, so
+    /// prefer one at the level that declares the name.
+    ///
+    /// The value is still returned when that level declares no callable — a closure-typed property
+    /// or parameter genuinely IS invoked as `content()`, and that branch must keep working. When a
+    /// callable wins, the caller's `switch` falls through to `resolveCall`, which does full
+    /// label/type-aware overload resolution over the same level.
+    private func lookupCallee(named name: String) -> Symbol? {
+        var s: Scope? = currentScope
+        while let cur = s {
+            let level = cur.symbols.filter { $0.name == name }
+            if !level.isEmpty {
+                return Self.narrowed(level, to: .callee).first
+            }
+            s = cur.parent
+        }
+        return nil
+    }
 
     private func enterInnerScope(of node: some SyntaxProtocol) {
         if let s = table.innerScope[node.id] {
@@ -487,7 +664,9 @@ private final class ResolutionVisitor: SyntaxVisitor {
                 for arg in node.arguments {
                     guard let label = arg.label else { continue }
                     let labelText = label.text
-                    if let member = typeScope.member(named: labelText),
+                    // A memberwise-init label names a stored PROPERTY; a same-named method must not
+                    // win `member(named:)`'s source-order pick and silently drop the label rename.
+                    if let member = Self.narrowed(typeScope.members(named: labelText), to: .value).first,
                        member.kind == .property,
                        map.obf(for: member) != nil {
                         emitRename(for: label, target: member)
@@ -624,8 +803,10 @@ private final class ResolutionVisitor: SyntaxVisitor {
                 break
             }
             let memberName = stripBackticks(prop.declName.baseName.text)
+            // A key-path component is never a callable, so a same-named method must not win the
+            // source-order pick `member(named:)` makes (same position rule as `lookupMember`).
             guard let inner = innerScope(of: typeSym),
-                  let member = inner.member(named: memberName) else {
+                  let member = Self.narrowed(inner.members(named: memberName), to: .value).first else {
                 break
             }
             emitRename(for: prop.declName.baseName, target: member)
@@ -699,9 +880,11 @@ private final class ResolutionVisitor: SyntaxVisitor {
         // Fallback for chains we can't flatten (generic / optional / array / metatype bases):
         // resolve the immediate base and rename only this member, as before.
         let memberName = stripBackticks(node.name.text)
+        // TYPE position: the member denotes a type, so a same-named property/method must not win
+        // `member(named:)`'s source-order pick (same position rule as `lookupMember`).
         if let baseSym = resolveTypeFromTypeSyntax(node.baseType),
            let baseScope = innerScope(of: baseSym),
-           let member = baseScope.member(named: memberName),
+           let member = Self.narrowed(baseScope.members(named: memberName), to: .typeReference).first,
            member.kind.isTypeLike {
             emitRename(for: node.name, target: member)
         }
@@ -767,7 +950,8 @@ private final class ResolutionVisitor: SyntaxVisitor {
             var ok = true
             for seg in segments.dropFirst() {
                 guard let inner = innerScope(of: walkSym),
-                      let m = inner.member(named: seg.name), m.kind.isTypeLike else {
+                      let m = Self.narrowed(inner.members(named: seg.name), to: .typeReference).first,
+                      m.kind.isTypeLike else {
                     ok = false; break
                 }
                 path.append(m)
@@ -858,7 +1042,9 @@ private final class ResolutionVisitor: SyntaxVisitor {
         if let member = type.as(MemberTypeSyntax.self) {
             guard let baseSym = resolveTypeFromTypeSyntax(member.baseType),
                   let baseScope = innerScope(of: baseSym) else { return nil }
-            return baseScope.member(named: stripBackticks(member.name.text))
+            // TYPE position — see `UsePosition`.
+            return Self.narrowed(baseScope.members(named: stripBackticks(member.name.text)),
+                                 to: .typeReference).first
         }
         if let opt = type.as(OptionalTypeSyntax.self) {
             return resolveTypeFromTypeSyntax(opt.wrappedType)
@@ -917,7 +1103,7 @@ private final class ResolutionVisitor: SyntaxVisitor {
             // control falls through to resolveCall (callable-only, overload-aware). Without this,
             // `f(…)` inside `let f = … f(…) …` binds to the value local → the call is left
             // un-renamed while the method decl renames → "use of local variable before its decl".
-            if let sym = currentScope.lookup(name: name),
+            if let sym = lookupCallee(named: name),
                !(Self.isValueBinding(sym.kind) && isInsideOwnInitializer(of: sym, node: node)) {
                 switch sym.kind {
                 case .class, .struct, .enum, .protocol, .typealias_, .associatedtype_:
@@ -941,10 +1127,21 @@ private final class ResolutionVisitor: SyntaxVisitor {
             // ambiguous, by argument types) so we don't pick a same-named-but-different-signature
             // function from an enclosing scope or a foreign module.
             if let target = resolveCall(name: name, call: call) {
+                if map.obf(for: target) == nil {
+                    reportUnresolved(.candidateHasNoObf, name: name, token: token)
+                }
                 emitRename(for: token, target: target)
+            } else {
+                // Ambiguous / no unique match → leave the call un-renamed. The original name then
+                // survives in output and RollbackPass reverts any partial renames of it. Which of
+                // the two it was is exactly what the report has to say, so classify it the same way
+                // `lookupMember` does: a name with no label-matching callable in reach never had a
+                // candidate; one with several was an unresolved overload.
+                let hadCandidates = !lexicalCallableCandidates(named: name).isEmpty
+                    || !table.callables(named: name).isEmpty
+                reportUnresolved(hadCandidates ? .ambiguousOverload : .noCandidateInScope,
+                                 name: name, token: token)
             }
-            // Ambiguous / no unique match → leave the call un-renamed. The original name then
-            // survives in output and RollbackPass reverts any partial renames of it.
             return .skipChildren
         }
 
@@ -1416,9 +1613,10 @@ private final class ResolutionVisitor: SyntaxVisitor {
     }
 
     private func enumHasCase(_ typeSym: Symbol, _ caseName: String) -> Bool {
-        guard let inner = innerScope(of: typeSym),
-              let m = inner.member(named: caseName) else { return false }
-        return m.kind == .enumCase
+        guard let inner = innerScope(of: typeSym) else { return false }
+        // Kind-filtered, not first-match: a same-named method declared before the case would
+        // otherwise answer "no case" (`member(named:)` is kind-blind — see `UsePosition`).
+        return inner.members(named: caseName).contains { $0.kind == .enumCase }
     }
 
     private func bareTypeName(_ s: String) -> String {
@@ -1472,26 +1670,83 @@ private final class ResolutionVisitor: SyntaxVisitor {
         return nil
     }
 
-    /// Resolve `name` as a member of `typeScope` for a use-site. When the name resolves to a
-    /// single member, return it. When it's an OVERLOADED method (several same-named members),
-    /// disambiguate by the enclosing call's signature — first-match would otherwise pick the wrong
-    /// overload and emit a compile-breaking rename. Returns nil when overloaded but unresolvable
-    /// (no call context, or still ambiguous): never guess between overloads.
-    private func resolveMemberForUse(_ name: String, in typeScope: Scope, node: MemberAccessExprSyntax) -> Symbol? {
-        let candidates = typeScope.members(named: name)
-        if candidates.count <= 1 { return candidates.first }
+    /// Resolve `name` as a member of `typeScope` for a use-site, reporting WHY when it declines.
+    ///
+    /// When the name resolves to a single member, return it. When it's an OVERLOADED method
+    /// (several same-named members), disambiguate by the enclosing call's signature — first-match
+    /// would otherwise pick the wrong overload and emit a compile-breaking rename. Returns no
+    /// symbol when overloaded but unresolvable (no call context, or still ambiguous): never guess
+    /// between overloads.
+    private func lookupMember(_ name: String, in typeScope: Scope,
+                              node: MemberAccessExprSyntax) -> LookupOutcome {
+        let declared = typeScope.members(named: name)
+        guard !declared.isEmpty else { return .failed(.noCandidateInScope) }
+        let call = enclosingCall(of: node)
+        // Narrow by SYNTACTIC POSITION before any fail-closed bail: a member access in callee
+        // position denotes a callable, one that is not denotes a non-callable. Without this, a type
+        // declaring both `var pf2: Bool` and `func pf2(for:) -> Bool` produced a mixed-kind set that
+        // the bail below refused outright, so `p1.pf2(for: path)` was never rewritten while the
+        // method's declaration was — and rollback shield 1b (the un-renamed property is a namesake)
+        // blocked the rescue, so the desync SHIPPED as "cannot call value of non-function type".
+        let candidates = Self.narrowed(declared, to: call != nil ? .callee : .value)
+        if candidates.count == 1 { return outcome(for: candidates[0]) }
         // Checked BEFORE label filtering on purpose: a call may omit a defaulted label in a way
         // `labelsMatch` can't model, and when every candidate shares one obf the outcome is right
         // regardless of which overload the compiler selects.
-        if let shared = unambiguousSharedObfTarget(candidates) { return shared }
-        guard candidates.allSatisfy({ Self.isCallable($0.kind) }), let call = enclosingCall(of: node) else {
-            return nil
+        if let shared = unambiguousSharedObfTarget(candidates) { return .resolved(shared) }
+        guard candidates.allSatisfy({ Self.isCallable($0.kind) }) else {
+            return .failed(.mixedKindCandidates, candidates: candidates.count)
         }
-        return chooseOverload(candidates, call: call)
+        guard let call else { return .failed(.ambiguousOverload, candidates: candidates.count) }
+        guard let picked = chooseOverload(candidates, call: call) else {
+            return .failed(.ambiguousOverload, candidates: candidates.count)
+        }
+        return outcome(for: picked)
+    }
+
+    /// A resolved candidate, tagged `candidate-has-no-obf` when it carries no obf: the use-site is
+    /// correct as it stands (the declaration was protected or policy-skipped), which is exactly what
+    /// turns an unexplained `SURV` into an explained one.
+    private func outcome(for sym: Symbol) -> LookupOutcome {
+        map.obf(for: sym) != nil ? .resolved(sym) : .init(symbol: sym, cause: .candidateHasNoObf, candidates: 1)
     }
 
     static func isCallable(_ k: SymbolKind) -> Bool {
         k == .method || k == .function
+    }
+
+    /// What the SYNTAX at a use-site says about the kind of declaration it references — the part of
+    /// name resolution Swift's grammar settles before any type information exists.
+    ///
+    /// `Scope.member(named:)` / `Scope.members(named:)` are kind-BLIND and hand back declarations in
+    /// source order, so a type that declares two same-named members of different kinds (`var pf2:
+    /// Bool` plus `func pf2(for:) -> Bool` — legal Swift, and the shape a protocol overloading one
+    /// name across kinds produces) resolved by a coin flip or, worse, was refused outright.
+    enum UsePosition {
+        /// `x.f(…)` / `f(…)` — the callee of a call: a method or function.
+        case callee
+        /// `x.f` read as a value, and every key-path component: never a callable.
+        case value
+        /// `A.B` in TYPE position: a type-like declaration.
+        case typeReference
+
+        func admits(_ k: SymbolKind) -> Bool {
+            switch self {
+            case .callee:        return ResolutionVisitor.isCallable(k)
+            case .value:         return !ResolutionVisitor.isCallable(k)
+            case .typeReference: return k.isTypeLike
+            }
+        }
+    }
+
+    /// The candidates that can occupy `position`. Applied ONLY when it leaves a non-empty set: an
+    /// empty result means the grammar rule does not apply at this site — a closure-typed PROPERTY is
+    /// legitimately invoked as `obj.handler()`, whose callee is not a callable *declaration* — so
+    /// the original set is the honest answer and the caller's fail-closed logic decides as before.
+    static func narrowed(_ candidates: [Symbol], to position: UsePosition) -> [Symbol] {
+        guard candidates.count > 1 else { return candidates }
+        let matching = candidates.filter { position.admits($0.kind) }
+        return matching.isEmpty ? candidates : matching
     }
 
     /// True when the call's argument labels can be satisfied by the symbol's parameters. Matches
@@ -1547,17 +1802,24 @@ private final class ResolutionVisitor: SyntaxVisitor {
                     // For `Self.X` inside an extension, the enclosing scope is the extension's
                     // own scope — which only knows extension-declared members. Members declared
                     // on the main type need lookup against the type symbol's CANONICAL inner scope.
-                    if let typeScope = enclosingTypeScope(),
-                       let owner = typeScope.owner,
-                       let canonical = innerScope(of: owner),
-                       let target = resolveMemberForUse(memberName, in: canonical, node: node) {
-                        emitRename(for: memberToken, target: target)
-                    } else if let extScope = enclosingExternalExtensionScope(),
-                              let target = resolveMemberForUse(memberName, in: extScope, node: node) {
+                    let owner = enclosingTypeScope()?.owner
+                    if let owner, let canonical = innerScope(of: owner) {
+                        let found = lookupMember(memberName, in: canonical, node: node)
+                        if let target = report(found, name: memberName, token: memberToken,
+                                               receiver: owner) {
+                            emitRename(for: memberToken, target: target)
+                        }
+                    } else if let extScope = enclosingExternalExtensionScope() {
                         // Inside an extension of an EXTERNAL type there IS no owner symbol, so
                         // `self.member` resolves against the extension's own scope (B-FIX-31).
                         // Without it the decl renames while `self.member` survives → revert.
-                        emitRename(for: memberToken, target: target)
+                        let found = lookupMember(memberName, in: extScope, node: node)
+                        if let target = report(found, name: memberName, token: memberToken,
+                                               receiver: nil) {
+                            emitRename(for: memberToken, target: target)
+                        }
+                    } else {
+                        reportUnresolved(.receiverUntyped, name: memberName, token: memberToken)
                     }
                     return .visitChildren
                 }
@@ -1578,9 +1840,15 @@ private final class ResolutionVisitor: SyntaxVisitor {
                         // is a member of E1. Without this unwrap, the member token stays un-renamed
                         // while the typealias's own decl was obfuscated → desync.
                         let walkSym = typealiasUnwrap(typeSym)
-                        if let typeScope = innerScope(of: walkSym),
-                           let target = resolveMemberForUse(memberName, in: typeScope, node: node) {
-                            emitRename(for: memberToken, target: target)
+                        if let typeScope = innerScope(of: walkSym) {
+                            let found = lookupMember(memberName, in: typeScope, node: node)
+                            if let target = report(found, name: memberName, token: memberToken,
+                                                   receiver: walkSym) {
+                                emitRename(for: memberToken, target: target)
+                            }
+                        } else {
+                            reportUnresolved(.receiverUntyped, name: memberName, token: memberToken,
+                                             receiver: walkSym.name)
                         }
                         return .skipChildren
                     }
@@ -1588,30 +1856,12 @@ private final class ResolutionVisitor: SyntaxVisitor {
                 // Base is an identifier we don't know as a type. Try precise type resolution
                 // (handles property/parameter declared types, $x/_x property-wrapper projections,
                 // optional chaining, try/await, etc.) and look up `member` in the resolved type.
-                if let baseTypeSym = resolveTypeSymbol(of: base),
-                   let typeScope = innerScope(of: baseTypeSym),
-                   let member = resolveMemberForUse(memberName, in: typeScope, node: node) {
-                    emitRename(for: memberToken, target: member)
-                } else if let member = resolveExternalExtensionMember(memberName, base: base, node: node)
-                            ?? uniqueExternalMember(memberName) {
-                    emitRename(for: memberToken, target: member)
-                }
+                resolveMemberAccess(memberName, token: memberToken, base: base, node: node)
                 return .visitChildren
             }
             // Chained / complex base: type-resolve to a precise type symbol (avoids ambiguity
             // when two types share a simple name — e.g. nested Coordinator inside different parents).
-            if let baseSym = resolveTypeSymbol(of: base),
-               let typeScope = innerScope(of: baseSym),
-               let member = resolveMemberForUse(memberName, in: typeScope, node: node) {
-                emitRename(for: memberToken, target: member)
-            } else if let member = resolveExternalExtensionMember(memberName, base: base, node: node)
-                        ?? uniqueExternalMember(memberName) {
-                // No typeable receiver: the project-unique external-extension member is the only
-                // declaration that name can denote (see `uniqueExternalExtensionMembers`). This is
-                // what reaches the SwiftUI `extension View` modifier idiom, whose receivers are
-                // `some View` chains no syntactic resolver can type.
-                emitRename(for: memberToken, target: member)
-            }
+            resolveMemberAccess(memberName, token: memberToken, base: base, node: node)
             return .visitChildren
         } else {
             // Shorthand `.member` — only rename if we positively identify the contextual type.
@@ -1622,11 +1872,55 @@ private final class ResolutionVisitor: SyntaxVisitor {
             if let context = contextualType(for: node),
                let typeSym = typeResolver.typeSymbol(forQualifiedName: context.name,
                                                      in: context.scope ?? currentScope),
-               let typeScope = innerScope(of: typeSym),
-               let member = resolveMemberForUse(memberName, in: typeScope, node: node) {
-                emitRename(for: memberToken, target: member)
+               let typeScope = innerScope(of: typeSym) {
+                let found = lookupMember(memberName, in: typeScope, node: node)
+                if let member = report(found, name: memberName, token: memberToken, receiver: typeSym) {
+                    emitRename(for: memberToken, target: member)
+                }
+            } else {
+                reportUnresolved(.noContextualType, name: memberName, token: memberToken)
             }
             return .visitChildren
+        }
+    }
+
+    /// A member access whose base is an EXPRESSION (a value reference or a chain), shared by the
+    /// two branches that reach one. Type the receiver, look the member up in it, and only when the
+    /// receiver could NOT be typed at all fall back to the name-based external-extension routes.
+    ///
+    /// That last condition is the load-bearing one. `uniqueExternalMember` rewrites by NAME alone
+    /// (see `ResolutionPass.uniqueExternalExtensionMembers`), and it used to fire whenever the whole
+    /// `if` chain failed — including when the receiver typed PERFECTLY and only the member lookup
+    /// did not (Case A's mixed-kind bail, an inherited member, a typo'd side table). A well-typed
+    /// LOCAL receiver would then have its member rewritten to the obf of an unrelated `extension
+    /// String { func foo() }` member that merely shares the name: a wrong rename, the class
+    /// RollbackPass cannot catch because no original name is left behind. The fallback is only ever
+    /// justified by "we have no idea what this receiver is", so that is now literally the condition.
+    private func resolveMemberAccess(_ memberName: String, token: TokenSyntax,
+                                     base: ExprSyntax, node: MemberAccessExprSyntax) {
+        let baseSym = resolveTypeSymbol(of: base)
+        if let baseSym {
+            if let typeScope = innerScope(of: baseSym) {
+                let found = lookupMember(memberName, in: typeScope, node: node)
+                if let member = report(found, name: memberName, token: token, receiver: baseSym) {
+                    emitRename(for: token, target: member)
+                }
+            } else {
+                reportUnresolved(.receiverUntyped, name: memberName, token: token,
+                                 receiver: baseSym.name)
+            }
+            return
+        }
+        // No typeable receiver. `resolveExternalExtensionMember` still matches on the receiver's
+        // WRITTEN type (a collection has no Symbol since B-FIX-28 but does have a written type);
+        // `uniqueExternalMember` is the last resort for receivers that cannot be typed at all —
+        // the SwiftUI `extension View` modifier idiom, whose receivers are `some View` chains no
+        // syntactic resolver can reach.
+        if let member = resolveExternalExtensionMember(memberName, base: base, node: node)
+            ?? uniqueExternalMember(memberName) {
+            emitRename(for: token, target: member)
+        } else {
+            reportUnresolved(.receiverUntyped, name: memberName, token: token)
         }
     }
 
@@ -1657,11 +1951,15 @@ private final class ResolutionVisitor: SyntaxVisitor {
         guard !table.externalExtensions.isEmpty,
               let info = typeResolver.receiverTypeInfo(of: base, in: currentScope) else { return nil }
         let receiver = typeResolver.expandedTypeName(info.name, in: info.declScope)
-        var candidates: [Symbol] = []
+        var declared: [Symbol] = []
         for ext in table.externalExtensions
         where externalExtensionApplies(ext, toReceiverType: receiver.name, writtenIn: receiver.scope) {
-            candidates.append(contentsOf: ext.scope.members(named: name))
+            declared.append(contentsOf: ext.scope.members(named: name))
         }
+        // Same position rule as `lookupMember`: an extension may declare `var foo` and `func foo()`
+        // on the same external type just as a local type may.
+        let call = enclosingCall(of: node)
+        var candidates = Self.narrowed(declared, to: call != nil ? .callee : .value)
         if candidates.count == 1 { return candidates[0] }
         guard candidates.count > 1 else { return nil }
         // Cross-target duplicates: a multi-target app compiles the same file into several writable
@@ -1672,8 +1970,7 @@ private final class ResolutionVisitor: SyntaxVisitor {
         if sameModule.count == 1 { return sameModule[0] }
         if !sameModule.isEmpty { candidates = sameModule }
         if let shared = unambiguousSharedObfTarget(candidates) { return shared }
-        guard candidates.allSatisfy({ Self.isCallable($0.kind) }),
-              let call = enclosingCall(of: node) else { return nil }
+        guard candidates.allSatisfy({ Self.isCallable($0.kind) }), let call else { return nil }
         return chooseOverload(candidates, call: call)
     }
 

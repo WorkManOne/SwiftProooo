@@ -151,14 +151,28 @@ public final class WitnessLinker {
     /// be wrongly paired with an unrelated requirement (`f1(par1: String, par2: String)`) and, if
     /// the requirement is protected/read-only, dragged into a group rollback — un-obfuscating an
     /// overload that has nothing to do with the protocol.
+    /// A witness also has to match the requirement's KIND. A protocol may overload ONE name across
+    /// kinds (`var pf2: Bool { get set }` next to `func pf2(for:) -> Bool` — legal Swift), and
+    /// `sameName.first` for a property/typealias witness was kind-blind: with the method declared
+    /// first, the class's PROPERTY linked to the METHOD requirement and adopted its obf, while the
+    /// protocol's property requirement kept its own ⇒ "does not conform to protocol", a wrong-rename
+    /// red RollbackPass cannot catch (no original name survives). Kinds pair as
+    /// property↔property, method↔method (plus signature) and typealias↔associatedtype.
     private func matchRequirement(_ member: Symbol, in reqs: [Symbol]) -> Symbol? {
         let sameName = reqs.filter { $0.name == member.name }
         guard !sameName.isEmpty else { return nil }
-        if member.kind == .method {
+        switch member.kind {
+        case .method:
             return sameName.first { $0.kind == .method && signaturesCompatible(member, $0) }
+        case .property:
+            return sameName.first { $0.kind == .property }
+        case .typealias_:
+            // A `typealias` witnesses an `associatedtype`; requirements never carry `.typealias_`
+            // (see the collection loop in `link`), so accept both spellings defensively.
+            return sameName.first { $0.kind == .associatedtype_ || $0.kind == .typealias_ }
+        default:
+            return nil
         }
-        // Property / typealias witnesses carry no signature — match by name.
-        return sameName.first
     }
 
     /// Two method symbols have compatible signatures when their external labels match and no

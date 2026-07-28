@@ -3823,4 +3823,269 @@ final class PatternTests: XCTestCase {
         XCTAssertTrue(r.contains("return f(h."), "no argument signal can pick an overload — the call stays original:\n\(r)")
         XCTAssertTrue(r.contains("func f("), "and the group is reverted, not half-renamed:\n\(r)")
     }
+
+    // MARK: - Use-site position decides the kind of the referenced declaration
+
+    /// A protocol may overload ONE name across kinds — `var pf2: Bool` next to
+    /// `func pf2(for:) -> Bool`. The call `g.floeGate(for:)` is in CALLEE position, so it denotes the
+    /// method; the mixed-kind candidate set must be narrowed by that before any fail-closed bail.
+    /// Before the fix `resolveMemberForUse` refused the whole set, the call kept the original name
+    /// while the method's declaration renamed, and rollback shield 1b (the un-renamed property is a
+    /// namesake) blocked the rescue — so the desync SHIPPED as "cannot call value of non-function
+    /// type 'Bool'".
+    func testMixedKindMembers_calleePositionResolvesToTheMethod() throws {
+        let source = """
+        protocol Gate {
+            var floeGate: Bool { get set }
+            func floeGate(for path: String) -> Bool
+        }
+        final class Door: Gate {
+            var floeGate: Bool = false
+            func floeGate(for path: String) -> Bool { return path.isEmpty }
+        }
+        func check(_ g: Gate, path: String) -> Bool {
+            return g.floeGate(for: path)
+        }
+        """
+        let rewritten = try runPipeline(source)
+        XCTAssertFalse(rewritten.contains("floeGate"),
+                       "call in callee position must resolve to the method, not stall on the "
+                           + "mixed-kind set:\n\(rewritten)")
+    }
+
+    /// The mirror image: the same name read as a VALUE denotes the property. With debug names the
+    /// obf prefix carries the kind (`p` for properties, `m` for methods), so the read site must use
+    /// the property's obf — binding it to the method would be a silent wrong-storage read.
+    func testMixedKindMembers_valuePositionResolvesToTheProperty() throws {
+        let source = """
+        protocol Gate {
+            var floeGate: Bool { get set }
+            func floeGate(for path: String) -> Bool
+        }
+        final class Door: Gate {
+            var floeGate: Bool = false
+            func floeGate(for path: String) -> Bool { return path.isEmpty }
+        }
+        func read(_ g: Gate) -> Bool {
+            return g.floeGate
+        }
+        """
+        let rewritten = try runPipeline(source)
+        // The receiver renames too (it is a parameter), so match the read by SHAPE: the only
+        // `return <recv>.<member>` with no call parentheses.
+        let read = rewritten.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }
+            .first { $0.hasPrefix("return ") && $0.contains(".") && !$0.contains("(") }
+        let member = read?.split(separator: ".").last.map(String.init)
+        XCTAssertNotNil(member, "the value read must still be present:\n\(rewritten)")
+        XCTAssertTrue(member?.hasPrefix("p") == true,
+                      "a non-callee member access denotes the PROPERTY (debug obfs prefix "
+                          + "properties with `p`, methods with `m`): \(read ?? "")")
+    }
+
+    /// The bare-call form of the same invariant: `Scope.lookup` is kind-blind and returns the
+    /// innermost level's FIRST declaration in source order, so a value declared before a same-named
+    /// method captured the callee of `floeGate(for:)` and rewrote it to the PROPERTY's obf — a wrong
+    /// rename RollbackPass cannot catch.
+    func testBareCall_mixedKindLevel_prefersTheCallable() throws {
+        let source = """
+        final class Door {
+            var floeGate: Bool = false
+            func floeGate(for path: String) -> Bool { return path.isEmpty }
+            func use(path: String) -> Bool { return floeGate(for: path) }
+        }
+        """
+        let rewritten = try runPipeline(source)
+        let call = rewritten.split(separator: "\n").first { $0.contains("(for: path)") }
+        XCTAssertNotNil(call, "the call must still be present:\n\(rewritten)")
+        XCTAssertTrue(call?.contains("return m") == true,
+                      "a bare call's callee denotes the METHOD (debug obfs prefix methods with "
+                          + "`m`): \(call ?? "")")
+    }
+
+    // MARK: - HOF closure-parameter element type resolves in its DECLARING scope (Case B)
+
+    /// `Outer.Inner.allCases.compactMap { $0.… }` — the element type `Inner` is written INSIDE
+    /// `Outer`, so it is invisible from the call site and `preferredConcreteType` refuses it (nested
+    /// types are not top-level). `resolveSource` used to return the bare name and every consumer
+    /// resolved it against the USE-SITE scope, so `$0` stayed untyped and every member reached
+    /// through it was left original while its declaration renamed (B-FIX-23 applied to HOF typing).
+    func testHOFClosureParam_nestedElementType_resolvesInDeclaringScope() throws {
+        let source = """
+        enum Outer {
+            enum Inner: CaseIterable {
+                case alpha
+                case beta
+                func floeCaption(prefix: String) -> String { return prefix }
+            }
+        }
+        final class Screen {
+            func captions() -> [String] {
+                return Outer.Inner.allCases.compactMap { $0.floeCaption(prefix: "x") }
+            }
+        }
+        """
+        let rewritten = try runPipeline(source)
+        XCTAssertFalse(rewritten.contains("floeCaption"),
+                       "the closure parameter's element type must resolve in the scope the element "
+                           + "name was WRITTEN in:\n\(rewritten)")
+    }
+
+    /// Same invariant through a NAMED closure parameter and a nested collection PROPERTY (rather
+    /// than `allCases`), so the fix is not tied to one receiver shape.
+    func testHOFClosureParam_namedParamNestedElement_resolvesInDeclaringScope() throws {
+        let source = """
+        enum Outer {
+            struct Row {
+                func floeCaption() -> String { return "x" }
+            }
+            static let rows: [Row] = []
+        }
+        final class Screen {
+            func captions() -> [String] {
+                return Outer.rows.map { row in row.floeCaption() }
+            }
+        }
+        """
+        let rewritten = try runPipeline(source)
+        XCTAssertFalse(rewritten.contains("floeCaption"),
+                       "a named HOF closure parameter types from the receiver's element in the "
+                           + "element's own scope:\n\(rewritten)")
+    }
+
+    // MARK: - The project-unique external-extension fallback needs an UNTYPEABLE receiver
+
+    /// `uniqueExternalMember` rewrites by NAME alone. It used to fire whenever the member-access
+    /// `if` chain failed — including when the receiver typed PERFECTLY and only the member lookup
+    /// did not — so a well-typed LOCAL receiver had its member rewritten to the obf of an unrelated
+    /// `extension String` member that merely shares the name. That is a wrong rename, invisible to
+    /// RollbackPass (no original name survives). The fallback is only justified by "we cannot type
+    /// this receiver at all", so that must be the literal condition.
+    func testUniqueExternalMember_notAppliedWhenReceiverIsTyped() throws {
+        let source = """
+        extension String {
+            func floeTag() -> String { return self }
+        }
+        struct Holder { var value: Int = 0 }
+        final class User {
+            let holder = Holder()
+            func bad() -> String { return holder.floeTag() }
+        }
+        """
+        let rewritten = try runPipeline(source)
+        // The receiver property renames; the MEMBER must not.
+        XCTAssertTrue(rewritten.contains(".floeTag()"),
+                      "a member access on a TYPED local receiver must not fall back to the "
+                          + "name-based external-extension rewrite:\n\(rewritten)")
+        XCTAssertTrue(rewritten.contains("func floeTag()"),
+                      "and the unmatched use-site reverts the extension member (green, readable):"
+                          + "\n\(rewritten)")
+    }
+
+    // MARK: - Witness matching is kind-aware
+
+    /// The name of the first declaration introduced by `keyword` inside the block whose header line
+    /// starts with `header`. Used to compare the obf a protocol requirement and its witness got.
+    private func declaredName(inBlockStartingWith header: String, keyword: String,
+                              of source: String) -> String? {
+        let lines = source.split(separator: "\n", omittingEmptySubsequences: false)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+        guard let start = lines.firstIndex(where: { $0.hasPrefix(header) }) else { return nil }
+        for line in lines[(start + 1)...] {
+            if line.hasPrefix("}") { return nil }
+            guard line.hasPrefix(keyword) else { continue }
+            let name = line.dropFirst(keyword.count).prefix { $0.isLetter || $0.isNumber || $0 == "_" }
+            return name.isEmpty ? nil : String(name)
+        }
+        return nil
+    }
+
+    /// `WitnessLinker.matchRequirement` returned `sameName.first` for a property witness with NO
+    /// kind check, so in a protocol that overloads one name across kinds the property witness linked
+    /// to whichever requirement came FIRST in source order. With the method declared first, the
+    /// class's property adopted the METHOD requirement's obf while the protocol's property kept its
+    /// own — "does not conform", a wrong-rename red RollbackPass cannot catch.
+    func testWitness_mixedKindRequirements_methodFirst_propertyLinksToProperty() throws {
+        let rewritten = try runPipeline("""
+        protocol Gate {
+            func floeGate(for path: String) -> Bool
+            var floeGate: Bool { get set }
+        }
+        final class Door: Gate {
+            func floeGate(for path: String) -> Bool { return path.isEmpty }
+            var floeGate: Bool = false
+        }
+        """)
+        assertWitnessKindsAligned(rewritten)
+    }
+
+    /// The same shape with the declarations the other way round — the order that happened to work
+    /// before, kept so the fix is not order-sensitive in the opposite direction.
+    func testWitness_mixedKindRequirements_propertyFirst_propertyLinksToProperty() throws {
+        let rewritten = try runPipeline("""
+        protocol Gate {
+            var floeGate: Bool { get set }
+            func floeGate(for path: String) -> Bool
+        }
+        final class Door: Gate {
+            var floeGate: Bool = false
+            func floeGate(for path: String) -> Bool { return path.isEmpty }
+        }
+        """)
+        assertWitnessKindsAligned(rewritten)
+    }
+
+    private func assertWitnessKindsAligned(_ rewritten: String, file: StaticString = #filePath,
+                                           line: UInt = #line) {
+        let protoVar = declaredName(inBlockStartingWith: "protocol", keyword: "var ", of: rewritten)
+        let classVar = declaredName(inBlockStartingWith: "final class", keyword: "var ", of: rewritten)
+        let protoFunc = declaredName(inBlockStartingWith: "protocol", keyword: "func ", of: rewritten)
+        let classFunc = declaredName(inBlockStartingWith: "final class", keyword: "func ", of: rewritten)
+        XCTAssertNotNil(protoVar, "protocol property not found:\n\(rewritten)", file: file, line: line)
+        XCTAssertEqual(protoVar, classVar,
+                       "the property witness must adopt the PROPERTY requirement's obf:\n\(rewritten)",
+                       file: file, line: line)
+        XCTAssertEqual(protoFunc, classFunc,
+                       "the method witness must adopt the METHOD requirement's obf:\n\(rewritten)",
+                       file: file, line: line)
+        XCTAssertNotEqual(protoVar, protoFunc,
+                          "property and method must not collapse onto one obf:\n\(rewritten)",
+                          file: file, line: line)
+    }
+
+    // MARK: - UNRES diagnostics (why a use-site was not rewritten)
+
+    /// `OVLD` fires only for an ambiguous overload SET and `SURV` names a survivor without a cause,
+    /// so a use-site that silently resolved to nothing produced no line at all. `UNRES` closes that:
+    /// one line per (cause, member, receiver), hashed through the SAME `Anon.of` so the `member=`
+    /// token matches the `SURV` `name=` token for the same symbol.
+    func testDiagnostics_untypeableReceiver_reportedAsUnresolved() throws {
+        let source = """
+        struct Box { var widgetPayload: Int = 0 }
+        func take(_ x: SomeExternalThing) -> Int { return x.widgetPayload }
+        """
+        let diag = try runPipelineDiagnostics(source)
+        XCTAssertTrue(diag.contains("UNRES cause=receiver-untyped member=\(Anon.of("widgetPayload"))"),
+                      "an un-typeable receiver must be reported with its cause:\n\(diag)")
+        XCTAssertTrue(diag.contains("SURV reverted name=\(Anon.of("widgetPayload"))"),
+                      "and correlate with the SURV line for the same symbol:\n\(diag)")
+    }
+
+    /// A receiver we typed fine whose type declares no such member is a DIFFERENT failure from one
+    /// we could not type, and the report has to tell them apart — that distinction is the whole
+    /// point of the cause field. The receiver's type is named (hashed) so the line is actionable.
+    func testDiagnostics_typedReceiverWithoutMember_reportedWithReceiverType() throws {
+        let source = """
+        struct Box { var widgetPayload: Int = 0 }
+        struct Other { var q: Int = 0 }
+        func take(_ o: Other) -> Int { return o.widgetPayload }
+        """
+        let diag = try runPipelineDiagnostics(source)
+        let line = diag.split(separator: "\n").first {
+            $0.contains("UNRES cause=no-candidate-in-scope member=\(Anon.of("widgetPayload"))")
+        }
+        XCTAssertNotNil(line, "a typed receiver missing the member is its own cause:\n\(diag)")
+        XCTAssertTrue(line?.contains("recv=\(Anon.of("Other"))") == true,
+                      "the receiver type must be named: \(line ?? "")")
+        XCTAssertTrue(line?.contains("occ=1") == true, "occurrences are counted: \(line ?? "")")
+    }
 }

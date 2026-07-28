@@ -170,8 +170,10 @@ public final class TypeResolver {
             // Closure shorthand parameter: `$0`, `$1`, ... — resolve via enclosing HOF call.
             // Only matches when the suffix is numeric — otherwise it's `$x` (projected value).
             if rawName.hasPrefix("$"), let idx = Int(rawName.dropFirst()) {
-                if let typeName = inferClosureParamType(at: idx, from: ref, in: scope) {
-                    return typeSymbol(forQualifiedName: typeName, in: scope)
+                // Resolve in the scope the inferred type NAME was written in, never the use-site's
+                // (B-FIX-23) — see `resolveSource`.
+                if let t = inferClosureParamType(at: idx, from: ref, in: scope) {
+                    return typeSymbol(forQualifiedName: t.name, in: t.scope)
                 }
                 return nil
             }
@@ -197,8 +199,8 @@ public final class TypeResolver {
                 // binding for shadow correctness must not disable the typing that previously ran
                 // when the name was absent from the scope tree.
                 if sym.kind == .parameter,
-                   let typeName = inferNamedClosureParamType(name: name, from: ref, in: scope) {
-                    return typeSymbol(forQualifiedName: typeName, in: scope)
+                   let t = inferNamedClosureParamType(name: name, from: ref, in: scope) {
+                    return typeSymbol(forQualifiedName: t.name, in: t.scope)
                 }
                 // A REGISTERED but untyped binding whose type the caller knows out-of-band — an
                 // enum-case payload bound by `case .run(let m)`, recorded flow-sensitively by
@@ -218,8 +220,8 @@ public final class TypeResolver {
                 return typeSymbol(forQualifiedName: typeName, in: scope)
             }
             // Maybe `name` is a named closure parameter — find enclosing closure and check.
-            if let typeName = inferNamedClosureParamType(name: name, from: ref, in: scope) {
-                return typeSymbol(forQualifiedName: typeName, in: scope)
+            if let t = inferNamedClosureParamType(name: name, from: ref, in: scope) {
+                return typeSymbol(forQualifiedName: t.name, in: t.scope)
             }
             if let target = preferredConcreteType(named: name) {
                 return unwrapTypealias(target, in: scope)
@@ -422,7 +424,8 @@ public final class TypeResolver {
     /// Walks: `ref` → enclosing ClosureExpr → enclosing FunctionCallExpr → look up HOF in registry.
     /// If the closure is the HOF's expected closure-argument and `N` < expected param count,
     /// produces the type of that closure parameter (typically the receiver's Element).
-    func inferClosureParamType(at index: Int, from ref: DeclReferenceExprSyntax, in scope: Scope) -> String? {
+    func inferClosureParamType(at index: Int, from ref: DeclReferenceExprSyntax,
+                               in scope: Scope) -> (name: String, scope: Scope)? {
         // Positional `$N` binds to the INNERMOST enclosing closure — each closure has its own `$0`,
         // so (unlike a named param) it is NOT visible from an outer closure. Don't walk outward.
         guard let closure = Self.enclosingClosure(of: Syntax(ref)),
@@ -435,7 +438,8 @@ public final class TypeResolver {
     /// Resolve a named closure parameter like `arr.filter { item in item.x }` where the inner
     /// reference is `item`. Walks up to ClosureExpr, finds the param by name in its signature,
     /// determines its index, delegates to the HOF inference.
-    func inferNamedClosureParamType(name: String, from ref: DeclReferenceExprSyntax, in scope: Scope) -> String? {
+    func inferNamedClosureParamType(name: String, from ref: DeclReferenceExprSyntax,
+                                    in scope: Scope) -> (name: String, scope: Scope)? {
         // A NAMED closure parameter is lexically visible throughout the closure body, INCLUDING
         // inside nested (non-HOF) closures — e.g. `arr.map { row in cb = { use(row.x) } }`, where
         // `row.x` sits in the escaping `cb` closure. So walk up through EVERY enclosing closure
@@ -511,7 +515,7 @@ public final class TypeResolver {
         closureArgIndex: Int,
         paramIndex: Int,
         in scope: Scope
-    ) -> String? {
+    ) -> (name: String, scope: Scope)? {
         // Method-style: `receiver.method(...)`
         if let memberCall = call.calledExpression.as(MemberAccessExprSyntax.self),
            let receiver = memberCall.base {
@@ -536,10 +540,14 @@ public final class TypeResolver {
         // OUR functions/methods whose param at `closureArgIndex` is a function type — type the
         // closure's params from that declared signature. Generalizes closure-param inference to any
         // function, no per-HOF hardcoding.
+        //
+        // The recorded input type is written in the CALLEE's scope, so it carries that scope for the
+        // same reason the element does above: `func each(_ f: (Row) -> Void)` declared inside a type
+        // that also declares `Row` names a type invisible from the call site.
         if let callee = calleeCallable(for: call, in: scope),
            let inputs = table.functionParamClosureInput[callee.id]?[closureArgIndex],
            paramIndex < inputs.count, !inputs[paramIndex].isEmpty {
-            return inputs[paramIndex]
+            return (inputs[paramIndex], callee.scope ?? scope)
         }
         return nil
     }
@@ -590,20 +598,39 @@ public final class TypeResolver {
         return nil
     }
 
+    /// The type a closure parameter takes from an HOF's `HOFParamSource`, PLUS the scope that type
+    /// name was WRITTEN in.
+    ///
+    /// The scope half is B-FIX-23 applied to closure-parameter inference: a receiver's element type
+    /// is spelled in the scope of the declaration the receiver came from, so a nested type spelled
+    /// unqualified there (`E1.E2.allCases` yields the element `E2`, written inside `E1`) is
+    /// INVISIBLE from the use-site. Resolving it against the use-site's scope — which is what every
+    /// consumer did while this returned a bare string — finds nothing, `$0` stays untyped, and every
+    /// member reached through the closure parameter (`$0.getTitle(…)`, `.c9`, `case .c1`) is left
+    /// original while its declaration renames. That is the desync class, and a red build wherever a
+    /// shield blocks the rollback rescue.
     private func resolveSource(
         _ source: HOFRegistry.HOFParamSource,
         call: FunctionCallExprSyntax,
         receiver: ExprSyntax,
         in scope: Scope
-    ) -> String? {
+    ) -> (name: String, scope: Scope)? {
         switch source {
         case .element:
-            guard let recType = receiverTypeName(of: receiver, in: scope) else { return nil }
-            return Self.extractElement(from: recType)
+            guard let info = receiverTypeInfo(of: receiver, in: scope) else { return nil }
+            // Expand a typealias to a composite (`typealias Items = [Item]`) before parsing out the
+            // element: a collection name resolves to no declaration (B-FIX-28), so the alias has to
+            // be followed textually — the same step `collectionMemberResult` takes.
+            let expanded = expandedTypeName(info.name, in: info.declScope)
+            guard let element = Self.extractElement(from: expanded.name) else { return nil }
+            return (element, expanded.scope)
         case .argType(let argIdx):
             guard argIdx < call.arguments.count else { return nil }
             let arg = call.arguments[call.arguments.index(call.arguments.startIndex, offsetBy: argIdx)]
-            return typeSymbol(of: arg.expression, in: scope)?.name
+            guard let sym = typeSymbol(of: arg.expression, in: scope) else { return nil }
+            // Qualified, resolved in the symbol's own declaring scope — a bare nested name would be
+            // scope-trapped exactly like the element above.
+            return (TypeInferencePass.qualifiedName(of: sym), sym.scope ?? scope)
         }
     }
 
@@ -625,8 +652,8 @@ public final class TypeResolver {
             if let sig = HOFRegistry.signature(forMethod: methodName),
                sig.closureArgIndex == argIndex,
                let firstSource = sig.closureParamSources.first,
-               let typeName = resolveSource(firstSource, call: call, receiver: receiver, in: scope) {
-                return typeSymbol(forQualifiedName: typeName, in: scope)
+               let t = resolveSource(firstSource, call: call, receiver: receiver, in: scope) {
+                return typeSymbol(forQualifiedName: t.name, in: t.scope)
             }
         }
         // Init-style: `TypeName(data, ...) { ... }`
@@ -638,25 +665,24 @@ public final class TypeResolver {
                 let receiver = call.arguments[call.arguments.index(
                     call.arguments.startIndex, offsetBy: initSig.sequenceArgIndex
                 )].expression
-                if let n = resolveSource(firstSource, call: call, receiver: receiver, in: scope) {
-                    return typeSymbol(forQualifiedName: n, in: scope)
+                if let t = resolveSource(firstSource, call: call, receiver: receiver, in: scope) {
+                    return typeSymbol(forQualifiedName: t.name, in: t.scope)
                 }
             }
         }
         return nil
     }
 
-    /// Get the textual type name of the receiver expression. Tries declared type first
-    /// (the most useful path — we want `[Purchase]`, not `Purchase` after type lookup).
-    private func receiverTypeName(of expr: ExprSyntax, in scope: Scope) -> String? {
-        receiverTypeInfo(of: expr, in: scope)?.name
-    }
-
-    /// Like `receiverTypeName`, but also returns the scope the type name should be RESOLVED in — the
-    /// declaring scope of the symbol whose type it is. A member's stored type is written relative to
-    /// where it was declared (a bare nested name like `S3`/`[S1]` on `enum E1`'s member is invisible
-    /// from the use-site), so a consumer that resolves the name to a Symbol must use this scope, not
-    /// the use-site's. (`receiverTypeName` keeps its string-only shape for callers that don't resolve.)
+    /// The textual type name of a receiver expression (declared type first — we want `[Purchase]`,
+    /// not `Purchase` after type lookup) TOGETHER WITH the scope that name should be RESOLVED in:
+    /// the declaring scope of the symbol whose type it is. A member's stored type is written relative
+    /// to where it was declared (a bare nested name like `S3`/`[S1]` on `enum E1`'s member is
+    /// invisible from the use-site), so a consumer that resolves the name to a Symbol must use this
+    /// scope, not the use-site's.
+    ///
+    /// The name and the scope are deliberately INSEPARABLE — there is no string-only variant to
+    /// call. The former `receiverTypeName` was exactly that variant, and dropping the scope through
+    /// it is how HOF closure-parameter inference lost `E1.E2` (see `resolveSource`).
     ///
     /// This is the ONE place that answers "what is the WRITTEN type name of this expression" — with
     /// the brackets intact, unlike `typeSymbol(of:)`, which resolves to a declaration and therefore

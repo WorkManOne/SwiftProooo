@@ -31,7 +31,10 @@ public final class DiagnosticsLog: Logger {
     /// extra file. Returns the number of lines in each.
     @discardableResult
     public func write(toDirectory dir: URL) throws -> (diagnostics: Int, legend: Int) {
-        let legend = lines.filter(Self.isLegend)
+        // De-duplicated: ResolutionPass (`UNRES`) and RollbackPass (`SURV`) each emit a legend line
+        // for every file they reported on, and the two sets overlap heavily.
+        var seen = Set<String>()
+        let legend = lines.filter { Self.isLegend($0) && seen.insert($0).inserted }
         let body = lines.filter { !Self.isLegend($0) }
         try render(body).write(to: dir.appendingPathComponent("Diagnostics.txt"),
                                atomically: true, encoding: .utf8)
@@ -55,6 +58,18 @@ public final class DiagnosticsLog: Logger {
         # OVLD unresolved …   a call the resolver refused to rewrite: several candidates matched the
         #                     argument labels and no argument type could pick one. Use-site keeps the
         #                     original name; RollbackPass then reverts the group (coverage loss).
+        # UNRES cause=… …     a use-site the resolver declined to rewrite, with WHY. One line per
+        #                     (cause, member, receiver-type), `occ=` counts the use-sites project-wide
+        #                     and `file=`/`line=` point at the FIRST one. Reported only for names some
+        #                     symbol WAS renamed under — those are the desync class, so every UNRES
+        #                     line should have a matching SURV line for the same member= token.
+        #                     Causes: receiver-untyped (the base could not be typed at all),
+        #                     no-candidate-in-scope (base typed, no such member declared on it),
+        #                     mixed-kind-candidates (same name declared at several kinds),
+        #                     ambiguous-overload (several same-kind candidates, no argument signal),
+        #                     no-contextual-type (a base-less `.member` with no context),
+        #                     candidate-has-no-obf (resolved fine, deliberately not renamed — the
+        #                     low-signal tier: it EXPLAINS a survivor rather than reporting a miss).
         # SURV reverted …     an original name survived in the output and NOTHING shielded it, so the
         #                     whole group was reverted. Green build, lost coverage.
         # SURV blocked …      an original name survived and a shield stopped the revert, so the desync
