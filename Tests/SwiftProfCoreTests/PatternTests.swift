@@ -2707,6 +2707,172 @@ final class PatternTests: XCTestCase {
                        "member access on a HOF closure param inside a NESTED closure must rename too:\n\(rewritten)")
     }
 
+    func testUserHOF_trailingClosureAfterLabeledArg_closureParamTypeResolves() throws {
+        // B-FIX-36. A user-defined HOF whose closure parameter is LABELED and passed as a TRAILING
+        // closure: `loader.fetch(from: rows) { row in … }` against
+        // `func fetch(from:completion:)`. Argument labels at the call are ["from", nil] — the
+        // trailing closure carries no label — so a matcher that compares labels position-by-position
+        // eliminates the only candidate, `calleeCallable` returns nil, `functionParamClosureInput`
+        // is never consulted and `row` stays untyped. Every member read through it then survives
+        // while its declaration renames ("Value of type 'Container.Entry' has no member '<obf>'").
+        let source = """
+        enum Container {
+            struct Entry {
+                let slotName: String
+                let slotKind: Int
+            }
+        }
+        struct Payload {
+            let pk: Int
+            let pv: String
+        }
+        final class Loader {
+            func fetch(from entries: [Container.Entry], completion: (Container.Entry) -> Void) {
+                for e in entries { completion(e) }
+            }
+        }
+        final class Screen {
+            var rows: [Container.Entry] = []
+            let loader = Loader()
+            func run() {
+                loader.fetch(from: rows) { row in
+                    let p = Payload(pk: row.slotKind, pv: row.slotName)
+                    print(p)
+                }
+            }
+        }
+        """
+        let rewritten = try runPipeline(source)
+        XCTAssertFalse(rewritten.contains("let slotName"),
+                       "the stored property decl is renamed:\n\(rewritten)")
+        XCTAssertFalse(rewritten.contains("row.slotName"),
+                       "member read through a trailing-closure param must rename too:\n\(rewritten)")
+        XCTAssertFalse(rewritten.contains("row.slotKind"),
+                       "member read through a trailing-closure param must rename too:\n\(rewritten)")
+    }
+
+    func testUserHOF_trailingClosureAfterSeveralLabeledArgs_closureParamTypeResolves() throws {
+        // Same rule with more labels before the trailing closure: the matcher must consume
+        // ["from", "tag", nil] against (from:tag:completion:).
+        let source = """
+        enum Container {
+            struct Entry {
+                let slotName: String
+            }
+        }
+        final class Loader {
+            func fetch(from entries: [Container.Entry], tag: String,
+                       completion: (Container.Entry) -> Void) {
+                for e in entries where tag.isEmpty { completion(e) }
+            }
+        }
+        final class Screen {
+            var rows: [Container.Entry] = []
+            let loader = Loader()
+            func run() {
+                loader.fetch(from: rows, tag: "x") { row in
+                    print(row.slotName)
+                }
+            }
+        }
+        """
+        let rewritten = try runPipeline(source)
+        XCTAssertFalse(rewritten.contains("let slotName"),
+                       "the stored property decl is renamed:\n\(rewritten)")
+        XCTAssertFalse(rewritten.contains("row.slotName"),
+                       "member read through a trailing-closure param must rename too:\n\(rewritten)")
+    }
+
+    func testUserHOF_trailingClosureWithDefaultedParamBetween_closureParamTypeResolves() throws {
+        // The call OMITS a defaulted parameter that sits between the labeled argument and the
+        // closure: labels ["from", nil] against (from:tag:completion:) where `tag` is defaulted.
+        // An exact-count matcher rejects this outright (2 labels vs 3 params).
+        let source = """
+        enum Container {
+            struct Entry {
+                let slotName: String
+            }
+        }
+        final class Loader {
+            func fetch(from entries: [Container.Entry], tag: String = "d",
+                       completion: (Container.Entry) -> Void) {
+                for e in entries where tag.isEmpty { completion(e) }
+            }
+        }
+        final class Screen {
+            var rows: [Container.Entry] = []
+            let loader = Loader()
+            func run() {
+                loader.fetch(from: rows) { row in
+                    print(row.slotName)
+                }
+            }
+        }
+        """
+        let rewritten = try runPipeline(source)
+        XCTAssertFalse(rewritten.contains("let slotName"),
+                       "the stored property decl is renamed:\n\(rewritten)")
+        XCTAssertFalse(rewritten.contains("row.slotName"),
+                       "member read through a trailing-closure param must rename too:\n\(rewritten)")
+    }
+
+    func testUserHOF_trailingClosureCallee_methodReturnTypeChainResolves() throws {
+        // The SAME label rule governs `TypeResolver.typeSymbol(of:)`'s method-return branch, which
+        // types `recv.method(args) { … }.member`. With the trailing closure unlabeled at the call
+        // and labeled at the declaration, the method was eliminated, the call's return type was
+        // unknown, and `.slotName` on the result stayed original while its decl renamed.
+        let source = """
+        struct Entry {
+            let slotName: String
+        }
+        final class Loader {
+            func build(from raw: String, transform: (String) -> String) -> Entry {
+                return Entry(slotName: transform(raw))
+            }
+        }
+        final class Screen {
+            let loader = Loader()
+            func run() {
+                print(loader.build(from: "a") { $0 }.slotName)
+            }
+        }
+        """
+        let rewritten = try runPipeline(source)
+        XCTAssertFalse(rewritten.contains("let slotName"),
+                       "the stored property decl is renamed:\n\(rewritten)")
+        XCTAssertFalse(rewritten.contains(".slotName)"),
+                       "member on a trailing-closure call's RESULT must rename too:\n\(rewritten)")
+    }
+
+    func testCalleeParamType_afterOmittedDefaultedParam_contextualCaseResolves() throws {
+        // B-FIX-36, second half. The call omits the defaulted `flag:`, so its ONLY argument sits at
+        // argument index 0 while binding PARAMETER index 1. Reading `functionParamTypes` at the
+        // argument's own ordinal yields `Bool`, which is not an enum, so the shorthand `.alpha` gets
+        // no contextual type and survives while `Mode.alpha` renames.
+        let source = """
+        enum Mode {
+            case alpha
+            case beta
+        }
+        struct Runner {
+            func apply(flag: Bool = false, mode: Mode) {
+                print(flag, mode)
+            }
+        }
+        struct Screen {
+            let runner = Runner()
+            func run() {
+                runner.apply(mode: .alpha)
+            }
+        }
+        """
+        let rewritten = try runPipeline(source)
+        XCTAssertFalse(rewritten.contains("case alpha"),
+                       "the enum case decl is renamed:\n\(rewritten)")
+        XCTAssertFalse(rewritten.contains(".alpha"),
+                       "a shorthand case bound to a parameter AFTER an omitted defaulted one must resolve:\n\(rewritten)")
+    }
+
     // MARK: - Key paths
 
     func testKeyPath_inferredRoot_memberRenamedOnce_trailingBytesIntact() throws {

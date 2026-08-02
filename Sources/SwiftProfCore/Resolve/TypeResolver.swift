@@ -142,23 +142,14 @@ public final class TypeResolver {
                let recvType = typeSymbol(of: base, in: scope),
                let recvScope = canonicalInnerScope(of: recvType) {
                 let methodName = Self.stripBackticks(memberCall.declName.baseName.text)
-                var callLabels: [String?] = call.arguments.map { $0.label?.text }
-                if call.trailingClosure != nil { callLabels.append(nil) }
-                for extra in call.additionalTrailingClosures { callLabels.append(extra.label.text) }
                 let methods = recvScope.members(named: methodName)
                     .filter { $0.kind == .method || $0.kind == .function }
-                let matching = methods.filter { sym in
-                    guard let sLabels = table.functionParamLabels[sym.id],
-                          sLabels.count == callLabels.count else { return false }
-                    for (ext, cl) in zip(sLabels, callLabels) {
-                        if ext == "_" {
-                            if cl != nil { return false }
-                        } else if ext != cl {
-                            return false
-                        }
-                    }
-                    return true
-                }
+                // Label matching goes through the ONE shared rule (B-FIX-36): a private
+                // count-equality copy lived here and rejected `recv.build(from: x) { … }.member`,
+                // because the trailing closure contributes a nil label that never equals the
+                // declared `transform:`. The call's return type then stayed unknown and every
+                // member reached through it was left original while its decl renamed.
+                let matching = methods.filter { ArgumentLabelMatch.matches($0, call: call, in: table) }
                 if matching.count == 1, let ret = table.functionReturnType[matching[0].id] {
                     return typeSymbol(forQualifiedName: ret, in: scope)
                 }
@@ -550,8 +541,16 @@ public final class TypeResolver {
         // The recorded input type is written in the CALLEE's scope, so it carries that scope for the
         // same reason the element does above: `func each(_ f: (Row) -> Void)` declared inside a type
         // that also declares `Row` names a type invisible from the call site.
+        //
+        // `closureArgIndex` is the closure's position among the CALL's arguments; the side table is
+        // keyed by the callee's PARAMETER position. They diverge as soon as the call omits a
+        // defaulted parameter (`fetch(from: rows) { … }` against `fetch(from:tag:completion:)` puts
+        // the closure at argument 1 and parameter 2), so the mapping has to come from the same
+        // label-matching walk that selected the callee (B-FIX-36).
         if let callee = calleeCallable(for: call, in: scope),
-           let inputs = table.functionParamClosureInput[callee.id]?[closureArgIndex],
+           let paramPos = ArgumentLabelMatch.parameterIndex(ofArgument: closureArgIndex, for: callee,
+                                                            call: call, in: table),
+           let inputs = table.functionParamClosureInput[callee.id]?[paramPos],
            paramIndex < inputs.count, !inputs[paramIndex].isEmpty {
             return (inputs[paramIndex], callee.scope ?? scope)
         }
@@ -561,18 +560,18 @@ public final class TypeResolver {
     /// Resolve the callee of a function call to a unique callable Symbol by name + argument labels.
     /// Handles free functions (DeclRef, scope-chain then global) and methods (`recv.method`). Returns
     /// nil on ambiguity — callers must not guess.
+    ///
+    /// Label matching goes through the ONE shared rule (`ArgumentLabelMatch`, B-FIX-36). A private
+    /// count-equality copy used to live here, and it is the reason a user-defined HOF called with a
+    /// TRAILING closure never found its callee: `loader.fetch(from: rows) { row in … }` presents the
+    /// labels `["from", nil]` while `fetch(from:completion:)` declares `["from", "completion"]`, so
+    /// the only candidate was eliminated, `functionParamClosureInput` was never consulted, and every
+    /// member read through `row` survived while its declaration renamed.
     private func calleeCallable(for call: FunctionCallExprSyntax, in scope: Scope) -> Symbol? {
-        var callLabels: [String?] = call.arguments.map { $0.label?.text }
-        if call.trailingClosure != nil { callLabels.append(nil) }
-        for extra in call.additionalTrailingClosures { callLabels.append(extra.label.text) }
+        let callLabels = ArgumentLabelMatch.labels(of: call)
+        let trailingStart = ArgumentLabelMatch.trailingStart(of: call)
         func labelsMatch(_ sym: Symbol) -> Bool {
-            guard let symLabels = table.functionParamLabels[sym.id],
-                  symLabels.count == callLabels.count else { return false }
-            for (ext, cl) in zip(symLabels, callLabels) {
-                if ext == "_" { if cl != nil { return false } }
-                else if ext != cl { return false }
-            }
-            return true
+            ArgumentLabelMatch.matches(sym, callLabels: callLabels, trailingStart: trailingStart, in: table)
         }
         func isCallable(_ k: SymbolKind) -> Bool { k == .function || k == .method }
 

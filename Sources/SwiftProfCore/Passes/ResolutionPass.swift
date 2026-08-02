@@ -1218,10 +1218,7 @@ private final class ResolutionVisitor: SyntaxVisitor {
 
     /// Argument labels at a call site, including trailing closures (which are positional / nil).
     static func argumentLabels(of call: FunctionCallExprSyntax) -> [String?] {
-        var labels: [String?] = call.arguments.map { $0.label?.text }
-        if call.trailingClosure != nil { labels.append(nil) }
-        for extra in call.additionalTrailingClosures { labels.append(extra.label.text) }
-        return labels
+        ArgumentLabelMatch.labels(of: call)
     }
 
     /// Same-named callables visible from `currentScope`, honouring LEXICAL SHADOWING: Swift's
@@ -1275,7 +1272,7 @@ private final class ResolutionVisitor: SyntaxVisitor {
     /// caller should NOT rename then.
     private func resolveCall(name: String, call: FunctionCallExprSyntax) -> Symbol? {
         let callLabels = Self.argumentLabels(of: call)
-        let trailingStart = call.arguments.count
+        let trailingStart = ArgumentLabelMatch.trailingStart(of: call)
         let scopeMatches = lexicalCallableCandidates(named: name) {
             labelsMatch($0, callLabels, trailingStart: trailingStart)
         }
@@ -1423,9 +1420,15 @@ private final class ResolutionVisitor: SyntaxVisitor {
     /// single-global-candidate veto.
     private func argTypesContradict(_ cand: Symbol, call: FunctionCallExprSyntax) -> Bool {
         guard let pTypes = table.functionParamTypes[cand.id] else { return false }
+        // Argument i does not necessarily bind parameter i — a call that omits a defaulted parameter
+        // shifts every later argument. Ask the label-matching walk which parameter each argument
+        // took (B-FIX-36); comparing against the wrong parameter's type is how a correct candidate
+        // gets vetoed.
+        let bound = ArgumentLabelMatch.parameterIndices(cand, call: call, in: table)
         let args = Array(call.arguments.map { $0.expression })
         for (i, arg) in args.enumerated() {
-            guard i < pTypes.count, let pType = pTypes[i] else { continue }
+            let pi = bound.map { i < $0.count ? $0[i] : Int.max } ?? i
+            guard pi < pTypes.count, let pType = pTypes[pi] else { continue }
             switch argConstraint(arg) {
             case .enumCase(let caseName):
                 if let t = typeResolver.typeSymbol(forQualifiedName: pType, in: currentScope),
@@ -1461,10 +1464,14 @@ private final class ResolutionVisitor: SyntaxVisitor {
         var scored: [(sym: Symbol, score: Int)] = []
         for cand in candidates {
             guard let pTypes = table.functionParamTypes[cand.id] else { continue }
+            // Same argument→parameter mapping as `argTypesContradict`: scoring an argument against
+            // the parameter at its own ordinal is wrong for any call that omits a defaulted one.
+            let bound = ArgumentLabelMatch.parameterIndices(cand, call: call, in: table)
             var score = 0
             var consistent = true
             for (i, arg) in args.enumerated() {
-                guard i < pTypes.count, let pType = pTypes[i] else { continue }
+                let pi = bound.map { i < $0.count ? $0[i] : Int.max } ?? i
+                guard pi < pTypes.count, let pType = pTypes[pi] else { continue }
                 switch argConstraint(arg) {
                 case .enumCase(let caseName):
                     if let t = typeResolver.typeSymbol(forQualifiedName: pType, in: currentScope),
@@ -1622,7 +1629,7 @@ private final class ResolutionVisitor: SyntaxVisitor {
             let methodName = stripBackticks(m.declName.baseName.text)
             let labels = Self.argumentLabels(of: call)
             let matches = recvScope.members(named: methodName)
-                .filter { Self.isCallable($0.kind) && labelsMatch($0, labels, trailingStart: call.arguments.count) }
+                .filter { Self.isCallable($0.kind) && labelsMatch($0, labels, trailingStart: ArgumentLabelMatch.trailingStart(of: call)) }
             if matches.count == 1, let ret = table.functionReturnType[matches[0].id] {
                 // Try to resolve the return-type name to a Symbol so disambiguation uses identity;
                 // fall back to the raw string when it's a primitive / external (stdlib) type.
@@ -1706,7 +1713,7 @@ private final class ResolutionVisitor: SyntaxVisitor {
     /// identically.
     private func chooseOverload(_ candidates: [Symbol], call: FunctionCallExprSyntax) -> Symbol? {
         let callLabels = Self.argumentLabels(of: call)
-        let labelMatches = candidates.filter { labelsMatch($0, callLabels, trailingStart: call.arguments.count) }
+        let labelMatches = candidates.filter { labelsMatch($0, callLabels, trailingStart: ArgumentLabelMatch.trailingStart(of: call)) }
         if labelMatches.count == 1 { return labelMatches[0] }
         if labelMatches.count > 1 { return disambiguateByArgTypes(labelMatches, call: call) }
         return nil
@@ -1801,45 +1808,12 @@ private final class ResolutionVisitor: SyntaxVisitor {
         return matching.isEmpty ? candidates : matching
     }
 
-    /// True when the call's argument labels can be satisfied by the symbol's parameters. Matches
-    /// left-to-right, SKIPPING a parameter only when it has a default value (so the call may omit
-    /// it); every parameter left unsatisfied at the end must also be defaulted. This is the part of
-    /// Swift's argument matching that overload resolution needs: matching labels EXACTLY by count
-    /// wrongly eliminates an overload with a trailing defaulted param (`f(_ url: URL, with: = [:])`)
-    /// when the call omits it (`f(u)`), leaving a different same-named overload (`f(_ par2: S2)`) as
-    /// a false unique match → wrong rename → "cannot convert URL to S2". (Variadics not modelled —
-    /// rare, and a miss here only costs a no-rename, never a wrong one.)
-    private func labelsMatch(_ sym: Symbol, _ callLabels: [String?], trailingStart: Int = Int.max) -> Bool {
-        guard let symLabels = table.functionParamLabels[sym.id] else { return false }
-        let defaults = table.functionParamHasDefault[sym.id] ?? Array(repeating: false, count: symLabels.count)
-        let closureParams = table.functionParamClosureInput[sym.id]
-        var ci = 0, pi = 0
-        while ci < callLabels.count {
-            guard pi < symLabels.count else { return false }   // more args than params
-            let ext = symLabels[pi]
-            let callLabel = callLabels[ci]
-            // A TRAILING closure (call index ≥ trailingStart) with no explicit label satisfies a
-            // LABELED closure-typed parameter — Swift lets `perform { }` match
-            // `perform(action: () -> Void)`. Without this the labeled param never matched a nil
-            // trailing label → the whole overload was eliminated → method reverted (under-obf).
-            let isTrailing = ci >= trailingStart
-            let closureMatchesLabeled = isTrailing && callLabel == nil && ext != "_"
-                && closureParams?[pi] != nil
-            let matches = (ext == "_" ? (callLabel == nil) : (ext == callLabel)) || closureMatchesLabeled
-            if matches {
-                ci += 1; pi += 1
-            } else if pi < defaults.count && defaults[pi] {
-                pi += 1                                          // omit this defaulted parameter
-            } else {
-                return false                                     // required param can't be skipped
-            }
-        }
-        // Any parameters not consumed by the call must all be defaulted.
-        while pi < symLabels.count {
-            guard pi < defaults.count && defaults[pi] else { return false }
-            pi += 1
-        }
-        return true
+    /// True when the call's argument labels can be satisfied by the symbol's parameters. Thin
+    /// wrapper over the ONE implementation of that rule (`ArgumentLabelMatch`, B-FIX-36) — defaulted
+    /// parameters may be skipped (B-FIX-11), an unlabeled TRAILING closure satisfies a labeled
+    /// closure-typed parameter (F5). Do not reimplement either half here or anywhere else.
+    private func labelsMatch(_ sym: Symbol, _ callLabels: [String?], trailingStart: Int) -> Bool {
+        ArgumentLabelMatch.matches(sym, callLabels: callLabels, trailingStart: trailingStart, in: table)
     }
 
     override func visit(_ node: MemberAccessExprSyntax) -> SyntaxVisitorContinueKind {
@@ -2270,8 +2244,7 @@ private final class ResolutionVisitor: SyntaxVisitor {
             // otherwise a shorthand `.case` argument can't learn its contextual enum type and is
             // left un-renamed while the enum case itself was renamed (`has no member` breakage).
             if let sym = resolveCall(name: name, call: call) ?? currentScope.lookup(name: name),
-               let types = table.functionParamTypes[sym.id], argIndex < types.count,
-               let type = types[argIndex] {
+               let type = declaredParamType(of: sym, call: call, argIndex: argIndex) {
                 return ContextualType(name: type, scope: sym.scope)
             }
             // CONSTRUCTOR call. A type name is not a callable, so neither branch above can see it
@@ -2320,8 +2293,7 @@ private final class ResolutionVisitor: SyntaxVisitor {
             }
             let cands = scope.members(named: methodName).filter { Self.isCallable($0.kind) }
             if let sym = (cands.count == 1 ? cands.first : chooseOverload(cands, call: call)),
-               let types = table.functionParamTypes[sym.id], argIndex < types.count,
-               let type = types[argIndex] {
+               let type = declaredParamType(of: sym, call: call, argIndex: argIndex) {
                 return ContextualType(name: type, scope: sym.scope)
             }
             // Disambiguation failed but we only need the parameter TYPE: if every label-matching
@@ -2376,9 +2348,8 @@ private final class ResolutionVisitor: SyntaxVisitor {
         let inits = typeScope.members(named: "init").filter { $0.kind == .initializer }
         if !inits.isEmpty {
             let callLabels = Self.argumentLabels(of: call)
-            let matching = inits.filter { labelsMatch($0, callLabels, trailingStart: call.arguments.count) }
-            if matching.count == 1, let types = table.functionParamTypes[matching[0].id],
-               argIndex < types.count, let type = types[argIndex] {
+            let matching = inits.filter { labelsMatch($0, callLabels, trailingStart: ArgumentLabelMatch.trailingStart(of: call)) }
+            if matching.count == 1, let type = declaredParamType(of: matching[0], call: call, argIndex: argIndex) {
                 return ContextualType(name: type, scope: matching[0].scope)
             }
             if matching.count > 1, let agreed = agreedParamType(matching, call: call, argIndex: argIndex) {
@@ -2408,15 +2379,24 @@ private final class ResolutionVisitor: SyntaxVisitor {
     /// The parameter type at `argIndex` when ALL label-matching candidates agree on it (else nil).
     private func agreedParamType(_ candidates: [Symbol], call: FunctionCallExprSyntax, argIndex: Int) -> String? {
         let callLabels = Self.argumentLabels(of: call)
-        let matching = candidates.filter { labelsMatch($0, callLabels, trailingStart: call.arguments.count) }
+        let matching = candidates.filter { labelsMatch($0, callLabels, trailingStart: ArgumentLabelMatch.trailingStart(of: call)) }
         guard !matching.isEmpty else { return nil }
-        let types = matching.compactMap { sym -> String? in
-            guard let t = table.functionParamTypes[sym.id], argIndex < t.count else { return nil }
-            return t[argIndex]
-        }
+        let types = matching.compactMap { declaredParamType(of: $0, call: call, argIndex: argIndex) }
         guard types.count == matching.count, let first = types.first,
               types.allSatisfy({ $0 == first }) else { return nil }
         return first
+    }
+
+    /// Declared type of the parameter that the call's argument at `argIndex` actually BINDS on
+    /// `sym`. The argument's own ordinal is not that parameter's index once the call omits a
+    /// defaulted parameter, so the position comes from the shared label-matching walk (B-FIX-36).
+    /// Falls back to the ordinal when the walk finds no match, which keeps the old behaviour for
+    /// shapes the label model cannot express (variadics).
+    private func declaredParamType(of sym: Symbol, call: FunctionCallExprSyntax, argIndex: Int) -> String? {
+        guard let types = table.functionParamTypes[sym.id] else { return nil }
+        let pi = ArgumentLabelMatch.parameterIndex(ofArgument: argIndex, for: sym, call: call, in: table) ?? argIndex
+        guard pi < types.count else { return nil }
+        return types[pi]
     }
 
     // MARK: - Helpers
