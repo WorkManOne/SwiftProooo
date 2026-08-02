@@ -343,7 +343,8 @@ public final class TypeResolver {
         while let cur = s {
             defer { s = cur.parent }
             guard cur.kind == .type, let owner = cur.owner else { continue }
-            for inh in inheritanceNames(of: owner) {
+            // Extension-declared conformances included (G2) — `extension C: P {}` is a conformance.
+            for inh in table.conformanceNames(of: owner) {
                 for proto in table.types(named: inh) where proto.kind == .protocol {
                     guard !seenProtocols.contains(proto.id) else { continue }
                     seenProtocols.insert(proto.id)
@@ -356,10 +357,6 @@ public final class TypeResolver {
             }
         }
         return nil
-    }
-
-    private func inheritanceNames(of sym: Symbol) -> [String] {
-        InheritanceClause.names(atOffset: sym.declOffset, in: sym.file.syntax)
     }
 
     /// Resolves a possibly-qualified type name string ("Foo" or "Foo.Bar.Baz") to a Symbol.

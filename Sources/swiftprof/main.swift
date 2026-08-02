@@ -100,6 +100,9 @@ struct Obfuscate: ParsableCommand {
     @Flag(name: .long, inversion: .prefixedNo, help: "Rewrite a member access by NAME when the name is a PROJECT-UNIQUE member of an extension on an external type whose receiver can't be typed (the SwiftUI `extension View { func myModifier() }` idiom). ON by default — without it such members rename but every use-site survives and the rollback reverts them. Pass --no-unique-external-members to bisect a red build back to this heuristic.")
     var uniqueExternalMembers: Bool?
 
+    @Option(name: .long, help: "Objective-C protection level: strict (default) / relaxed / off. strict keeps every member of every class descending from an ObjC root (NSObject, UIView, …). relaxed keeps protection only where the exposure is DECLARED — @objc/@objcMembers/@IBDesignable classes, exposing attributes (@objc, @IBOutlet, @IBAction, @NSManaged), #selector names, @objc extensions and NSManagedObject descendants — while an ancestry-only class keeps its NAME (storyboard customClass) and gives up its members. off drops all ObjC-motivated protection; do not use it with Core Data or storyboards.")
+    var objcProtection: String?
+
     @Flag(name: .long, inversion: .prefixedNo, help: "Emit a per-symbol decision report (Decisions.txt + decisions.json in --output): for every writable declaration, exactly why it was obfuscated / protected / skipped / reverted.")
     var explain: Bool?
 
@@ -146,6 +149,7 @@ struct Obfuscate: ParsableCommand {
         cli.aggressiveRollback = aggressiveRollback
         cli.explain = explain
         cli.uniqueExternalMembers = uniqueExternalMembers
+        cli.objcProtection = objcProtection
         cli.verbose = verbose
 
         let merged = cli.merging(over: fileConfig)
@@ -192,7 +196,8 @@ struct Obfuscate: ParsableCommand {
             indexStorePath: merged.indexStorePath,
             indexStoreGate: merged.indexStoreGate ?? false,
             explain: merged.explain ?? false,
-            uniqueExternalMembers: merged.uniqueExternalMembers ?? true
+            uniqueExternalMembers: merged.uniqueExternalMembers ?? true,
+            objcProtection: try parseObjCProtectionMode(merged.objcProtection ?? "strict")
         )
         let result = try Pipeline(options: options, logger: logger).run()
         FileHandle.standardOutput.write(Data(result.coverage.formatted().utf8))
@@ -201,6 +206,13 @@ struct Obfuscate: ParsableCommand {
     private func parseRawValueMode(_ s: String) throws -> RawValueMode {
         guard let mode = RawValueMode(rawValue: s.trimmingCharacters(in: .whitespaces).lowercased()) else {
             throw ValidationError("--raw-values must be one of: \(RawValueMode.allCases.map { $0.rawValue }.joined(separator: ", "))")
+        }
+        return mode
+    }
+
+    private func parseObjCProtectionMode(_ s: String) throws -> ObjCProtectionMode {
+        guard let mode = ObjCProtectionMode(rawValue: s.trimmingCharacters(in: .whitespaces).lowercased()) else {
+            throw ValidationError("--objc-protection must be one of: \(ObjCProtectionMode.allCases.map { $0.rawValue }.joined(separator: ", "))")
         }
         return mode
     }

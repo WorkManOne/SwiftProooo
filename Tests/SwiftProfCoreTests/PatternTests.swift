@@ -13,7 +13,8 @@ final class PatternTests: XCTestCase {
     private func runPipeline(_ source: String, moduleName: String = "M", file: String = "Sample.swift",
                              rawValues: RawValueMode = .off,
                              skipOverloadedCallables: Bool = false,
-                             aggressiveRollback: Bool = false) throws -> String {
+                             aggressiveRollback: Bool = false,
+                             objcProtection: ObjCProtectionMode = .strict) throws -> String {
         let tempRoot = FileManager.default.temporaryDirectory
             .appendingPathComponent("SwiftProf-\(UUID().uuidString)")
         let moduleRoot = tempRoot.appendingPathComponent(moduleName)
@@ -30,7 +31,8 @@ final class PatternTests: XCTestCase {
             modules: specs, outputDirectory: outputDir, dryRun: false,
             nameStyle: .debug, introspectSDK: false, rawValueMode: rawValues,
             skipOverloadedCallables: skipOverloadedCallables,
-            aggressiveRollback: aggressiveRollback
+            aggressiveRollback: aggressiveRollback,
+            objcProtection: objcProtection
         )
         let pipeline = Pipeline(options: options, logger: StderrLogger(verbose: false))
         _ = try pipeline.run()
@@ -4418,5 +4420,249 @@ final class PatternTests: XCTestCase {
         XCTAssertTrue(line?.contains("recv=\(Anon.of("Other"))") == true,
                       "the receiver type must be named: \(line ?? "")")
         XCTAssertTrue(line?.contains("occ=1") == true, "occurrences are counted: \(line ?? "")")
+    }
+
+    // MARK: - G1: @NSManaged is an ObjC-exposing attribute
+
+    /// A `@NSManaged` property's name IS the Core Data attribute name in the `.xcdatamodel`.
+    /// Renaming it compiles fine and then faults at runtime on the first fetch — the silent class
+    /// of failure. The fixture deliberately gives the class NO inheritance clause so the blanket
+    /// objc-descendant rule cannot fire: what is under test is the ATTRIBUTE alone.
+    func testNSManagedProperty_protectedByAttribute() throws {
+        let source = """
+        import CoreData
+        class EventEntry {
+            @NSManaged var eventTitle: String
+            var localCounter: Int = 0
+        }
+        """
+        let a = try runPipeline(source)
+        XCTAssertTrue(a.contains("var eventTitle: String"),
+                      "@NSManaged property is a Core Data attribute name — must be protected:\n\(a)")
+        XCTAssertFalse(a.contains("var localCounter"),
+                       "a plain property of the same class stays renameable:\n\(a)")
+    }
+
+    /// The to-many relationship accessors Xcode generates are `@NSManaged func addToItems(_:)`.
+    /// Same contract, method side.
+    func testNSManagedMethod_protectedByAttribute() throws {
+        let source = """
+        import CoreData
+        class EventEntry {
+            @NSManaged func addToTags(_ value: NSSet)
+            func localHelper() {}
+        }
+        """
+        let a = try runPipeline(source)
+        XCTAssertTrue(a.contains("func addToTags"),
+                      "@NSManaged method must be protected:\n\(a)")
+        XCTAssertFalse(a.contains("func localHelper"),
+                       "a plain method of the same class stays renameable:\n\(a)")
+    }
+
+    // MARK: - G2: conformances declared in an EXTENSION are visible to the Protector
+
+    /// `extension Model: Codable {}` is the idiomatic way to declare the conformance away from the
+    /// type. The Protector read only the PRIMARY declaration's inheritance clause, so the type did
+    /// not look Codable, its stored-property names were renamed, and the JSON contract changed with
+    /// no compile error, no `SURV` line and no diagnostic — exactly the failure B-FIX-17 exists to
+    /// prevent.
+    func testCodable_conformanceInExtension_storedPropertiesProtected() throws {
+        let source = """
+        struct Model {
+            let userId: String
+            var displayCount: Int
+        }
+        extension Model: Codable {}
+        """
+        let a = try runPipeline(source)
+        XCTAssertTrue(a.contains("let userId: String"),
+                      "extension-declared Codable protects the serialization keys:\n\(a)")
+        XCTAssertTrue(a.contains("var displayCount: Int"),
+                      "every stored property is a key:\n\(a)")
+        XCTAssertFalse(a.contains("struct Model"),
+                       "the type name itself is not a serialization key — still renamed:\n\(a)")
+    }
+
+    /// The same blind spot on the fail-closed path: a conformance to an UNKNOWN external protocol
+    /// declared in an extension. Any member could be its witness, so all of them must be protected
+    /// — a missed one is a hard "does not conform" red build, never a policy question.
+    func testUnknownExternalConformance_inExtension_membersProtected() throws {
+        let source = """
+        struct Gadget {
+            var serialTag: String = ""
+            func syncNow() {}
+        }
+        extension Gadget: VendorSyncable {}
+        """
+        let a = try runPipeline(source)
+        XCTAssertTrue(a.contains("var serialTag"),
+                      "unknown external conformance in an extension must protect members:\n\(a)")
+        XCTAssertTrue(a.contains("func syncNow"),
+                      "any member could be the witness — fail closed:\n\(a)")
+    }
+
+    // MARK: - G3: `@objc extension` exposes every member it declares
+
+    /// `@objc extension Foo { … }` makes each member of that extension @objc — the runtime can
+    /// reach them by name — but the Protector had no `ExtensionDeclSyntax` visit at all, so the
+    /// attribute was invisible. As with G1, the class carries no inheritance clause so the blanket
+    /// rule cannot mask the result.
+    func testObjCExtension_membersProtected() throws {
+        let source = """
+        import Foundation
+        class Legacy {
+            var untouched: Int = 0
+        }
+        @objc extension Legacy {
+            func runtimeHook() {}
+            var exposedValue: Int { return 1 }
+        }
+        """
+        let a = try runPipeline(source)
+        XCTAssertTrue(a.contains("func runtimeHook"),
+                      "@objc extension exposes its methods by name:\n\(a)")
+        XCTAssertTrue(a.contains("var exposedValue"),
+                      "@objc extension exposes its properties by name:\n\(a)")
+        XCTAssertFalse(a.contains("var untouched"),
+                       "a member of the primary decl is not covered by the extension's @objc:\n\(a)")
+    }
+
+    // MARK: - --objc-protection: strict (default) / relaxed / off
+
+    /// The lever itself. `Leaf` is tainted only by ancestry (its superclass chain reaches
+    /// UIViewController), and since SE-0160 an unannotated member of such a class is not visible to
+    /// the ObjC runtime at all. Under `relaxed` its members become renameable while the class NAME
+    /// stays — a storyboard names the class as a string, and nothing else does.
+    func testObjCProtection_relaxed_ancestryOnlyClassKeepsNameLosesMemberProtection() throws {
+        let source = """
+        import UIKit
+        class Base: UIViewController {}
+        class Leaf: Base { var counter = 0 }
+        """
+        let strict = try runPipeline(source)
+        XCTAssertTrue(strict.contains("var counter"), "strict keeps the default behaviour:\n\(strict)")
+
+        let relaxed = try runPipeline(source, objcProtection: .relaxed)
+        XCTAssertFalse(relaxed.contains("var counter"),
+                       "relaxed renames a member of an ancestry-only objc class:\n\(relaxed)")
+        XCTAssertTrue(relaxed.contains("class Leaf"),
+                      "the class NAME stays — a storyboard customClass is a string:\n\(relaxed)")
+    }
+
+    /// The other side of the same rule: an EXPLICIT annotation is a declared exposure, and
+    /// `@objcMembers` propagates to subclasses (the compiler adds `@objc` to their members too), so
+    /// the taint must propagate with it even under `relaxed`.
+    func testObjCProtection_relaxed_annotatedClassAndItsSubclassStayProtected() throws {
+        let source = """
+        import Foundation
+        @objcMembers class Bridged { var trackedName: String = "" }
+        class Derived: Bridged { var derivedValue: Int = 0 }
+        """
+        let a = try runPipeline(source, objcProtection: .relaxed)
+        XCTAssertTrue(a.contains("var trackedName"),
+                      "an explicitly annotated class keeps its members under relaxed:\n\(a)")
+        XCTAssertTrue(a.contains("var derivedValue"),
+                      "@objcMembers reaches subclasses, so the taint must too:\n\(a)")
+    }
+
+    /// Core Data reads and writes by attribute NAME, whether or not the property carries
+    /// `@NSManaged` (a subclass can declare plain helpers the framework still faults through), so an
+    /// NSManagedObject descendant keeps full protection under `relaxed`. The intermediate class is
+    /// LOCAL on purpose: it is what makes the taint reach `EventEntry` by inheritance alone.
+    func testObjCProtection_relaxed_nsManagedObjectDescendantStaysProtected() throws {
+        let source = """
+        import CoreData
+        class BaseEntity: NSManagedObject {}
+        class EventEntry: BaseEntity { var cachedTitle: String = "" }
+        """
+        let a = try runPipeline(source, objcProtection: .relaxed)
+        XCTAssertTrue(a.contains("var cachedTitle"),
+                      "Core Data binds by name — NSManagedObject descendants stay protected:\n\(a)")
+    }
+
+    /// An exposing ATTRIBUTE is a declared exposure, so `relaxed` keeps honouring it even on a class
+    /// whose members it otherwise releases.
+    ///
+    func testObjCProtection_relaxed_exposingAttributesStillProtect() throws {
+        let source = """
+        import UIKit
+        class Screen: UIViewController {
+            @IBOutlet var titleLabel: UILabel!
+            @NSManaged var storedTag: String
+            @objc func handleTap() {}
+            var plainHelper: Int = 0
+        }
+        """
+        let a = try runPipeline(source, objcProtection: .relaxed)
+        XCTAssertTrue(a.contains("var titleLabel"), "@IBOutlet survives relaxed:\n\(a)")
+        XCTAssertTrue(a.contains("var storedTag"), "@NSManaged survives relaxed:\n\(a)")
+        XCTAssertTrue(a.contains("func handleTap"), "@objc survives relaxed:\n\(a)")
+        XCTAssertFalse(a.contains("var plainHelper"),
+                       "an unannotated member of the same class is released:\n\(a)")
+    }
+
+    /// A DIRECT subclass of a UIKit class is the common shape, and it used to be released by the
+    /// objc rule and instantly re-protected by the conformance rule, which cannot tell an external
+    /// superclass from an unknown external protocol. Under `relaxed` a curated ObjC ROOT CLASS name
+    /// is known to be a class, so it no longer triggers the protocol protect-all. Everything else in
+    /// the clause is still treated as a protocol and still protects fail-closed.
+    func testObjCProtection_relaxed_externalRootClassIsNotTreatedAsUnknownProtocol() throws {
+        let source = """
+        import UIKit
+        class Screen: UIViewController { var plainHelper: Int = 0 }
+        """
+        let strict = try runPipeline(source)
+        XCTAssertTrue(strict.contains("var plainHelper"), "strict keeps it:\n\(strict)")
+
+        let relaxed = try runPipeline(source, objcProtection: .relaxed)
+        XCTAssertFalse(relaxed.contains("var plainHelper"),
+                       "relaxed releases a direct UIKit subclass's unannotated member:\n\(relaxed)")
+    }
+
+    /// The guard on the above: a genuine unknown external PROTOCOL in the same clause keeps
+    /// protecting every member, because any of them could be its witness and a missed witness is a
+    /// red build, not a policy choice. This is the IceTrays `Coordinator` shape.
+    func testObjCProtection_relaxed_unknownExternalProtocolStillProtectsMembers() throws {
+        let source = """
+        import UIKit
+        class Coordinator: NSObject, PHPickerViewControllerDelegate {
+            var pendingCount: Int = 0
+        }
+        """
+        let a = try runPipeline(source, objcProtection: .relaxed)
+        XCTAssertTrue(a.contains("var pendingCount"),
+                      "an unknown external protocol still protects fail-closed under relaxed:\n\(a)")
+    }
+
+    /// `off` is the level for a project with no ObjC name dependency: the attributes stop protecting
+    /// too. Same fixture as the G1 test, opposite expectation — which is exactly what makes it a
+    /// flag rather than a fix.
+    func testObjCProtection_off_dropsAttributeAndSelectorProtection() throws {
+        let source = """
+        import CoreData
+        class EventEntry {
+            @NSManaged var eventTitle: String
+            @objc func legacyTap() {}
+            func wire() { _ = #selector(EventEntry.legacyTap) }
+        }
+        """
+        let a = try runPipeline(source, objcProtection: .off)
+        XCTAssertFalse(a.contains("var eventTitle"), "off drops @NSManaged protection:\n\(a)")
+        XCTAssertFalse(a.contains("func legacyTap"),
+                       "off drops @objc and #selector protection:\n\(a)")
+    }
+
+    /// G2 is a correctness fix, not a policy: a missed conformance is a "does not conform" red build
+    /// or a silently changed JSON contract, neither of which is a level the user gets to choose. It
+    /// must survive even the most permissive setting.
+    func testObjCProtection_off_extensionCodableStillProtected() throws {
+        let source = """
+        struct Model { let userId: String }
+        extension Model: Codable {}
+        """
+        let a = try runPipeline(source, objcProtection: .off)
+        XCTAssertTrue(a.contains("let userId: String"),
+                      "extension-declared Codable is never subject to --objc-protection:\n\(a)")
     }
 }

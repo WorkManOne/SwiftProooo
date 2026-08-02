@@ -237,12 +237,50 @@ public final class SymbolTable {
     /// Conformance names declared on EXTENSIONS of the type whose canonical inner scope is owned by
     /// `ownerId`. Combined with the type's primary-decl inheritance clause, this is the full set of
     /// protocols a type conforms to (B-FIX-6 — extension-declared conformances).
+    ///
+    /// Reads the owner-keyed index once `indexExtensionConformances()` has been called (which
+    /// ExtensionOwnerResolver does as its last act, i.e. exactly when owners are final); before that
+    /// it falls back to the linear scan, which returns the same answer — no owner is resolved yet, so
+    /// an early caller correctly sees nothing.
     public func extensionConformanceNames(ownerId: Int) -> [String] {
+        if let index = extensionConformanceIndex { return index[ownerId] ?? [] }
         var out: [String] = []
         for ext in extensionRefs where ext.scope.owner?.id == ownerId {
             out.append(contentsOf: ext.inheritedNames)
         }
         return out
+    }
+
+    /// Owner id → conformance names declared on that type's extensions. nil until built.
+    private var extensionConformanceIndex: [Int: [String]]?
+
+    /// Build the owner-keyed extension-conformance index. Called by ExtensionOwnerResolver once every
+    /// extension's owner is resolved — the answer cannot change after that, and `conformanceNames` is
+    /// consulted from the per-use-site resolution paths where a linear scan over every extension in
+    /// the project would show up.
+    public func indexExtensionConformances() {
+        var index: [Int: [String]] = [:]
+        for ext in extensionRefs {
+            guard let ownerId = ext.scope.owner?.id, !ext.inheritedNames.isEmpty else { continue }
+            index[ownerId, default: []].append(contentsOf: ext.inheritedNames)
+        }
+        extensionConformanceIndex = index
+    }
+
+    /// EVERY protocol (and superclass) name written for `sym`: its PRIMARY declaration's inheritance
+    /// clause plus the conformances declared on its extensions.
+    ///
+    /// This is the invariant `extension Model: Codable {}` broke over and over: a conformance is a
+    /// conformance wherever it is written, so every consumer asking "what does this type conform to"
+    /// must read BOTH halves. `InheritanceClause.names` deliberately reads only the primary decl, so
+    /// asking it alone is always a half-answer — ask this instead.
+    ///
+    /// The two deliberate NON-consumers are `SuperclassVisibility` and `OverrideLinker`: Swift does
+    /// not allow an extension to add a SUPERCLASS, so for those two the primary clause IS the whole
+    /// answer and reading extensions would only add protocol names they must ignore anyway.
+    public func conformanceNames(of sym: Symbol) -> [String] {
+        InheritanceClause.names(atOffset: sym.declOffset, in: sym.file.syntax)
+            + extensionConformanceNames(ownerId: sym.id)
     }
 
     public func register(_ symbol: Symbol) {

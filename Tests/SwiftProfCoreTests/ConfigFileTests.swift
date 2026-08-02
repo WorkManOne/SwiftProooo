@@ -49,6 +49,7 @@ final class ConfigFileTests: XCTestCase {
         no-rollback: false
         kinds: [class, struct]
         raw-values: safe
+        objc-protection: relaxed
         index-store-path: /abs/DataStore
         index-store-gate: false
         aggressive-rollback: true
@@ -70,6 +71,7 @@ final class ConfigFileTests: XCTestCase {
         XCTAssertEqual(c.noRollback, false)
         XCTAssertEqual(c.kinds, ["class", "struct"])
         XCTAssertEqual(c.rawValues, "safe")
+        XCTAssertEqual(c.objcProtection, "relaxed")
         XCTAssertEqual(c.indexStorePath, "/abs/DataStore")
         XCTAssertEqual(c.indexStoreGate, false)
         XCTAssertEqual(c.aggressiveRollback, true)
@@ -164,6 +166,18 @@ final class ConfigFileTests: XCTestCase {
         XCTAssertEqual(merged.ignoreNames, [])
         XCTAssertEqual(merged.module, ["App:/file/App"])
         XCTAssertNil(merged.debugNames)    // set by neither → default applied downstream
+    }
+
+    /// `objc-protection` is a value-valued key like `raw-values`, so its precedence is the plain
+    /// `cli ?? config` rule — a CLI `--objc-protection strict` must be able to pull a project back
+    /// from a config-file `relaxed` for one run.
+    func testMerging_objcProtectionCliOverridesConfig() {
+        var cli = ConfigFile()
+        cli.objcProtection = "strict"
+        var file = ConfigFile()
+        file.objcProtection = "relaxed"
+        XCTAssertEqual(cli.merging(over: file).objcProtection, "strict")
+        XCTAssertEqual(ConfigFile().merging(over: file).objcProtection, "relaxed")
     }
 
     // MARK: - Discovery

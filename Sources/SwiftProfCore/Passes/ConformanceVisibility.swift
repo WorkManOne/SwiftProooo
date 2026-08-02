@@ -31,9 +31,7 @@ public final class ConformanceVisibility {
                   let inner = parent.children.first(where: { $0.owner?.id == sym.id })
             else { continue }
             // Primary decl conformances + conformances declared in extensions (B-FIX-6).
-            var conformedTo = inheritanceNames(for: sym)
-            conformedTo.append(contentsOf: table.extensionConformanceNames(ownerId: sym.id))
-            for name in conformedTo {
+            for name in table.conformanceNames(of: sym) {
                 // A protocol must not fold its own requirements into itself.
                 if name == sym.name { continue }
                 // Prefer the protocol declared in the conformer's own module. When the match fails,
@@ -86,7 +84,4 @@ public final class ConformanceVisibility {
         Self.preferredProtocol(in: table, named: name, forModule: module)
     }
 
-    private func inheritanceNames(for sym: Symbol) -> [String] {
-        InheritanceClause.names(atOffset: sym.declOffset, in: sym.file.syntax)
-    }
 }

@@ -41,6 +41,7 @@ public struct ConfigFile: Decodable, Equatable {
     public var indexStoreGate: Bool?
     public var aggressiveRollback: Bool?
     public var uniqueExternalMembers: Bool?
+    public var objcProtection: String?
     public var explain: Bool?
     public var verbose: Bool?
 
@@ -68,6 +69,7 @@ public struct ConfigFile: Decodable, Equatable {
         case indexStoreGate = "index-store-gate"
         case aggressiveRollback = "aggressive-rollback"
         case uniqueExternalMembers = "unique-external-members"
+        case objcProtection = "objc-protection"
         case explain
         case verbose
     }
@@ -153,6 +155,7 @@ public struct ConfigFile: Decodable, Equatable {
         r.indexStoreGate = indexStoreGate ?? base.indexStoreGate
         r.aggressiveRollback = aggressiveRollback ?? base.aggressiveRollback
         r.uniqueExternalMembers = uniqueExternalMembers ?? base.uniqueExternalMembers
+        r.objcProtection = objcProtection ?? base.objcProtection
         r.explain = explain ?? base.explain
         r.verbose = verbose ?? base.verbose
         return r

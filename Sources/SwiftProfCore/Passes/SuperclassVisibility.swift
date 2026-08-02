@@ -92,6 +92,10 @@ public final class SuperclassVisibility {
     /// The single LOCAL class a class directly inherits from, or nil (external / no superclass /
     /// ambiguous). A class has at most one superclass; the remaining inheritance entries are
     /// protocols, which resolve to nil here.
+    ///
+    /// Deliberately reads the PRIMARY declaration only, not `SymbolTable.conformanceNames`: Swift
+    /// does not allow an extension to add a superclass, so the extension half can contribute nothing
+    /// but protocol names this function must discard anyway.
     private func superclass(of sym: Symbol) -> Symbol? {
         for name in inheritanceNames(for: sym) {
             // Strip generic args (`Base<T>` → `Base`) before lookup — partial-generics limit applies.

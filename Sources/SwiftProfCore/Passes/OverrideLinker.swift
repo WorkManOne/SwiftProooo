@@ -130,6 +130,9 @@ public final class OverrideLinker {
 
     /// The single LOCAL class `sym` directly inherits from, or nil (external / none / ambiguous).
     /// A class's first resolvable inheritance entry is its superclass; the rest are protocols.
+    ///
+    /// Primary declaration only, on purpose (same reason as SuperclassVisibility): an extension
+    /// cannot add a superclass, so `SymbolTable.conformanceNames` would only add protocol names.
     private func superclass(of sym: Symbol) -> Symbol? {
         for name in inheritanceNames(for: sym) {
             var base = name

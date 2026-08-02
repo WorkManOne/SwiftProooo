@@ -1054,7 +1054,9 @@ private final class ResolutionVisitor: SyntaxVisitor {
         while let cur = s {
             defer { s = cur.parent }
             guard cur.kind == .type, let owner = cur.owner else { continue }
-            for inh in inheritanceNames(for: owner) {
+            // Conformances declared in an extension count too (G2): `extension C: P {}` makes P's
+            // typealiases just as visible inside C as writing `class C: P` would.
+            for inh in table.conformanceNames(of: owner) {
                 for proto in table.types(named: inh) where proto.kind == .protocol {
                     guard !seenProtocols.contains(proto.id) else { continue }
                     seenProtocols.insert(proto.id)
@@ -1067,12 +1069,6 @@ private final class ResolutionVisitor: SyntaxVisitor {
             }
         }
         return found
-    }
-
-    /// Inheritance-clause type names for a type symbol (re-reading its decl node — same pattern
-    /// WitnessLinker uses). Returns an empty list if the symbol's decl can't be located.
-    private func inheritanceNames(for sym: Symbol) -> [String] {
-        InheritanceClause.names(atOffset: sym.declOffset, in: sym.file.syntax)
     }
 
     /// Walk type-position syntax (IdentifierType / MemberType / OptionalType / ArrayType-of-type)
@@ -1391,9 +1387,7 @@ private final class ResolutionVisitor: SyntaxVisitor {
         // Primary-decl inheritance clause + conformances declared on the type's EXTENSIONS
         // (`extension Tool: Helper` — B-FIX-6 discipline; without them a protocol adopted in an
         // extension is missing from the family / conformance evidence).
-        var names = inheritanceNames(for: typeSym)
-        names.append(contentsOf: table.extensionConformanceNames(ownerId: typeSym.id))
-        for inh in names {
+        for inh in table.conformanceNames(of: typeSym) {
             let base = bareTypeName(inh)
             // Module-aware: a bare inherited name resolves in the type's own module first.
             for cand in table.types(named: base)

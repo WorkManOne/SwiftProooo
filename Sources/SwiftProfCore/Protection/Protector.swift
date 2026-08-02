@@ -1,19 +1,46 @@
 import Foundation
 import SwiftSyntax
 
+/// How much of the Objective-C runtime's name sensitivity to assume. Only protections that exist
+/// BECAUSE of the ObjC runtime answer to this setting; everything else the Protector does (Codable
+/// keys, property wrappers, raw enums, operators, protocol conformances) is unaffected.
+public enum ObjCProtectionMode: String, CaseIterable {
+    /// Default. A class is name-sensitive if it or any ancestor is annotated `@objc`-ish OR descends
+    /// from an ObjC root (`NSObject`, `UIView`, …), and every member of such a class is protected.
+    /// On a UIKit project that is nearly every class, so it is also where most over-protection sits.
+    case strict
+    /// Protect members only where the exposure is DECLARED — an explicit `@objc` / `@objcMembers` /
+    /// `@IBDesignable` class, an exposing attribute on the member, a `#selector` reference, an
+    /// `@objc extension`, or an `NSManagedObject` descendant (Core Data binds by name). A class
+    /// tainted purely by its ancestry keeps its NAME protected (a storyboard `customClass` is a
+    /// string) while its members become renameable. Since SE-0160 an unannotated member of an
+    /// NSObject subclass is not visible to the ObjC runtime at all, which is what makes this safe;
+    /// what it does NOT cover is name-based reflection the compiler cannot see (KVC string keys,
+    /// `value(forKey:)`, hand-built selector strings that never appear as `#selector`).
+    case relaxed
+    /// Drop every ObjC-motivated protection, including exposing attributes, `#selector` names,
+    /// `@objc` classes and `NSManagedObject`. For projects with no Objective-C name dependency at
+    /// all. Not for a project with Core Data or storyboards.
+    case off
+}
+
 /// Marks symbols that must never be renamed. Each protection records WHY (a short reason),
 /// surfaced in the coverage report so users see which decisions reduced renaming.
 public final class Protector {
     public let table: SymbolTable
     public let logger: Logger
     public let stdlibRegistry: StdlibRegistry
+    /// How much ObjC-runtime name sensitivity to assume (`--objc-protection`).
+    public let objcProtection: ObjCProtectionMode
     /// id → human-readable reason. Presence in this map = protected.
     public private(set) var reasonForId: [Int: String] = [:]
 
-    public init(table: SymbolTable, stdlibRegistry: StdlibRegistry, logger: Logger) {
+    public init(table: SymbolTable, stdlibRegistry: StdlibRegistry, logger: Logger,
+                objcProtection: ObjCProtectionMode = .strict) {
         self.table = table
         self.stdlibRegistry = stdlibRegistry
         self.logger = logger
+        self.objcProtection = objcProtection
     }
 
     /// Mark a symbol as protected with a reason. First reason wins for any id.
@@ -29,7 +56,8 @@ public final class Protector {
         var wrapperTypeNames: Set<String> = []
         var wrappedCandidates: [(id: Int, attrNames: [String])] = []
         for file in files {
-            let visitor = ProtectionVisitor(file: file, table: table) { [unowned self] id, reason in
+            let visitor = ProtectionVisitor(file: file, table: table,
+                                            objcProtection: objcProtection) { [unowned self] id, reason in
                 self.protect(id, reason: reason)
             }
             visitor.walk(file.syntax)
@@ -121,21 +149,59 @@ public final class Protector {
     /// `addTarget` / KVC strings at runtime (B-FIX-4). Protect every tainted class + its members
     /// (including extension members).
     private func runObjCInheritanceProtection(classFacts: [(id: Int, inherited: [String], isObjCAttr: Bool)]) {
+        guard objcProtection != .off else { return }
         guard !classFacts.isEmpty else { return }
         // Index classes by simple name for module-aware-ish superclass resolution.
         var classesByName: [String: [Symbol]] = [:]
         for sym in table.symbols where sym.kind == .class {
             classesByName[sym.name, default: []].append(sym)
         }
-        var tainted = Set<Int>()
-        // Seed: classes with an @objc-ish attribute, or directly inheriting an ObjC root name.
+        // Seeds kept APART by origin, because that is the only thing `relaxed` needs to know: an
+        // annotation is a DECLARED exposure, an ancestor is merely an inherited possibility.
+        var attrSeed = Set<Int>()        // @objc / @objcMembers / @IBDesignable written on the class
+        var managedSeed = Set<Int>()     // NSManagedObject — Core Data binds properties by NAME
+        var rootSeed = Set<Int>()        // any ObjC root class (NSObject, UIView, …)
         for f in classFacts {
-            if f.isObjCAttr || f.inherited.contains(where: { Self.objcRootClassNames.contains($0) }) {
-                tainted.insert(f.id)
+            if f.isObjCAttr { attrSeed.insert(f.id) }
+            if f.inherited.contains("NSManagedObject") { managedSeed.insert(f.id) }
+            if f.inherited.contains(where: { Self.objcRootClassNames.contains($0) }) { rootSeed.insert(f.id) }
+        }
+        let tainted = propagateTaint(seed: attrSeed.union(rootSeed),
+                                     classFacts: classFacts, classesByName: classesByName)
+        // Under `relaxed`, members stay protected only where the exposure was DECLARED (an
+        // annotation — `@objcMembers` propagates to subclasses, so the taint does too) or where a
+        // framework binds them by name regardless of annotation (Core Data). A class tainted only by
+        // ancestry keeps its NAME (storyboards name it as a string) and gives up its members.
+        let memberTainted = objcProtection == .relaxed
+            ? propagateTaint(seed: attrSeed.union(managedSeed),
+                             classFacts: classFacts, classesByName: classesByName)
+            : tainted
+        // Precompute owner → scopes (primary inner + extensions) ONCE so applying protection to
+        // many tainted classes stays linear, not O(tainted × scopes).
+        var scopesByOwner: [Int: [Scope]] = [:]
+        for (_, fileScope) in table.fileScopes {
+            collectScopes(fileScope) { scope in
+                if let ownerId = scope.owner?.id { scopesByOwner[ownerId, default: []].append(scope) }
             }
         }
-        // Fixpoint: a class becomes tainted when a superclass name resolves to a tainted local
-        // class. Conservative on same-named ambiguity (taint if ANY namesake is tainted).
+        for id in tainted {
+            let protectsMembers = memberTainted.contains(id)
+            protect(id, reason: protectsMembers
+                    ? "@objc / transitive objc-class"
+                    : "objc-descendant class name (relaxed: members renameable)")
+            guard protectsMembers else { continue }
+            for scope in scopesByOwner[id] ?? [] {
+                for member in scope.symbols { protect(member.id, reason: "@objc class member (transitive)") }
+            }
+        }
+    }
+
+    /// Fixpoint over the class graph: a class joins the set when a superclass name resolves to a
+    /// class already in it. Conservative on same-named ambiguity (join if ANY namesake is in).
+    private func propagateTaint(seed: Set<Int>,
+                                classFacts: [(id: Int, inherited: [String], isObjCAttr: Bool)],
+                                classesByName: [String: [Symbol]]) -> Set<Int> {
+        var tainted = seed
         var changed = true
         while changed {
             changed = false
@@ -148,20 +214,7 @@ public final class Protector {
                 }
             }
         }
-        // Precompute owner → scopes (primary inner + extensions) ONCE so applying protection to
-        // many tainted classes stays linear, not O(tainted × scopes).
-        var scopesByOwner: [Int: [Scope]] = [:]
-        for (_, fileScope) in table.fileScopes {
-            collectScopes(fileScope) { scope in
-                if let ownerId = scope.owner?.id { scopesByOwner[ownerId, default: []].append(scope) }
-            }
-        }
-        for id in tainted {
-            protect(id, reason: "@objc / transitive objc-class")
-            for scope in scopesByOwner[id] ?? [] {
-                for member in scope.symbols { protect(member.id, reason: "@objc class member (transitive)") }
-            }
-        }
+        return tainted
     }
 
     /// Protect every member whose name is referenced by a `#selector` / `Selector("…")` anywhere
@@ -181,6 +234,7 @@ public final class Protector {
     }
 
     private func runSelectorNameProtection(selectorNames: Set<String>) {
+        guard objcProtection != .off else { return }
         guard !selectorNames.isEmpty else { return }
         for sym in table.symbols
         where (sym.kind == .method || sym.kind == .function || sym.kind == .property)
@@ -287,10 +341,8 @@ public final class Protector {
     /// requirements into each local protocol's scope, so inner-scope members cover transitively-
     /// inherited requirements too.
     private func localProtocolRequirementNames(for sym: Symbol) -> Set<String> {
-        var conformed = inheritanceNames(for: sym).map(simpleBaseName)
-        conformed.append(contentsOf: table.extensionConformanceNames(ownerId: sym.id).map(simpleBaseName))
         var names: Set<String> = []
-        for name in conformed {
+        for name in conformanceNames(for: sym) {
             guard let proto = ConformanceVisibility.preferredProtocol(in: table, named: name, forModule: sym.module.name),
                   let protoParent = proto.scope,
                   let protoScope = protoParent.children.first(where: { $0.owner?.id == proto.id })
@@ -325,6 +377,21 @@ public final class Protector {
         return names
     }
 
+    /// EVERY protocol/superclass name `sym` conforms to: the primary declaration's inheritance
+    /// clause PLUS the conformances declared on its extensions (`extension Model: Codable {}`).
+    /// `InheritanceClause.names` reads only the primary decl by design, so any consumer that asks
+    /// "what does this type conform to" must add the extension half itself — this helper is the
+    /// Protector's single answer, so no consumer can be left reading half the picture again (G2).
+    /// Memoized: the transitive walk revisits the same local protocols across many conformers.
+    private var conformanceCache: [Int: [String]] = [:]
+    private func conformanceNames(for sym: Symbol) -> [String] {
+        if let cached = conformanceCache[sym.id] { return cached }
+        let names = (inheritanceNames(for: sym) + table.extensionConformanceNames(ownerId: sym.id))
+            .map(simpleBaseName)
+        conformanceCache[sym.id] = names
+        return names
+    }
+
     /// Collect the EXTERNAL (stdlib/SDK, not-in-our-table) protocols `sym` conforms to, following
     /// inherited LOCAL protocols transitively. `protocol Widget: Hashable` + `class C: Widget` ⇒
     /// `C` reaches external `Hashable`, so its `hash(into:)` witness must be protected even though
@@ -334,15 +401,21 @@ public final class Protector {
     /// Only LOCAL PROTOCOLS are followed — NOT local base classes. A member inherited/overridden
     /// from a local base class is the OverrideLinker's concern; expanding through base classes here
     /// would over-protect every subclass for no correctness gain.
+    ///
+    /// Both the seed and the transitive step read `conformanceNames`, so a conformance declared in
+    /// an EXTENSION counts exactly like one on the primary declaration (G2). It used to read the
+    /// primary clause only, which silently unprotected `extension Model: Codable {}` (changed JSON
+    /// contract, no compile error) and `extension C: SomeVendorProtocol {}` ("does not conform" red).
     private func reachableExternalProtocols(from sym: Symbol) -> (known: [String], unknown: [String]) {
         var known: Set<String> = []
         var unknown: Set<String> = []
         var visitedLocal: Set<Int> = []          // local protocol ids already expanded
         var seenNames: Set<String> = []
-        var queue = inheritanceNames(for: sym).map(simpleBaseName)
+        var queue = conformanceNames(for: sym)
         while let name = queue.popLast() {
             guard seenNames.insert(name).inserted else { continue }
             if knownStdlibTypes.contains(name) { continue }              // value type — not a protocol
+            if externalClassNotProtocol(name) { continue }
             let locals = table.types(named: name)
             if locals.isEmpty {
                 // External protocol (or unmodeled external type).
@@ -352,12 +425,36 @@ public final class Protector {
                 // Local — recurse into its OWN conformances, protocols only.
                 for t in locals where t.kind == .protocol {
                     if visitedLocal.insert(t.id).inserted {
-                        queue.append(contentsOf: inheritanceNames(for: t).map(simpleBaseName))
+                        queue.append(contentsOf: conformanceNames(for: t))
                     }
                 }
             }
         }
         return (Array(known), Array(unknown))
+    }
+
+    /// True when `name` is an external name we KNOW names a CLASS, not a protocol — and the caller
+    /// should therefore not treat it as an unknown external protocol.
+    ///
+    /// Why this exists: `reachableExternalProtocols` cannot tell an external class from an external
+    /// protocol, so `class Screen: UIViewController` looked like a conformance to an unknown
+    /// protocol and every member was protected fail-closed as a possible witness. Under `strict`
+    /// that is invisible (the objc-descendant rule protects the same members anyway), but it
+    /// silently CANCELS `relaxed`: the members it releases are immediately re-protected by the
+    /// conformance rule, with only the reason string changing. Measured on the fixtures: relaxed
+    /// moved 0 symbols before this, because that is exactly what happened.
+    ///
+    /// Gated on the mode so `strict` stays bit-identical rather than merely equivalent. The names
+    /// are `objcRootClassNames`, which is a curated list of CLASSES — no guessing about whether an
+    /// arbitrary unknown name is a class or a protocol, because guessing wrong in that direction
+    /// drops a real conformance and produces a "does not conform" red build. An ObjC-rooted class's
+    /// name sensitivity is `runObjCInheritanceProtection`'s job, which is what the flag governs;
+    /// its OTHER inherited names (`UIImagePickerControllerDelegate`, …) are still protocols and
+    /// still protect fail-closed.
+    private func externalClassNotProtocol(_ name: String) -> Bool {
+        objcProtection != .strict
+            && Self.objcRootClassNames.contains(name)
+            && table.types(named: name).isEmpty
     }
 
     /// Strip a trailing generic argument clause and surrounding whitespace so an inherited entry
@@ -380,6 +477,10 @@ public final class Protector {
 private final class ProtectionVisitor: SyntaxVisitor {
     let file: SourceFile
     let table: SymbolTable
+    /// `.off` disables the ObjC-motivated detectors in this visitor (exposing attributes, `@objc
+    /// extension`, `#selector` collection). `.relaxed` keeps them all — a written annotation is a
+    /// declared exposure, which is exactly what `relaxed` still honours.
+    let objcProtection: ObjCProtectionMode
     let protect: (Int, String) -> Void
 
     /// Class inheritance + @objc-attribute facts collected during the walk, consumed by the
@@ -395,9 +496,11 @@ private final class ProtectionVisitor: SyntaxVisitor {
     /// whose attribute is a known SwiftUI/Combine wrapper OR a local `@propertyWrapper` type.
     var wrappedPropertyCandidates: [(id: Int, attrNames: [String])] = []
 
-    init(file: SourceFile, table: SymbolTable, protect: @escaping (Int, String) -> Void) {
+    init(file: SourceFile, table: SymbolTable, objcProtection: ObjCProtectionMode,
+         protect: @escaping (Int, String) -> Void) {
         self.file = file
         self.table = table
+        self.objcProtection = objcProtection
         self.protect = protect
         super.init(viewMode: .sourceAccurate)
     }
@@ -545,11 +648,13 @@ private final class ProtectionVisitor: SyntaxVisitor {
         return .visitChildren
     }
 
-    // @IBOutlet / @IBInspectable / @objc properties — the runtime / Interface Builder reference
-    // these by name (KVC / storyboard outlets), so renaming orphans them (B-FIX-4).
+    // @IBOutlet / @IBInspectable / @objc / @NSManaged properties — the runtime / Interface Builder /
+    // Core Data reference these by name (KVC, storyboard outlets, `.xcdatamodel` attribute names),
+    // so renaming orphans them (B-FIX-4). `@NSManaged` is the quietest of the four: the name IS the
+    // Core Data attribute, a mismatch compiles and then faults on the first fetch (G1).
     override func visitPost(_ node: VariableDeclSyntax) {
-        let objcExposing: Set<String> = ["IBOutlet", "IBInspectable", "objc"]
-        guard let attr = firstAttribute(node.attributes, in: objcExposing) else { return }
+        guard objcProtection != .off,
+              let attr = firstAttribute(node.attributes, in: Self.objcExposingAttributes) else { return }
         for binding in node.bindings {
             guard let ident = binding.pattern.as(IdentifierPatternSyntax.self),
                   let sym = memberSymbol(declaredAt: ident.identifier) else { continue }
@@ -557,12 +662,46 @@ private final class ProtectionVisitor: SyntaxVisitor {
         }
     }
 
-    // @IBAction / @objc methods — referenced by selector string at runtime; protect by name.
+    // @IBAction / @objc / @NSManaged methods — referenced by selector string at runtime; protect by
+    // name. The `@NSManaged` case is Core Data's generated to-many accessors (`addToItems(_:)`),
+    // whose names the framework builds from the relationship name (G1).
     override func visit(_ node: FunctionDeclSyntax) -> SyntaxVisitorContinueKind {
-        let objcExposing: Set<String> = ["IBAction", "objc", "IBSegueAction"]
-        if let attr = firstAttribute(node.attributes, in: objcExposing),
+        if objcProtection != .off,
+           let attr = firstAttribute(node.attributes, in: Self.objcExposingAttributes),
            let sym = memberSymbol(declaredAt: node.name) {
             protect(sym.id, "@\(attr) (selector/runtime name-sensitive)")
+        }
+        return .visitChildren
+    }
+
+    /// Attributes that publish a member's NAME to a runtime outside the Swift compiler: the ObjC
+    /// runtime (`@objc`), Interface Builder (`@IBOutlet` / `@IBInspectable` / `@IBAction` /
+    /// `@IBSegueAction`) and Core Data (`@NSManaged`). One set for properties and methods — every
+    /// one of them is valid on both, and keeping two hand-maintained lists is how `@NSManaged` went
+    /// missing from both in the first place.
+    static let objcExposingAttributes: Set<String> = [
+        "objc", "IBOutlet", "IBInspectable", "IBAction", "IBSegueAction", "NSManaged",
+    ]
+
+    /// `@objc extension Foo { … }` marks EVERY member it declares as `@objc`, so the runtime can
+    /// reach each one by name — the same exposure as writing `@objc` on each member. The Protector
+    /// had no `ExtensionDeclSyntax` visit at all, so this whole form was invisible (G3). Protect the
+    /// members the extension declares; the extended TYPE is untouched here (an `@objc extension`
+    /// says nothing about the type's own members, which sit in another decl).
+    override func visit(_ node: ExtensionDeclSyntax) -> SyntaxVisitorContinueKind {
+        guard objcProtection != .off,
+              hasAttribute(node.attributes, named: "objc") else { return .visitChildren }
+        for member in node.memberBlock.members {
+            if let fn = member.decl.as(FunctionDeclSyntax.self),
+               let sym = memberSymbol(declaredAt: fn.name) {
+                protect(sym.id, "@objc extension member (runtime name-sensitive)")
+            } else if let v = member.decl.as(VariableDeclSyntax.self) {
+                for binding in v.bindings {
+                    guard let ident = binding.pattern.as(IdentifierPatternSyntax.self),
+                          let sym = memberSymbol(declaredAt: ident.identifier) else { continue }
+                    protect(sym.id, "@objc extension member (runtime name-sensitive)")
+                }
+            }
         }
         return .visitChildren
     }

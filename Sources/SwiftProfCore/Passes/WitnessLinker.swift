@@ -50,9 +50,7 @@ public final class WitnessLinker {
         for sym in table.symbols where isTypeKind(sym.kind) && sym.kind != .protocol {
             // Conformances from the primary decl AND from extensions (`extension S: P`), so a
             // witness declared in an extension is still paired with its requirement (B-FIX-6).
-            var inherits = inheritanceNames(for: sym)
-            inherits.append(contentsOf: table.extensionConformanceNames(ownerId: sym.id))
-            for name in inherits {
+            for name in table.conformanceNames(of: sym) {
                 // Find a local protocol matching this name, preferring one in the conformer's
                 // own module. Fail closed on ambiguous cross-module collisions rather than `.first`
                 // (B-FIX-5): an arbitrary pick links witnesses to the wrong-module requirement.
@@ -227,7 +225,4 @@ public final class WitnessLinker {
         for c in scope.children { collect(c) }
     }
 
-    private func inheritanceNames(for sym: Symbol) -> [String] {
-        InheritanceClause.names(atOffset: sym.declOffset, in: sym.file.syntax)
-    }
 }

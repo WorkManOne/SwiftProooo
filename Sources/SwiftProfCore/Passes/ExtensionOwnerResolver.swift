@@ -37,6 +37,10 @@ public final class ExtensionOwnerResolver {
                 ext.scope.owner = nil
             }
         }
+        // Owners are final now, so the owner-keyed conformance index can be built. Every consumer of
+        // `SymbolTable.conformanceNames` runs after this pass; building it here means no caller has
+        // to know when the answer became stable.
+        table.indexExtensionConformances()
         logger.log("extension owners resolved: \(resolved)/\(table.extensionRefs.count)", verbose: true)
     }
 }

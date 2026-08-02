@@ -89,6 +89,13 @@ public struct PipelineOptions {
     /// -members`) to bisect a red build back to this heuristic.
     public var uniqueExternalMembers: Bool
 
+    /// How much Objective-C runtime name sensitivity the Protector assumes. `.strict` (default) is
+    /// the historical behaviour: every descendant of an ObjC root class keeps all its members.
+    /// `.relaxed` narrows that to DECLARED exposure (annotations, selectors, Core Data), which is
+    /// the main coverage lever on a UIKit project; `.off` drops ObjC protections entirely.
+    /// Non-ObjC protections (Codable keys, property wrappers, conformances) never answer to this.
+    public var objcProtection: ObjCProtectionMode
+
     public init(
         modules: [ModuleSpec],
         outputDirectory: URL,
@@ -112,7 +119,8 @@ public struct PipelineOptions {
         indexStorePath: String? = nil,
         indexStoreGate: Bool = false,
         explain: Bool = false,
-        uniqueExternalMembers: Bool = true
+        uniqueExternalMembers: Bool = true,
+        objcProtection: ObjCProtectionMode = .strict
     ) {
         self.modules = modules
         self.outputDirectory = outputDirectory
@@ -137,6 +145,7 @@ public struct PipelineOptions {
         self.indexStoreGate = indexStoreGate
         self.explain = explain
         self.uniqueExternalMembers = uniqueExternalMembers
+        self.objcProtection = objcProtection
     }
 }
 
@@ -319,7 +328,8 @@ public final class Pipeline {
             indexContext = IndexContext(usrIndex: index, usrBySymbolId: usrBySymbolId)
         }
 
-        let protector = Protector(table: table, stdlibRegistry: registry, logger: logger)
+        let protector = Protector(table: table, stdlibRegistry: registry, logger: logger,
+                                  objcProtection: options.objcProtection)
         protector.run(on: project.files)
         KeyPathProtector(table: table, protector: protector, logger: logger).run(on: project.files)
         logger.log("protected: \(protector.reasonForId.count)")
