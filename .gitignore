@@ -10,6 +10,15 @@ Temp.swift
 # disk for manual CLI runs; the automated SwiftProfCoreTests suite does not use them).
 *.docx
 /docs/
+
+/propertyReports/
+/SwiftProf_*.md
+/Diagnostics.txt
+/Diagnostics-files.txt
+/Decisions.txt
+/decisions.json
+/ConversionMap.json
+/CoverageReport.txt
 /Tests/IceTrays/
 /Tests/IceTrays1/
 /Tests/PullTheTicket/
