@@ -43,12 +43,18 @@ public final class TypeResolver {
     /// Converter for that file, turning a use-site UTF-8 offset into the line:column the index uses.
     public let useSiteConverter: SourceLocationConverter?
 
-    /// Injected provider: given a bare value name with NO scope Symbol, returns its static type NAME
-    /// if the caller knows it out-of-band. ResolutionVisitor wires this to its optional-binding type
-    /// tracker so `typeSymbol(of:)` can type a binding local (`if let acc = makeFoo(); acc.x.y`) that
-    /// is not a `declaredType`-carrying Symbol (B-FIX-12). Default nil ⇒ purely syntactic. Safe w.r.t.
-    /// the `preferredCache` (name-keyed, top-level types only) because `typeSymbol(of:)` is not cached.
-    public var localBindingTypeName: ((String) -> String?)?
+    /// Injected provider: given a bare value name with NO scope Symbol, returns its static type — the
+    /// NAME together with the scope that name must be resolved in. ResolutionVisitor wires this to
+    /// its optional-binding type tracker so `typeSymbol(of:)` can type a binding local (`if let acc =
+    /// makeFoo(); acc.x.y`) that is not a `declaredType`-carrying Symbol (B-FIX-12). Default nil ⇒
+    /// purely syntactic. Safe w.r.t. the `preferredCache` (name-keyed, top-level types only) because
+    /// `typeSymbol(of:)` is not cached.
+    ///
+    /// The scope is part of the answer, not an optional extra (B-FIX-35): the name may be a written
+    /// annotation (resolves where the binding is written) or an inferred nested type (resolves in the
+    /// type's DECLARING scope, invisible from the use-site). Re-resolving a bare name at the use-site
+    /// is the B-FIX-23 defect, so the two travel together and there is no name-only variant to reach for.
+    public var localBindingTypeName: ((String) -> (name: String, scope: Scope)?)?
 
     public init(table: SymbolTable, preferredModule: String? = nil,
                 indexContext: IndexContext? = nil,
@@ -207,8 +213,8 @@ public final class TypeResolver {
                 // ResolutionVisitor. Without this the provider was reachable only for bindings that
                 // are absent from the scope tree (`if let`), so every payload binding stayed untyped.
                 if sym.kind == .parameter, let provider = localBindingTypeName,
-                   let typeName = provider(name) {
-                    return typeSymbol(forQualifiedName: typeName, in: scope)
+                   let t = provider(name) {
+                    return typeSymbol(forQualifiedName: t.name, in: t.scope)
                 }
                 return nil
             }
@@ -216,8 +222,8 @@ public final class TypeResolver {
             // (ResolutionVisitor) may know its type out-of-band. Consult the injected provider so a
             // chain `acc.x.y` types `acc` and resolves through it. Returns nil for external types
             // (URL, …) → falls through, leaving external members untouched (B-FIX-12).
-            if let provider = localBindingTypeName, let typeName = provider(name) {
-                return typeSymbol(forQualifiedName: typeName, in: scope)
+            if let provider = localBindingTypeName, let t = provider(name) {
+                return typeSymbol(forQualifiedName: t.name, in: t.scope)
             }
             // Maybe `name` is a named closure parameter — find enclosing closure and check.
             if let t = inferNamedClosureParamType(name: name, from: ref, in: scope) {

@@ -232,14 +232,19 @@ private final class ResolutionVisitor: SyntaxVisitor {
     /// a binding is added only AFTER its initializer has been visited (so `guard let x = x`
     /// correctly resolves the RHS to the outer `x`). Frames align with function/closure scopes.
     var shadowFrames: [Set<String>] = [[]]
-    /// Parallel to `shadowFrames`: the inferred STATIC TYPE NAME of each in-scope optional binding,
-    /// keyed by bound name (when we could infer it from the initializer). An `if let u = makeURL()`
-    /// binding carries no `declaredType` (it's not a declared symbol), so a call `c.f(u)` had no way
-    /// to disambiguate overloads. Recording the binding's type here lets `argConstraint` type such a
-    /// use-site argument (B-FIX-11 follow-up). Tracked here rather than as a real Symbol so the
-    /// binding never shadows the same-named property during the binding's OWN initializer resolution
+    /// Parallel to `shadowFrames`: the STATIC TYPE of each in-scope binding, keyed by bound name. An
+    /// `if let u = makeURL()` binding carries no `declaredType` (it's not a declared symbol), so a
+    /// call `c.f(u)` had no way to disambiguate overloads. Recording the binding's type here lets
+    /// `argConstraint` type such a use-site argument (B-FIX-11 follow-up) and lets `typeSymbol(of:)`
+    /// resolve member access through it. Tracked here rather than as a real Symbol so the binding
+    /// never shadows the same-named property during the binding's OWN initializer resolution
     /// (`guard let x = x` — the RHS must still resolve to the property).
-    var shadowBindingTypeFrames: [[String: String]] = [[:]]
+    ///
+    /// The value is a (name, scope) PAIR, never a bare name (B-FIX-35): the name is either written at
+    /// the binding (`guard let r: Section.Row = …`, resolves where written) or inferred from the
+    /// initializer (resolves in the type's DECLARING scope — a nested `Row` is invisible from the
+    /// use-site). Re-resolving a bare name at the use-site is the B-FIX-23 defect.
+    var shadowBindingTypeFrames: [[String: (name: String, scope: Scope)]] = [[:]]
     /// Token ids whose rename decision was already made by qualified-type-chain resolution
     /// (`A.B.C`). Set by the outermost MemberType node; consulted by the inner MemberType nodes
     /// and the root IdentifierType so they do NOT independently rename a partial root match
@@ -467,9 +472,9 @@ private final class ResolutionVisitor: SyntaxVisitor {
         }
     }
 
-    /// The inferred static type name of an in-scope optional binding named `name`, if recorded.
-    /// Searches frames innermost-out (mirrors `shadowFrames`).
-    private func shadowBindingType(_ name: String) -> String? {
+    /// The static type of an in-scope binding named `name`, if recorded: the type NAME plus the scope
+    /// that name resolves in. Searches frames innermost-out (mirrors `shadowFrames`).
+    private func shadowBindingType(_ name: String) -> (name: String, scope: Scope)? {
         for frame in shadowBindingTypeFrames.reversed() {
             if let t = frame[name] { return t }
         }
@@ -505,13 +510,15 @@ private final class ResolutionVisitor: SyntaxVisitor {
               let caseSym = enumScope.members(named: caseName).first(where: { $0.kind == .enumCase }),
               let types = table.enumCaseAssociatedTypes[caseSym.id],
               types.count == bindings.count else { return }
+        let caseScope = caseSym.scope ?? currentScope
         for (binding, type) in zip(bindings, types) {
             guard let binding, let type else { continue }
-            // Resolve in the CASE's scope, store the name that resolves anywhere.
-            let resolved = typeResolver.typeSymbol(forQualifiedName: type,
-                                                   in: caseSym.scope ?? currentScope)
-            let name = resolved.map { TypeInferencePass.qualifiedName(of: $0) } ?? type
-            shadowBindingTypeFrames[shadowBindingTypeFrames.count - 1][binding] = name
+            // The associated type is WRITTEN in the enum's own scope, so that is where it resolves.
+            // Storing the pair keeps that fact with the name instead of qualifying the string and
+            // hoping the qualified form resolves from wherever it is read (B-FIX-35).
+            let resolved = typeResolver.typeSymbol(forQualifiedName: type, in: caseScope)
+            let info = resolved.map { ($0.name, $0.scope ?? caseScope) } ?? (type, caseScope)
+            shadowBindingTypeFrames[shadowBindingTypeFrames.count - 1][binding] = info
         }
     }
 
@@ -545,11 +552,48 @@ private final class ResolutionVisitor: SyntaxVisitor {
         return (TypeResolver.stripBackticks(callee.declName.baseName.text), bindings)
     }
 
-    /// Record a binding's inferred type into the current frame (best-effort; nil inferences skipped).
-    private func recordShadowBindingType(name: String, initializer: ExprSyntax) {
+    /// Record an optional binding's type into the current frame (best-effort; nil results skipped).
+    /// The ONE place a `let`/`var` optional binding gets a type — every entry form (`if let`,
+    /// `while let`, `guard let`) routes here so the annotation rule cannot be forgotten at one of them.
+    private func recordShadowBindingType(name: String, annotation: TypeAnnotationSyntax?,
+                                         initializer: ExprSyntax) {
         guard !shadowBindingTypeFrames.isEmpty,
-              let typeName = typeResolver.declaredTypeName(of: initializer, in: currentScope) else { return }
-        shadowBindingTypeFrames[shadowBindingTypeFrames.count - 1][name] = typeName
+              let info = bindingType(annotation: annotation, initializer: initializer) else { return }
+        shadowBindingTypeFrames[shadowBindingTypeFrames.count - 1][name] = info
+    }
+
+    /// The static type of a binding, as a (name, resolving-scope) pair.
+    ///
+    /// A WRITTEN annotation is ground truth and outranks any inference (B-FIX-35): the compiler has
+    /// been told the type, so there is nothing to guess. Only the inference below can fail, and it
+    /// fails exactly where the real project broke — `guard let row: Section.Row = items[safe: i]`,
+    /// where the initializer is a labeled subscript / cast / external generic the resolver cannot
+    /// type. The binding then stayed untyped and every member read through it landed in
+    /// `receiver-untyped`, un-renamed, while the member declarations renamed.
+    ///
+    /// Each branch pairs the name with the scope it must be resolved in, never the use-site's:
+    ///   1. annotation → the scope it is WRITTEN in (`currentScope`), so an unqualified nested name
+    ///      (`Row` written inside `enum Section`) still resolves;
+    ///   2. inferred LOCAL type → the type's own DECLARING scope, since `Symbol.name` is bare and a
+    ///      nested type is invisible from the use-site (this is the second half of the same bug);
+    ///   3. inferred EXTERNAL type (`URL`, `String`) → no Symbol exists, but the NAME still feeds
+    ///      overload disambiguation, and a top-level external name resolves anywhere.
+    ///
+    /// An annotation `WrittenTypeName.of` cannot reduce (a function type, a tuple) falls through to
+    /// inference rather than failing closed: recording nothing is what we did before, so the
+    /// fall-through can only add information, never change an existing answer.
+    private func bindingType(annotation: TypeAnnotationSyntax?,
+                             initializer: ExprSyntax) -> (name: String, scope: Scope)? {
+        if let annotation, let written = WrittenTypeName.of(annotation.type) {
+            return (written, currentScope)
+        }
+        if let sym = typeResolver.typeSymbol(of: initializer, in: currentScope) {
+            return (sym.name, sym.scope ?? currentScope)
+        }
+        if let name = typeResolver.declaredTypeName(of: initializer, in: currentScope) {
+            return (name, currentScope)
+        }
+        return nil
     }
 
     /// Closest type scope walking up from `currentScope`.
@@ -733,7 +777,8 @@ private final class ResolutionVisitor: SyntaxVisitor {
             shadowFrames[shadowFrames.count - 1].insert(name)
         }
         if let initializer = node.initializer {
-            recordShadowBindingType(name: name, initializer: initializer.value)
+            recordShadowBindingType(name: name, annotation: node.typeAnnotation,
+                                    initializer: initializer.value)
         }
     }
 
@@ -758,7 +803,8 @@ private final class ResolutionVisitor: SyntaxVisitor {
                   let ident = binding.pattern.as(IdentifierPatternSyntax.self) else { continue }
             let name = stripBackticks(ident.identifier.text)
             shadowFrames[shadowFrames.count - 1].insert(name)
-            recordShadowBindingType(name: name, initializer: initializer.value)
+            recordShadowBindingType(name: name, annotation: binding.typeAnnotation,
+                                    initializer: initializer.value)
         }
     }
 
@@ -1592,7 +1638,13 @@ private final class ResolutionVisitor: SyntaxVisitor {
         // binding's own (unwrapped) type. The name is external/stdlib (URL, …) → match by name.
         if let ref = expr.as(DeclReferenceExprSyntax.self),
            let bindingType = shadowBindingType(stripBackticks(ref.baseName.text)) {
-            return .typeName(bareTypeName(bindingType))
+            // Prefer identity when the name resolves in the scope it belongs to; fall back to the
+            // NAME for external/stdlib types (URL, …), which have no Symbol — the original signal.
+            if let sym = typeResolver.typeSymbol(forQualifiedName: bindingType.name,
+                                                 in: bindingType.scope) {
+                return .typeSymbol(sym)
+            }
+            return .typeName(bareTypeName(bindingType.name))
         }
         // General fallback — resolve the expression's static type via TypeResolver. Catches a
         // bare DeclRef to a typed parameter / property / variable, `obj.prop`, etc. We keep the

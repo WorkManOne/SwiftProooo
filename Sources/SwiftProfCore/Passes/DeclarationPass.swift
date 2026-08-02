@@ -68,50 +68,6 @@ private final class DeclVisitor: SyntaxVisitor {
         }
     }
 
-    /// Cheap textual representation of a declared type, used as a key into `declaredType` and
-    /// parsed downstream (TypeInferencePass extracts element types for for-loop variables).
-    /// - `Foo`              → "Foo"
-    /// - `Foo?` / `Foo??`   → "Foo" (optionals are unwrapped)
-    /// - `Array<Foo>`       → "Array<Foo>"
-    /// - `[Foo]`            → "[Foo]"
-    /// - tuples / functions / composition → nil (not modelled)
-    static func simpleTypeName(_ type: TypeSyntax) -> String? {
-        var t = type
-        // Peel attribute (`@escaping (X)->Y`), `inout`, and opaque/existential wrappers
-        // (`some P` / `any P`) so `r: some Renderer` types `r` as `Renderer` and its members
-        // resolve. Repeated because they can nest (`inout some P`).
-        var changed = true
-        while changed {
-            changed = false
-            if let attr = t.as(AttributedTypeSyntax.self) { t = attr.baseType; changed = true }
-            if let opaque = t.as(SomeOrAnyTypeSyntax.self) { t = opaque.constraint; changed = true }
-            if let opt = t.as(OptionalTypeSyntax.self) { t = opt.wrappedType; changed = true }
-        }
-        if let ident = t.as(IdentifierTypeSyntax.self) {
-            if ident.genericArgumentClause == nil { return ident.name.text }
-            return ident.trimmedDescription
-        }
-        if let arr = t.as(ArrayTypeSyntax.self) {
-            return "[\(arr.element.trimmedDescription)]"
-        }
-        // `[K: V]` — keep the dictionary form so a subscript on it (`dict[k]`) can extract the Value
-        // type. Consumers that only understand arrays bail on the `:` (extractElement,
-        // typeSymbol(forQualifiedName:)) — which is NOT automatically harmless: a consumer that
-        // treats a nil entry as a WILDCARD reads this string as "a type I can't resolve" and flips
-        // from "matches anything" to "matches nothing". That is exactly how witness linking broke
-        // into a red build (B-FIX-27); signature comparison now decomposes the form structurally
-        // (`TypeNameEquivalence.sameType`). Check nil semantics at EVERY consumer before widening
-        // what this function returns.
-        if let dict = t.as(DictionaryTypeSyntax.self) {
-            return "[\(dict.key.trimmedDescription): \(dict.value.trimmedDescription)]"
-        }
-        // `Foo.Bar` — store full qualified text; TypeResolver walks dotted names.
-        if let member = t.as(MemberTypeSyntax.self) {
-            return member.trimmedDescription
-        }
-        return nil
-    }
-
     private var currentScope: Scope { scopeStack.last! }
 
     private func push(_ kind: ScopeKind, owner: Symbol? = nil, node: some SyntaxProtocol) -> Scope {
@@ -213,7 +169,7 @@ private final class DeclVisitor: SyntaxVisitor {
 
     override func visit(_ node: TypeAliasDeclSyntax) -> SyntaxVisitorContinueKind {
         let sym = makeSymbol(name: node.name.text, kind: .typealias_, identifierToken: node.name)
-        if let t = Self.simpleTypeName(node.initializer.value) {
+        if let t = WrittenTypeName.of(node.initializer.value) {
             table.typealiasTarget[sym.id] = t
         }
         return .visitChildren
@@ -307,7 +263,7 @@ private final class DeclVisitor: SyntaxVisitor {
         )
         currentScope.add(symbol: sym)
         table.register(sym)
-        if let type, let t = Self.simpleTypeName(type) {
+        if let type, let t = WrittenTypeName.of(type) {
             table.declaredType[sym.id] = t
         }
     }
@@ -423,7 +379,7 @@ private final class DeclVisitor: SyntaxVisitor {
         let kind: SymbolKind = currentScope.kind == .type ? .method : .function
         let sym = makeSymbol(name: node.name.text, kind: kind, identifierToken: node.name)
         if Self.hasModifier(node.modifiers, "override") { table.overrideMemberIds.insert(sym.id) }
-        if let ret = node.signature.returnClause, let t = Self.simpleTypeName(ret.type) {
+        if let ret = node.signature.returnClause, let t = WrittenTypeName.of(ret.type) {
             table.functionReturnType[sym.id] = t
         }
         let funcScope = push(.function, owner: sym, node: node)
@@ -474,7 +430,7 @@ private final class DeclVisitor: SyntaxVisitor {
             )
             scope.add(symbol: sym)
             table.register(sym)
-            if let t = Self.simpleTypeName(param.type) {
+            if let t = WrittenTypeName.of(param.type) {
                 table.declaredType[sym.id] = t
             }
         }
@@ -483,7 +439,7 @@ private final class DeclVisitor: SyntaxVisitor {
         // declared return type. Subscript label rule differs from functions: a plain `subscript(i:)`
         // is called `x[5]` with NO label — a label exists ONLY when there's a distinct external name
         // (`subscript(safe i:)` → `x[safe: 5]`), i.e. when `secondName` is present.
-        if let enclosing = scope.parent, let ret = Self.simpleTypeName(node.returnClause.type) {
+        if let enclosing = scope.parent, let ret = WrittenTypeName.of(node.returnClause.type) {
             let labels: [String] = node.parameterClause.parameters.map { param in
                 param.secondName != nil ? Self.stripBackticks(param.firstName.text) : "_"
             }
@@ -505,7 +461,7 @@ private final class DeclVisitor: SyntaxVisitor {
         }
         if let attr = t.as(AttributedTypeSyntax.self) { t = attr.baseType }
         guard let fn = t.as(FunctionTypeSyntax.self) else { return nil }
-        return fn.parameters.map { Self.simpleTypeName($0.type) ?? "" }
+        return fn.parameters.map { WrittenTypeName.of($0.type) ?? "" }
     }
 
     /// Register generic parameters (`<T: P, U>`) as NON-renameable `.typealias_` placeholders in
@@ -528,7 +484,7 @@ private final class DeclVisitor: SyntaxVisitor {
             scope.add(symbol: sym)
             table.register(sym)
             table.genericParameterIds.insert(sym.id)
-            if let inherited = p.inheritedType, let t = Self.simpleTypeName(inherited) {
+            if let inherited = p.inheritedType, let t = WrittenTypeName.of(inherited) {
                 table.typealiasTarget[sym.id] = t
             }
         }
@@ -540,7 +496,7 @@ private final class DeclVisitor: SyntaxVisitor {
         var paramHasDefault: [Bool] = []
         var closureInputs: [Int: [String]] = [:]
         for (paramIndex, param) in params.enumerated() {
-            paramTypes.append(Self.simpleTypeName(param.type))
+            paramTypes.append(WrittenTypeName.of(param.type))
             paramHasDefault.append(param.defaultValue != nil)
             if let inputs = Self.closureInputTypeNames(of: param.type) {
                 closureInputs[paramIndex] = inputs
@@ -560,7 +516,7 @@ private final class DeclVisitor: SyntaxVisitor {
             )
             scope.add(symbol: sym)
             table.register(sym)
-            if let t = Self.simpleTypeName(param.type) {
+            if let t = WrittenTypeName.of(param.type) {
                 table.declaredType[sym.id] = t
             }
             // The internal name is safely renameable iff the parameter has a DISTINCT external
@@ -600,7 +556,7 @@ private final class DeclVisitor: SyntaxVisitor {
                 if isOverride { table.overrideMemberIds.insert(sym.id) }
                 if !isStatic, Self.isStoredBinding(binding) { table.storedPropertyIds.insert(sym.id) }
                 if let annotation = binding.typeAnnotation,
-                   let typeName = Self.simpleTypeName(annotation.type) {
+                   let typeName = WrittenTypeName.of(annotation.type) {
                     table.declaredType[sym.id] = typeName
                 } else if let init_ = binding.initializer {
                     // Try the cheap initializer-call shortcut first; otherwise defer to TypeInferencePass.
@@ -632,7 +588,15 @@ private final class DeclVisitor: SyntaxVisitor {
                 )
                 currentScope.add(symbol: sym)
                 table.register(sym)
-                table.forLoopSequence[sym.id] = node.sequence
+                // `for row: Section.Row in rows` — a WRITTEN annotation is ground truth and outranks
+                // element inference (B-FIX-35), which has to guess through the sequence expression.
+                // The string resolves later in `sym.scope`, which is where it was written.
+                if let annotation = node.typeAnnotation,
+                   let typeName = WrittenTypeName.of(annotation.type) {
+                    table.declaredType[sym.id] = typeName
+                } else {
+                    table.forLoopSequence[sym.id] = node.sequence
+                }
             }
         } else if node.caseKeyword != nil {
             registerCaseItemPattern(node.pattern)
@@ -674,7 +638,7 @@ private final class DeclVisitor: SyntaxVisitor {
             // payload types play the role of `functionParamTypes` for that call — they are what lets
             // a shorthand payload argument learn its contextual enum.
             if let params = element.parameterClause?.parameters {
-                table.enumCaseAssociatedTypes[sym.id] = params.map { Self.simpleTypeName($0.type) }
+                table.enumCaseAssociatedTypes[sym.id] = params.map { WrittenTypeName.of($0.type) }
             }
         }
         return .visitChildren

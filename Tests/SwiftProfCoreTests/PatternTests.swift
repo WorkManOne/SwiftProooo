@@ -3518,6 +3518,171 @@ final class PatternTests: XCTestCase {
         XCTAssertFalse(r.contains("self.m.tag"), "the else-body property member must resolve to Marker's own member:\n\(r)")
     }
 
+    // MARK: - A written type annotation is ground truth (B-FIX-35)
+    // Invariant: an optional binding takes its type from its OWN `typeAnnotation` when one is
+    // written, in preference to any inference from the initializer; the name in it resolves in the
+    // scope it was WRITTEN in (B-FIX-23), qualification intact.
+
+    func testOptionalBinding_guardLetAnnotation_qualifiedNestedTypeMemberResolves() throws {
+        // The reported red build. The initializer is un-inferable (a cast through `Any`), so before
+        // this fix the binding stayed untyped and `row.slotValue` resolved to nothing while the
+        // property's declaration renamed — a desync that ships whenever a shield blocks the revert.
+        // The annotation names a NESTED type QUALIFIED (`Section.Row`), which is the spelling that
+        // breaks: the same code with a top-level type has the same defect but a shorter path to it.
+        let r = try runPipeline("""
+        enum Section {
+            struct Row {
+                let slotValue: Int
+            }
+        }
+        final class Host {
+            func lookup(_ i: Int) -> Any? { return nil }
+            func run(_ i: Int) {
+                guard let row: Section.Row = lookup(i) as? Section.Row else { return }
+                _ = row.slotValue
+            }
+        }
+        """)
+        let obf = try firstGroup(#"let (\w+): Int"#, in: r)
+        XCTAssertNotEqual(obf, "slotValue", "the property decl must stay obfuscated:\n\(r)")
+        XCTAssertTrue(r.contains("row.\(obf)"), "row.slotValue must rename via the written annotation:\n\(r)")
+    }
+
+    func testOptionalBinding_ifLetAnnotation_topLevelTypeMemberResolves() throws {
+        // Same defect in the `if let` form, and with a TOP-LEVEL annotation: nothing read the
+        // annotation at all, so qualification was never the deciding factor.
+        let r = try runPipeline("""
+        struct Row {
+            let slotValue: Int
+        }
+        final class Host {
+            func lookup(_ i: Int) -> Any? { return nil }
+            func run(_ i: Int) {
+                if let row: Row = lookup(i) as? Row {
+                    _ = row.slotValue
+                }
+            }
+        }
+        """)
+        let obf = try firstGroup(#"let (\w+): Int"#, in: r)
+        XCTAssertNotEqual(obf, "slotValue", "the property decl must stay obfuscated:\n\(r)")
+        XCTAssertTrue(r.contains("row.\(obf)"), "row.slotValue must rename via the written annotation:\n\(r)")
+    }
+
+    func testOptionalBinding_whileLetAnnotation_memberResolves() throws {
+        // `while let` goes through the same visitPost(OptionalBindingCondition) entry as `if let`.
+        let r = try runPipeline("""
+        struct Row {
+            let slotValue: Int
+        }
+        final class Host {
+            func lookup() -> Any? { return nil }
+            func run() {
+                while let row: Row = lookup() as? Row {
+                    _ = row.slotValue
+                }
+            }
+        }
+        """)
+        let obf = try firstGroup(#"let (\w+): Int"#, in: r)
+        XCTAssertNotEqual(obf, "slotValue", "the property decl must stay obfuscated:\n\(r)")
+        XCTAssertTrue(r.contains("row.\(obf)"), "row.slotValue must rename via the written annotation:\n\(r)")
+    }
+
+    func testOptionalBinding_annotationResolvesInScopeItIsWrittenIn() throws {
+        // The scope half of the invariant. The annotation is written UNQUALIFIED (`Row`) inside the
+        // enum that declares it, so it resolves only from that lexical position. Storing the bare
+        // string and re-resolving it somewhere else is what B-FIX-23 forbids.
+        let r = try runPipeline("""
+        enum Section {
+            struct Row {
+                let slotValue: Int
+            }
+            struct Runner {
+                func lookup() -> Any? { return nil }
+                func run() {
+                    guard let row: Row = lookup() as? Row else { return }
+                    _ = row.slotValue
+                }
+            }
+        }
+        """)
+        let obf = try firstGroup(#"let (\w+): Int"#, in: r)
+        XCTAssertNotEqual(obf, "slotValue", "the property decl must stay obfuscated:\n\(r)")
+        XCTAssertTrue(r.contains("row.\(obf)"), "an unqualified annotation must resolve where written:\n\(r)")
+    }
+
+    func testOptionalBinding_inferredNestedType_resolvesInDeclaringScope() throws {
+        // No annotation: the type comes from the initializer, and the inferred name was stored BARE
+        // (`Row`) then re-resolved at the use-site, where a nested type is invisible. Same B-FIX-23
+        // class as the annotation path, which is why both are recorded through one helper that keeps
+        // the name and its declaring scope together.
+        let r = try runPipeline("""
+        enum Section {
+            struct Row {
+                let slotValue: Int
+            }
+        }
+        final class Host {
+            func make() -> Section.Row? { return nil }
+            func run() {
+                guard let row = make() else { return }
+                _ = row.slotValue
+            }
+        }
+        """)
+        let obf = try firstGroup(#"let (\w+): Int"#, in: r)
+        XCTAssertNotEqual(obf, "slotValue", "the property decl must stay obfuscated:\n\(r)")
+        XCTAssertTrue(r.contains("row.\(obf)"), "an inferred nested type must resolve in its declaring scope:\n\(r)")
+    }
+
+    func testOptionalBinding_guardLetAnnotation_elseBodyKeepsOuterMeaning() throws {
+        // Safety complement, mirroring the guard-case payload test: a `guard let` binding is not in
+        // scope inside the `else` body, so a same-named PROPERTY referenced there must keep its own
+        // type. Recording the annotation earlier than visitPost(GuardStmt) would type `row` as the
+        // annotated type and rewrite `row.tag` to ITS member — a wrong rename RollbackPass cannot
+        // catch (both ends rename, no original survives).
+        let r = try runPipeline("""
+        struct Row { let slotValue: Int }
+        struct Marker { let slotTag: String }
+        final class Host {
+            let row = Marker(slotTag: "x")
+            func lookup() -> Any? { return nil }
+            func run() -> String {
+                guard let row: Row = lookup() as? Row else { return self.row.slotTag }
+                _ = row.slotValue
+                return "ok"
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("self.row.slotTag"),
+                       "the else-body property member must resolve to Marker's own member:\n\(r)")
+    }
+
+    func testForInLoop_writtenAnnotationOutranksElementInference() throws {
+        // The same invariant at the other binding form that can carry an annotation. Element
+        // inference has to type the SEQUENCE expression, and a cast is one of the shapes it cannot
+        // type — but the loop variable's type is written right there.
+        let r = try runPipeline("""
+        enum Section {
+            struct Row {
+                let slotValue: Int
+            }
+        }
+        final class Host {
+            func rows() -> Any { return [] }
+            func run() {
+                for row: Section.Row in rows() as! [Section.Row] {
+                    _ = row.slotValue
+                }
+            }
+        }
+        """)
+        let obf = try firstGroup(#"let (\w+): Int"#, in: r)
+        XCTAssertNotEqual(obf, "slotValue", "the property decl must stay obfuscated:\n\(r)")
+        XCTAssertTrue(r.contains("row.\(obf)"), "row.slotValue must rename via the written annotation:\n\(r)")
+    }
+
     // MARK: - Extensions on EXTERNAL types are renameable (B-FIX-31)
     // Invariant: a member declared in an extension of a type we do NOT own (`extension String`,
     // `extension Array where Element == Mood`) can still be renamed — its use-sites are matched by
