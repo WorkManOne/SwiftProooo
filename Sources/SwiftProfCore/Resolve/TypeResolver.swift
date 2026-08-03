@@ -54,7 +54,12 @@ public final class TypeResolver {
     /// annotation (resolves where the binding is written) or an inferred nested type (resolves in the
     /// type's DECLARING scope, invisible from the use-site). Re-resolving a bare name at the use-site
     /// is the B-FIX-23 defect, so the two travel together and there is no name-only variant to reach for.
-    public var localBindingTypeName: ((String) -> (name: String, scope: Scope)?)?
+    ///
+    /// The second argument is the REFERENCE's byte offset, because not every binding answers
+    /// everywhere its frame is live: an `if case` payload binding stops at the end of its statement's
+    /// body (B-FIX-42). Passing it is not optional bookkeeping — dropping it re-opens exactly that
+    /// wrong rename, so every call site here reads the offset off the `DeclReferenceExpr` it holds.
+    public var localBindingTypeName: ((String, Int?) -> (name: String, scope: Scope)?)?
 
     public init(table: SymbolTable, preferredModule: String? = nil,
                 indexContext: IndexContext? = nil,
@@ -311,9 +316,10 @@ public final class TypeResolver {
     /// `declaredType` is a written fact and outranks both inferences.
     private func bareValueTypeInfo(named name: String, from ref: DeclReferenceExprSyntax,
                                    in scope: Scope) -> (name: String, scope: Scope)? {
+        let refOffset = ref.positionAfterSkippingLeadingTrivia.utf8Offset
         // At the reference's POSITION: a local of a braced block is visible only after its own
         // declaration, so `p2.p3` written above `let p2: Detail = …` is typed from the PARAMETER.
-        if let sym = scope.lookup(name: name, at: ref.positionAfterSkippingLeadingTrivia.utf8Offset) {
+        if let sym = scope.lookup(name: name, at: refOffset) {
             if sym.kind.isTypeLike { return nil }
             if let t = table.declaredType[sym.id] {
                 // The DECLARING scope, not the use-site: a bare nested type (`var p: S3` inside
@@ -326,11 +332,11 @@ public final class TypeResolver {
             // the scope tree, so both remaining sources are tried here too.
             guard sym.kind == .parameter else { return nil }
             if let t = inferNamedClosureParamType(name: name, from: ref, in: scope) { return t }
-            return localBindingTypeName?(name)
+            return localBindingTypeName?(name, refOffset)
         }
         // Not a scope Symbol at all — an optional binding (`if let acc = makeFoo()`). Returns nil for
         // external types (URL, …), leaving external members untouched.
-        if let t = localBindingTypeName?(name) { return t }
+        if let t = localBindingTypeName?(name, refOffset) { return t }
         return inferNamedClosureParamType(name: name, from: ref, in: scope)
     }
 

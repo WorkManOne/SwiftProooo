@@ -33,6 +33,13 @@ public final class Symbol {
     public let declOffset: Int
     public let declLength: Int
 
+    /// EXCLUSIVE end of this symbol's visibility, for the one kind of declaration whose visibility
+    /// ends before its scope does: a binding introduced by an `if case` / `while case` condition,
+    /// which dies with the statement's body (`ConditionBindingExtent`, B-FIX-42). nil — the default
+    /// and the case for every other symbol — means "visible to the end of its scope", which is what
+    /// `declOffset` alone already expressed (B-FIX-40).
+    public let visibilityEndOffset: Int?
+
     public init(
         id: Int,
         name: String,
@@ -41,7 +48,8 @@ public final class Symbol {
         file: SourceFile,
         scope: Scope?,
         declOffset: Int,
-        declLength: Int
+        declLength: Int,
+        visibilityEndOffset: Int? = nil
     ) {
         self.id = id
         self.name = name
@@ -51,5 +59,6 @@ public final class Symbol {
         self.scope = scope
         self.declOffset = declOffset
         self.declLength = declLength
+        self.visibilityEndOffset = visibilityEndOffset
     }
 }

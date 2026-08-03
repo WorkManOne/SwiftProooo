@@ -54,10 +54,19 @@ public final class Scope {
     /// .lookupCallee`, which stops at the innermost LEVEL declaring the name and narrows by kind).
     /// Such a caller must ask this, not `symbols`: a level whose only declaration is not yet visible
     /// has not declared the name at that position, and the walk has to continue outward.
+    ///
+    /// Two independent bounds, and both need the use-site offset. The START (`declOffset`) applies
+    /// only to a braced block's value locals — types and functions may be referenced before they are
+    /// declared (B-FIX-40). The END (`visibilityEndOffset`) is carried by the symbol itself and
+    /// applies wherever it is set, because the only symbols that set it are condition bindings,
+    /// whose visibility genuinely stops mid-scope (B-FIX-42) — it is not a property of the scope
+    /// kind, so it must not be filtered through `isVisibleOnlyAfterDeclaration`.
     public func declarations(named name: String, visibleAt offset: Int?) -> [Symbol] {
         symbols.filter { sym in
             guard sym.name == name else { return false }
-            guard let offset, isVisibleOnlyAfterDeclaration(sym) else { return true }
+            guard let offset else { return true }
+            if let end = sym.visibilityEndOffset, offset >= end { return false }
+            guard isVisibleOnlyAfterDeclaration(sym) else { return true }
             return sym.declOffset <= offset
         }
     }

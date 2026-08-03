@@ -244,7 +244,13 @@ private final class ResolutionVisitor: SyntaxVisitor {
     /// the binding (`guard let r: Section.Row = …`, resolves where written) or inferred from the
     /// initializer (resolves in the type's DECLARING scope — a nested `Row` is invisible from the
     /// use-site). Re-resolving a bare name at the use-site is the B-FIX-23 defect.
-    var shadowBindingTypeFrames: [[String: (name: String, scope: Scope)]] = [[:]]
+    ///
+    /// `end` is the EXCLUSIVE offset the entry stops answering at — set only for an `if case` /
+    /// `while case` payload binding, which dies with its statement's body while this frame (the
+    /// enclosing block's) lives on to the end of the method (B-FIX-42). It is the type half of the
+    /// same bound `Symbol.visibilityEndOffset` carries for the scope half, and both come from
+    /// `ConditionBindingExtent`. nil for every other binding.
+    var shadowBindingTypeFrames: [[String: (name: String, scope: Scope, end: Int?)]] = [[:]]
     /// Token ids whose rename decision was already made by qualified-type-chain resolution
     /// (`A.B.C`). Set by the outermost MemberType node; consulted by the inner MemberType nodes
     /// and the root IdentifierType so they do NOT independently rename a partial root match
@@ -304,7 +310,11 @@ private final class ResolutionVisitor: SyntaxVisitor {
         // Let TypeResolver type optional-binding locals (not Symbols) via the flow-sensitive tracker,
         // so member/chain resolution on a binding (`if let acc = makeFoo(); acc.x.y`) works. Safe: the
         // tracker is read at call time (typeSymbol(of:) is uncached), reflecting the current flow.
-        self.typeResolver.localBindingTypeName = { [weak self] in self?.shadowBindingType($0) }
+        // The offset is the reference's own position: a condition binding stops answering at the end
+        // of its statement's body, even though the frame holding it lives longer (B-FIX-42).
+        self.typeResolver.localBindingTypeName = { [weak self] name, at in
+            self?.shadowBindingType(name, at: at)
+        }
     }
 
     /// Deterministic anonymizing hash for a source identifier — keeps NDA logs leak-free while
@@ -487,9 +497,21 @@ private final class ResolutionVisitor: SyntaxVisitor {
 
     /// The static type of an in-scope binding named `name`, if recorded: the type NAME plus the scope
     /// that name resolves in. Searches frames innermost-out (mirrors `shadowFrames`).
-    private func shadowBindingType(_ name: String) -> (name: String, scope: Scope)? {
+    ///
+    /// `at` is the use-site offset, and an entry that carries an `end` stops answering there — the
+    /// frame outlives the `if case` that recorded it, so without this the payload type still typed
+    /// the same-named outer symbol below the statement (B-FIX-42). A caller with no use-site passes
+    /// nothing and keeps the old, position-blind answer.
+    ///
+    /// An expired entry does not end the search, it is SKIPPED: the name is simply not bound by that
+    /// frame at this position, so an outer frame's still-live binding of the same name is the right
+    /// answer (a `guard case` binding an inner `if case` shadowed for the length of its body). Same
+    /// rule `Scope.declarations(named:visibleAt:)` applies to the scope chain.
+    private func shadowBindingType(_ name: String, at offset: Int?) -> (name: String, scope: Scope)? {
         for frame in shadowBindingTypeFrames.reversed() {
-            if let t = frame[name] { return t }
+            guard let t = frame[name] else { continue }
+            if let offset, let end = t.end, offset >= end { continue }
+            return (t.name, t.scope)
         }
         return nil
     }
@@ -514,7 +536,13 @@ private final class ResolutionVisitor: SyntaxVisitor {
 
     /// Core of the above, shared with the `if/guard/while case .run(let m) = value` condition form:
     /// one pattern matched against one expression. Same fail-closed contract.
-    private func recordEnumPayloadBindingTypes(pattern: PatternSyntax, matching subject: ExprSyntax) {
+    ///
+    /// `visibleUntil` is the offset the recorded types stop answering at — set by the `if case` /
+    /// `while case` entry point, whose bindings die with the statement's body while this frame does
+    /// not (B-FIX-42). A `switch` case and a `guard` pass nil: the former's frame is popped with its
+    /// own scope, the latter's binding genuinely outlives its statement.
+    private func recordEnumPayloadBindingTypes(pattern: PatternSyntax, matching subject: ExprSyntax,
+                                               visibleUntil: Int? = nil) {
         guard !shadowBindingTypeFrames.isEmpty,
               let enumSym = typeResolver.typeSymbol(of: subject, in: currentScope),
               enumSym.kind == .enum,
@@ -531,7 +559,8 @@ private final class ResolutionVisitor: SyntaxVisitor {
             // hoping the qualified form resolves from wherever it is read (B-FIX-35).
             let resolved = typeResolver.typeSymbol(forQualifiedName: type, in: caseScope)
             let info = resolved.map { ($0.name, $0.scope ?? caseScope) } ?? (type, caseScope)
-            shadowBindingTypeFrames[shadowBindingTypeFrames.count - 1][binding] = info
+            shadowBindingTypeFrames[shadowBindingTypeFrames.count - 1][binding] =
+                (name: info.0, scope: info.1, end: visibleUntil)
         }
     }
 
@@ -572,7 +601,9 @@ private final class ResolutionVisitor: SyntaxVisitor {
                                          initializer: ExprSyntax) {
         guard !shadowBindingTypeFrames.isEmpty,
               let info = bindingType(annotation: annotation, initializer: initializer) else { return }
-        shadowBindingTypeFrames[shadowBindingTypeFrames.count - 1][name] = info
+        // No end bound: an optional binding's frame extent is its own (separate) question.
+        shadowBindingTypeFrames[shadowBindingTypeFrames.count - 1][name] =
+            (name: info.name, scope: info.scope, end: nil)
     }
 
     /// The static type of a binding, as a (name, resolving-scope) pair.
@@ -834,9 +865,15 @@ private final class ResolutionVisitor: SyntaxVisitor {
     /// condition, typed exactly like a `switch` case's (B-FIX-29 covered only `switch`). In
     /// `visitPost` so the matched expression has been resolved first, and skipped for a `guard`,
     /// whose bindings are deferred to `visitPost(GuardStmt)` (see there).
+    ///
+    /// The frame this records into is the ENCLOSING block's and lives to the end of the method,
+    /// while the binding dies with the statement's body — hence the end bound (B-FIX-42). Without
+    /// it, `if case .calm(let item) = mood { … }` still typed a same-named property below the
+    /// statement as the payload and rewrote its members to the payload type's obfs.
     override func visitPost(_ node: MatchingPatternConditionSyntax) {
         guard !isInGuardCondition(node) else { return }
-        recordEnumPayloadBindingTypes(pattern: node.pattern, matching: node.initializer.value)
+        recordEnumPayloadBindingTypes(pattern: node.pattern, matching: node.initializer.value,
+                                      visibleUntil: ConditionBindingExtent.endOffset(of: node))
     }
 
     /// True when a condition belongs to a `guard` (vs `if let` / `while let` / `if case`).
@@ -1661,7 +1698,8 @@ private final class ResolutionVisitor: SyntaxVisitor {
         // general typeSymbol fallback so a binding that shadows a same-named property uses the
         // binding's own (unwrapped) type. The name is external/stdlib (URL, …) → match by name.
         if let ref = expr.as(DeclReferenceExprSyntax.self),
-           let bindingType = shadowBindingType(stripBackticks(ref.baseName.text)) {
+           let bindingType = shadowBindingType(stripBackticks(ref.baseName.text),
+                                               at: ref.positionAfterSkippingLeadingTrivia.utf8Offset) {
             // Prefer identity when the name resolves in the scope it belongs to; fall back to the
             // NAME for external/stdlib types (URL, …), which have no Symbol — the original signal.
             if let sym = typeResolver.typeSymbol(forQualifiedName: bindingType.name,

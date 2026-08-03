@@ -5295,4 +5295,145 @@ final class PatternTests: XCTestCase {
         XCTAssertTrue(r.contains("return \(propObf)"),
                       "the read after the block is the PROPERTY, not the block-local:\n\(r)")
     }
+
+    // MARK: - A condition binding ends with its statement's body (B-FIX-42)
+    // Invariant: a binding introduced by an `if case` / `while case` condition is visible from its
+    // own declaration to the END of that statement's BODY — inside a later condition of the same
+    // list and inside the body, never in the `else`, never after the statement. Verified against
+    // swiftc for all three positions. `guard case` is the deliberate exception (its binding is
+    // visible AFTER the statement instead), covered by the `testEnumCasePayload_guardCaseBinding_*`
+    // tests plus the one at the end of this section.
+
+    func testIfCaseBinding_doesNotLeakPastTheStatement() throws {
+        // The reported shape. The binding was registered into the ENCLOSING scope and its payload
+        // type into the enclosing FRAME, so both outlived the `if`: the read below it was typed as
+        // `Payload` and its member rewritten to `Payload.payloadTag`'s obf on a `Detail` receiver.
+        // A wrong rename — the original `detailTag` does not survive, so RollbackPass sees nothing
+        // (`0 names desynced`) and `--diagnose-overloads` writes no line at all.
+        let r = try runPipeline("""
+        struct Payload { let payloadTag: String }
+        struct Detail { let detailTag: String }
+        enum Mood { case calm(Payload), sharp }
+        final class Screen {
+            var item: Detail = Detail(detailTag: "")
+            func render(_ mood: Mood) -> String {
+                if case .calm(let item) = mood { return item.payloadTag }
+                return item.detailTag
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("payloadTag"), "the in-body read is still typed from the payload:\n\(r)")
+        XCTAssertFalse(r.contains("detailTag"), "the read below the statement is typed from the property:\n\(r)")
+        let propObf = try firstGroup(#"var (\w+): \w+ = "#, in: r)
+        XCTAssertTrue(r.contains("return \(propObf)."),
+                      "the reference below the statement is the PROPERTY, not the binding:\n\(r)")
+    }
+
+    func testIfCaseBinding_doesNotLeakIntoTheElseBody() throws {
+        // Same root, the other half of the statement: the `else` body reads the OUTER symbol
+        // (checked against swiftc — `item.payloadTag` there is "value of type 'Detail' has no
+        // member 'payloadTag'"), so the binding must not reach it either.
+        let r = try runPipeline("""
+        struct Payload { let payloadTag: String }
+        struct Detail { let detailTag: String }
+        enum Mood { case calm(Payload), sharp }
+        final class Screen {
+            var item: Detail = Detail(detailTag: "")
+            func render(_ mood: Mood) -> String {
+                if case .calm(let item) = mood { return item.payloadTag } else { return item.detailTag }
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("payloadTag"), "the then-body read is still typed from the payload:\n\(r)")
+        XCTAssertFalse(r.contains("detailTag"), "the else-body read is typed from the property:\n\(r)")
+        let propObf = try firstGroup(#"var (\w+): \w+ = "#, in: r)
+        XCTAssertTrue(r.contains("else { return \(propObf)."),
+                      "the else body reads the PROPERTY, not the binding:\n\(r)")
+    }
+
+    func testWhileCaseBinding_doesNotLeakPastTheLoop() throws {
+        // `while case` binds exactly like `if case`, and its binding dies with the loop body.
+        let r = try runPipeline("""
+        struct Payload { let payloadTag: String }
+        struct Detail { let detailTag: String }
+        enum Mood { case calm(Payload), sharp }
+        final class Screen {
+            var item: Detail = Detail(detailTag: "")
+            func render(_ mood: Mood) -> String {
+                while case .calm(let item) = mood { return item.payloadTag }
+                return item.detailTag
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("payloadTag"), "the loop-body read is still typed from the payload:\n\(r)")
+        XCTAssertFalse(r.contains("detailTag"), "the read below the loop is typed from the property:\n\(r)")
+        let propObf = try firstGroup(#"var (\w+): \w+ = "#, in: r)
+        XCTAssertTrue(r.contains("return \(propObf)."),
+                      "the reference below the loop is the PROPERTY, not the binding:\n\(r)")
+    }
+
+    func testIfCaseBinding_visibleInALaterConditionOfTheSameList() throws {
+        // The anti-over-narrowing guard: a LATER condition in the same list does see the binding
+        // (swiftc compiles `if case .calm(let item) = mood, item.payloadTag == "x"`). Confining the
+        // binding to the body alone would type that read from the same-named property instead —
+        // the identical wrong rename, one position to the left.
+        let r = try runPipeline("""
+        struct Payload { let payloadTag: String }
+        struct Detail { let detailTag: String }
+        enum Mood { case calm(Payload), sharp }
+        final class Screen {
+            var item: Detail = Detail(detailTag: "")
+            func render(_ mood: Mood) -> Bool {
+                if case .calm(let item) = mood, item.payloadTag == "x" { return true }
+                return item.detailTag.isEmpty
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("payloadTag"), "the later condition still reads the BINDING:\n\(r)")
+        XCTAssertFalse(r.contains("detailTag"), "the read below the statement reads the property:\n\(r)")
+    }
+
+    func testIfCaseBinding_capturedByNestedFunctionInsideTheBody() throws {
+        // The capture exemption must survive: a nested `func` in the body sees the binding, and
+        // crossing a `.function` boundary drops the use-site offset — so the end bound must not be
+        // applied there either, or the capture resolves to the same-named property instead.
+        let r = try runPipeline("""
+        struct Payload { let payloadTag: String }
+        struct Detail { let detailTag: String }
+        enum Mood { case calm(Payload), sharp }
+        final class Screen {
+            var item: Detail = Detail(detailTag: "")
+            func render(_ mood: Mood) -> String {
+                if case .calm(let item) = mood {
+                    func inner() -> String { return item.payloadTag }
+                    return inner()
+                }
+                return item.detailTag
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("payloadTag"), "the nested function captures the BINDING:\n\(r)")
+        XCTAssertFalse(r.contains("detailTag"), "the read below the statement reads the property:\n\(r)")
+    }
+
+    func testGuardCaseBinding_stillVisibleAfterTheStatement() throws {
+        // The deliberate exception, and the thing this change must NOT break: a `guard case`
+        // binding is in scope AFTER the statement and NOT inside the `else`. It therefore carries
+        // no end bound at all, and the read below the guard is still typed from the payload while
+        // the `else` still reads the property.
+        let r = try runPipeline("""
+        struct Payload { let payloadTag: String }
+        struct Detail { let detailTag: String }
+        enum Mood { case calm(Payload), sharp }
+        final class Screen {
+            var item: Detail = Detail(detailTag: "")
+            func render(_ mood: Mood) -> String {
+                guard case .calm(let item) = mood else { return self.item.detailTag }
+                return item.payloadTag
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("payloadTag"), "the guard binding is still typed AFTER the statement:\n\(r)")
+        XCTAssertFalse(r.contains("detailTag"), "the else body still reads the property:\n\(r)")
+    }
 }

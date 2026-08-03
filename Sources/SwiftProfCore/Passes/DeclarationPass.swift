@@ -325,18 +325,25 @@ private final class DeclVisitor: SyntaxVisitor {
     /// subscript-parameter precedent): it is never renamed itself (not in `renameableParameters`),
     /// but its presence makes body references resolve to it instead of a same-named outer
     /// property/global. Skips `_` and `self`.
-    private func registerLocalBinding(_ token: TokenSyntax, type: TypeSyntax? = nil) {
-        registerLocalBinding(name: token.text, at: token, type: type)
+    /// `visibleUntil` is the EXCLUSIVE end of the binding's visibility, set only for an
+    /// `if case` / `while case` condition binding, which dies with its statement's body
+    /// (`ConditionBindingExtent`, B-FIX-42). Every other binding is visible to the end of the scope
+    /// it is registered in, and passes nil.
+    private func registerLocalBinding(_ token: TokenSyntax, type: TypeSyntax? = nil,
+                                      visibleUntil: Int? = nil) {
+        registerLocalBinding(name: token.text, at: token, type: type, visibleUntil: visibleUntil)
     }
 
-    private func registerLocalBinding(name rawName: String, at token: TokenSyntax, type: TypeSyntax? = nil) {
+    private func registerLocalBinding(name rawName: String, at token: TokenSyntax,
+                                      type: TypeSyntax? = nil, visibleUntil: Int? = nil) {
         let name = Self.stripBackticks(rawName)
         guard name != "_", name != "self" else { return }
         let sym = Symbol(
             id: mintId(), name: name, kind: .parameter,
             module: file.module, file: file, scope: currentScope,
             declOffset: token.positionAfterSkippingLeadingTrivia.utf8Offset,
-            declLength: token.trimmedLength.utf8Length
+            declLength: token.trimmedLength.utf8Length,
+            visibilityEndOffset: visibleUntil
         )
         currentScope.add(symbol: sym)
         table.register(sym)
@@ -378,11 +385,19 @@ private final class DeclVisitor: SyntaxVisitor {
     override func visitPost(_ node: CatchClauseSyntax) { pop() }
 
     /// `if case .foo(let x) = y` / `guard case` / `while case` — bindings are registered into the
-    /// CURRENT scope (no dedicated scope node). Over-broad for `guard case`'s else-body (where the
-    /// binding is not yet in scope) — a same-named property ref there resolves to the binding and
-    /// stays un-renamed → RollbackPass reverts the property (safe under-obf, never a wrong rename).
+    /// CURRENT scope, with an END offset instead of a dedicated scope node (B-FIX-42): for `if`/
+    /// `while` the binding dies with the statement's BODY, so it is invisible in the `else` and
+    /// below the statement, while a LATER CONDITION of the same list still sees it (all three
+    /// checked against swiftc). An end offset expresses that exactly; a scope node could not,
+    /// because the `else` body is a child of the same statement.
+    ///
+    /// `guard case` is the exception and keeps the old unbounded registration: its binding really
+    /// is in scope after the statement. That leaves it over-broad in the guard's own else-body,
+    /// where a same-named property ref resolves to the binding and stays un-renamed → RollbackPass
+    /// reverts the property (safe under-obf, never a wrong rename); the dangerous half, the payload
+    /// TYPE, is already withheld there by `ResolutionPass.visitPost(GuardStmtSyntax)`.
     override func visit(_ node: MatchingPatternConditionSyntax) -> SyntaxVisitorContinueKind {
-        registerCaseItemPattern(node.pattern)
+        registerCaseItemPattern(node.pattern, visibleUntil: ConditionBindingExtent.endOffset(of: node))
         return .visitChildren
     }
 
@@ -405,49 +420,55 @@ private final class DeclVisitor: SyntaxVisitor {
 
     /// Pattern in a MATCHING position (switch case item, catch item, if/guard/while-case). Only
     /// `let`/`var` subtrees bind; a bare identifier/expression matches an EXISTING value.
-    private func registerCaseItemPattern(_ pattern: PatternSyntax) {
+    ///
+    /// `visibleUntil` rides all the way down to `registerLocalBinding` because a single condition
+    /// pattern can bind several names at any nesting depth (`case .pair(let a, let b)`,
+    /// `case let .pair((a, b))`) and they ALL end with the same statement. Threading it explicitly
+    /// rather than parking it in a field keeps that visible at every hop — the switch/catch callers
+    /// pass nothing and keep the scope-wide default.
+    private func registerCaseItemPattern(_ pattern: PatternSyntax, visibleUntil: Int? = nil) {
         if let vb = pattern.as(ValueBindingPatternSyntax.self) {
-            registerBindingSubpattern(vb.pattern)
+            registerBindingSubpattern(vb.pattern, visibleUntil: visibleUntil)
         } else if let expr = pattern.as(ExpressionPatternSyntax.self) {
             // `.foo(let x)` — the bindings are PatternExprs nested inside the expression.
-            registerNestedBindings(in: expr.expression)
+            registerNestedBindings(in: expr.expression, visibleUntil: visibleUntil)
         } else if let tuple = pattern.as(TuplePatternSyntax.self) {
-            for el in tuple.elements { registerCaseItemPattern(el.pattern) }
+            for el in tuple.elements { registerCaseItemPattern(el.pattern, visibleUntil: visibleUntil) }
         }
         // (`case let x?` parses the `x?` as an ExpressionPattern — covered above.)
     }
 
     /// Everything under a `let`/`var` binds: `let x`, `let (a, b)`, `let x?`, `let .foo(a, b)`
     /// (bare refs inside the expression are the bindings).
-    private func registerBindingSubpattern(_ pattern: PatternSyntax) {
+    private func registerBindingSubpattern(_ pattern: PatternSyntax, visibleUntil: Int? = nil) {
         if let ident = pattern.as(IdentifierPatternSyntax.self) {
-            registerLocalBinding(ident.identifier)
+            registerLocalBinding(ident.identifier, visibleUntil: visibleUntil)
         } else if let tuple = pattern.as(TuplePatternSyntax.self) {
-            for el in tuple.elements { registerBindingSubpattern(el.pattern) }
+            for el in tuple.elements { registerBindingSubpattern(el.pattern, visibleUntil: visibleUntil) }
         } else if let expr = pattern.as(ExpressionPatternSyntax.self) {
-            registerBindingRefs(in: expr.expression)
+            registerBindingRefs(in: expr.expression, visibleUntil: visibleUntil)
         } else if let vb = pattern.as(ValueBindingPatternSyntax.self) {
-            registerBindingSubpattern(vb.pattern)
+            registerBindingSubpattern(vb.pattern, visibleUntil: visibleUntil)
         }
     }
 
     /// Under a `let`/`var`, `case let .foo(a, b)` binds `a`/`b`. Depending on the exact source
     /// shape the parser represents them either as nested `PatternExprSyntax` (→ IdentifierPattern)
     /// or as bare `DeclReferenceExpr`s inside the call expression. Collect BOTH.
-    private func registerBindingRefs(in expr: ExprSyntax) {
+    private func registerBindingRefs(in expr: ExprSyntax, visibleUntil: Int? = nil) {
         let collector = BindingRefCollector()
         collector.walk(expr)
-        for token in collector.found { registerLocalBinding(token) }
+        for token in collector.found { registerLocalBinding(token, visibleUntil: visibleUntil) }
         // These PatternExprs sit UNDER a `let`/`var`, so a bare identifier inside them IS a binding
         // (unlike a top-level matching position) — route through the binding path.
-        for pat in collector.foundPatterns { registerBindingSubpattern(pat) }
+        for pat in collector.foundPatterns { registerBindingSubpattern(pat, visibleUntil: visibleUntil) }
     }
 
     /// `.foo(let x)` — walk the expression for nested PatternExprs and register their bindings.
-    private func registerNestedBindings(in expr: ExprSyntax) {
+    private func registerNestedBindings(in expr: ExprSyntax, visibleUntil: Int? = nil) {
         let collector = NestedPatternCollector()
         collector.walk(expr)
-        for pat in collector.found { registerCaseItemPattern(pat) }
+        for pat in collector.found { registerCaseItemPattern(pat, visibleUntil: visibleUntil) }
     }
 
     // MARK: - Function-like declarations
