@@ -31,9 +31,33 @@ public final class Scope {
 
     /// Walk up scopes looking for a symbol with the given name.
     /// Returns first match (innermost shadows outer).
-    public func lookup(name: String) -> Symbol? {
-        for sym in symbols where sym.name == name { return sym }
-        return parent?.lookup(name: name)
+    ///
+    /// `at` is the USE-SITE byte offset, and it is what makes a local's visibility start at its
+    /// declaration rather than at the opening brace: `func f(for p2: Mode) { if … = p2 …; let p2:
+    /// Detail = … }` reads the PARAMETER on the first line and the LOCAL on the last (verified
+    /// against swiftc: the same holds for a shadowed property and a shadowed global). Only VALUE
+    /// locals of a braced block are position-sensitive; types and functions may be referenced before
+    /// they are declared, and a type/file scope has no order at all.
+    ///
+    /// Crossing a `.function` or `.type` boundary DROPS the offset, because from there the reference
+    /// is a capture, and a nested `func` legitimately captures a local declared after it
+    /// (`func outer() { func inner() { use(x) }; let x = 1; inner() }` compiles and `inner` sees the
+    /// local). Passing no offset keeps the old, order-blind behaviour for callers that resolve a
+    /// name with no use-site (a stored type string, a declaration-time lookup).
+    public func lookup(name: String, at offset: Int? = nil) -> Symbol? {
+        for sym in symbols where sym.name == name {
+            if let offset, isVisibleOnlyAfterDeclaration(sym), sym.declOffset > offset { continue }
+            return sym
+        }
+        let outer: Int? = (kind == .function || kind == .type) ? nil : offset
+        return parent?.lookup(name: name, at: outer)
+    }
+
+    /// A `let`/`var` local or a pattern binding declared in a braced block: the only declarations
+    /// Swift makes visible from their declaration onward rather than throughout their scope.
+    private func isVisibleOnlyAfterDeclaration(_ sym: Symbol) -> Bool {
+        guard kind == .block || kind == .function else { return false }
+        return sym.kind == .property || sym.kind == .parameter
     }
 
     /// Find direct child symbol by name (used for `Type.member`).

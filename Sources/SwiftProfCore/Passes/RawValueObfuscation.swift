@@ -401,7 +401,7 @@ private final class RawValueUseVisitor: SyntaxVisitor {
             var n = strip(ref.baseName.text)
             if n.hasPrefix("$") || n.hasPrefix("_") { n = String(n.dropFirst()) }
             if n == "self" || n == "Self" { return TypeResolver.enclosingTypeScope(of: currentScope)?.owner?.name }
-            if let s = currentScope.lookup(name: n) {
+            if let s = currentScope.lookup(name: n, at: ref.positionAfterSkippingLeadingTrivia.utf8Offset) {
                 return s.kind.isTypeLike ? s.name : table.declaredType[s.id]
             }
             return typeResolver.resolveType(named: n)?.name

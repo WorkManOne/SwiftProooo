@@ -404,15 +404,19 @@ private final class ResolutionVisitor: SyntaxVisitor {
         return false
     }
 
-    /// `currentScope.lookup(name:)` for a bare reference, honouring the own-initializer rule: when
-    /// the innermost match is a value local whose initializer contains `node`, resolve the name from
-    /// the local's ENCLOSING scope instead (so `count` in `let count = count + 1` reads the outer
-    /// property). Falls back to the plain match otherwise.
+    /// `currentScope.lookup(name:)` for a bare reference, at the use-site's POSITION (a local of a
+    /// braced block is visible only after its declaration, so an earlier reference reads the outer
+    /// parameter/property) and honouring the own-initializer rule: when the innermost match is a
+    /// value local whose initializer contains `node`, resolve the name from the local's ENCLOSING
+    /// scope instead (so `count` in `let count = count + 1` reads the outer property). The two rules
+    /// are complementary — the initializer sits AFTER the declaration's identifier, so position
+    /// alone never catches it.
     private func lookupOutsideOwnInitializer(name: String, at node: some SyntaxProtocol) -> Symbol? {
-        guard let sym = currentScope.lookup(name: name) else { return nil }
+        let offset = node.positionAfterSkippingLeadingTrivia.utf8Offset
+        guard let sym = currentScope.lookup(name: name, at: offset) else { return nil }
         guard Self.isValueBinding(sym.kind), let declScope = sym.scope,
               isInsideOwnInitializer(of: sym, node: node) else { return sym }
-        return declScope.parent?.lookup(name: name)
+        return declScope.parent?.lookup(name: name, at: offset)
     }
 
     /// Whether `pattern` declares an identifier at decl-offset `offset` (`let name`, or a tuple

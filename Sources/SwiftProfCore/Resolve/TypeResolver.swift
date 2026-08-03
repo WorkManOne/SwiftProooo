@@ -193,8 +193,9 @@ public final class TypeResolver {
                 return typeSymbol(forQualifiedName: t.name, in: t.scope)
             }
             // A name that IS in the scope tree but has no known type is answered, not guessed: a
-            // global type of the same name is not what a value reference denotes.
-            if scope.lookup(name: name) != nil { return nil }
+            // global type of the same name is not what a value reference denotes. Position-aware for
+            // the same reason as `bareValueTypeInfo`: a local declared LATER does not answer here.
+            if scope.lookup(name: name, at: ref.positionAfterSkippingLeadingTrivia.utf8Offset) != nil { return nil }
             if let target = preferredConcreteType(named: name) {
                 return unwrapTypealias(target, in: scope)
             }
@@ -310,7 +311,9 @@ public final class TypeResolver {
     /// `declaredType` is a written fact and outranks both inferences.
     private func bareValueTypeInfo(named name: String, from ref: DeclReferenceExprSyntax,
                                    in scope: Scope) -> (name: String, scope: Scope)? {
-        if let sym = scope.lookup(name: name) {
+        // At the reference's POSITION: a local of a braced block is visible only after its own
+        // declaration, so `p2.p3` written above `let p2: Detail = …` is typed from the PARAMETER.
+        if let sym = scope.lookup(name: name, at: ref.positionAfterSkippingLeadingTrivia.utf8Offset) {
             if sym.kind.isTypeLike { return nil }
             if let t = table.declaredType[sym.id] {
                 // The DECLARING scope, not the use-site: a bare nested type (`var p: S3` inside

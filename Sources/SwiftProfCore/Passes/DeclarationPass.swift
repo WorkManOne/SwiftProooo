@@ -231,8 +231,10 @@ private final class DeclVisitor: SyntaxVisitor {
     /// (declared first), and two sibling `if` bodies each declaring `parts` collapsed onto the first
     /// one, so the second block's use was rewritten to a name declared in the other block.
     ///
-    /// Source order within ONE block needs no modelling: Swift rejects both a redeclaration in the
-    /// same block and a use before the declaration, so the block's whole extent is the right answer.
+    /// The block is only HALF the answer: within it a local is visible from its DECLARATION onward,
+    /// not from the opening brace, so a reference above it reads the outer parameter/property
+    /// (B-FIX-40). That half lives in `Scope.lookup(name:at:)`, which is why the scope tree may stay
+    /// order-blind here.
     override func visit(_ node: CodeBlockSyntax) -> SyntaxVisitorContinueKind {
         _ = push(.block, owner: nil, node: node)
         return .visitChildren

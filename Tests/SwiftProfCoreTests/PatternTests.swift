@@ -4981,6 +4981,74 @@ final class PatternTests: XCTestCase {
         }
     }
 
+    // MARK: - A local is visible only AFTER its declaration (B-FIX-40)
+
+    func testLocalVariable_referencedBeforeItsDeclaration_readsTheParameter() throws {
+        // Same block, but the reference sits ABOVE the local: Swift reads the PARAMETER there and
+        // the local only from its declaration onward (checked against swiftc). Scoping the local to
+        // the whole block rewrote the earlier reference to the local's obf, which reads
+        // "use of local variable … before its declaration".
+        let r = try runPipeline("""
+        enum Mode { case idle }
+        struct Detail { let ribbonTag: String }
+        struct Wrapper { let detailPart: Detail, marker: String }
+        final class Runner {
+            func handle(for slot: Mode, _ wrapper: Wrapper) -> String {
+                var out = ""
+                if case .idle = slot { out = wrapper.marker }
+                let slot: Detail = wrapper.detailPart
+                return out + slot.ribbonTag
+            }
+        }
+        """)
+        let paramObf = try firstGroup(#"func \w+\(for (\w+): "#, in: r)
+        let localObf = try firstGroup(#"let (\w+): \w+ = \w+\.\w+"#, in: r)
+        XCTAssertNotEqual(paramObf, localObf, "parameter and local are distinct symbols:\n\(r)")
+        XCTAssertTrue(r.contains("= \(paramObf) {"),
+                      "the reference above the declaration is the PARAMETER:\n\(r)")
+    }
+
+    func testLocalVariable_memberAccessBeforeItsDeclaration_typedFromTheParameter() throws {
+        // The type-inference half of the same rule: the member access above the declaration must be
+        // typed from the parameter, the one below it from the local. Typing both from the local
+        // leaves the earlier member un-renamed while its declaration renames.
+        let r = try runPipeline("""
+        struct Alpha { let tagAlpha: String }
+        struct Beta { let tagBeta: String }
+        final class Runner {
+            func handle(for item: Alpha, _ other: Beta) -> String {
+                let first = item.tagAlpha
+                let item: Beta = other
+                return first + item.tagBeta
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("tagAlpha"), "the member above the declaration reads Alpha:\n\(r)")
+        XCTAssertFalse(r.contains("tagBeta"), "the member below it reads Beta:\n\(r)")
+    }
+
+    func testNestedFunction_referencesLocalDeclaredAfterIt() throws {
+        // The exemption the position rule must keep: a nested `func` CAPTURES a local declared after
+        // it, so its body reads the local, not the same-named property (verified against swiftc,
+        // which compiles this and prints the local's value). Filtering by position across the
+        // function boundary would rewrite the capture to the property's obf.
+        let r = try runPipeline("""
+        final class Holder {
+            var marker: Int = 1
+            func run() -> Int {
+                func inner() -> Int { return marker }
+                let marker: Int = 2
+                return inner() + marker
+            }
+        }
+        """)
+        let propObf = try firstGroup(#"var (\w+): Int = 1"#, in: r)
+        let localObf = try firstGroup(#"let (\w+): Int = 2"#, in: r)
+        XCTAssertNotEqual(propObf, localObf, "property and local are distinct symbols:\n\(r)")
+        XCTAssertTrue(r.contains("{ return \(localObf) }"),
+                      "the nested function captures the LOCAL declared below it:\n\(r)")
+    }
+
     func testBlockScopedLocal_doesNotShadowPropertyOutsideItsBlock() throws {
         // The flip side: a local confined to an `if` body must not capture a same-named PROPERTY
         // read after that block. Over-scoping the local would rewrite the property read to the
