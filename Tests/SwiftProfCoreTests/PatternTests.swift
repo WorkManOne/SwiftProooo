@@ -5569,4 +5569,105 @@ final class PatternTests: XCTestCase {
         XCTAssertTrue(r.contains("else { return \(localObf)."),
                       "the else body must read the LOCAL, not the binding:\n\(r)")
     }
+
+    // MARK: - A for-in loop variable dies with its loop (B-FIX-44)
+
+    func testForInLoopVariable_notVisibleBelowTheLoop_readsTheProperty() throws {
+        // The reported shape. `for row in rows { … }` binds `row` for the loop only; below it the
+        // name means the PROPERTY (checked against swiftc — the source compiles and prints the
+        // property's value). The loop variable was registered into the ENCLOSING scope, so it stayed
+        // visible after the loop: `return row` resolved to it, kept its original name while the
+        // property renamed, and rollback shield 1b (the un-renamed loop variable is a namesake)
+        // blocked the rescue ⇒ "cannot find 'row' in scope".
+        let r = try runPipeline("""
+        final class Report {
+            var row: String = ""
+            func build(_ rows: [String]) -> String {
+                for row in rows { _ = row }
+                return row
+            }
+        }
+        """)
+        let propObf = try firstGroup(#"var (\w+): String"#, in: r)
+        XCTAssertTrue(r.contains("return \(propObf)"),
+                      "the read below the loop must be the PROPERTY:\n\(r)")
+        XCTAssertTrue(r.contains("for row in"), "the loop variable itself is never renamed:\n\(r)")
+    }
+
+    func testForCaseLoopVariable_notVisibleBelowTheLoop() throws {
+        // `for case let row? in rows` registers through the other branch of the same visit
+        // (`registerCaseItemPattern`), so it needs the same scope.
+        let r = try runPipeline("""
+        final class Report {
+            var row: String = ""
+            func build(_ rows: [String?]) -> String {
+                for case let row? in rows { _ = row }
+                return row
+            }
+        }
+        """)
+        let propObf = try firstGroup(#"var (\w+): String"#, in: r)
+        XCTAssertTrue(r.contains("return \(propObf)"),
+                      "the read below a `for case` loop must be the PROPERTY:\n\(r)")
+    }
+
+    func testForInTupleLoopVariables_notVisibleBelowTheLoop() throws {
+        // And the tuple branch (`registerForInTuplePattern`), which registers one symbol per
+        // component — every branch of the visit shares the one scope.
+        let r = try runPipeline("""
+        final class Report {
+            var key: String = ""
+            var value: String = ""
+            func build(_ d: [String: String]) -> String {
+                for (key, value) in d { _ = key + value }
+                return key + value
+            }
+        }
+        """)
+        let props = try allGroups(#"var (\w+): String"#, in: r)
+        XCTAssertEqual(props.count, 2, "both properties renamed:\n\(r)")
+        XCTAssertTrue(r.contains("return \(props[0]) + \(props[1])"),
+                      "both reads below the loop must be the PROPERTIES:\n\(r)")
+    }
+
+    func testForInLoopVariable_insideTheBody_stillShadowsTheProperty() throws {
+        // The guard-rail for the fix: within the loop the variable still WINS over a same-named
+        // property, and it is still typed from the sequence element, so a member read through it
+        // follows that member's rename.
+        let r = try runPipeline("""
+        struct Row { let rowTag: String }
+        final class Report {
+            var row: String = ""
+            func build(_ rows: [Row]) -> String {
+                var out = ""
+                for row in rows { out += row.rowTag }
+                return out + self.row
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("rowTag"), "the member read through the loop variable renames:\n\(r)")
+        XCTAssertTrue(r.contains("+= row."), "the loop variable stays original in the body:\n\(r)")
+        let propObf = try firstGroup(#"var (\w+): String"#, in: r)
+        XCTAssertTrue(r.contains("self.\(propObf)"), "the read below the loop is the PROPERTY:\n\(r)")
+    }
+
+    func testForInLoopVariable_visibleInItsWhereClause() throws {
+        // The anti-over-narrowing guard, and the reason the scope hangs off the STATEMENT rather
+        // than off its body: a `where` clause sits outside the braces, and the loop variable is in
+        // scope there (`for row in rows where !row.rowTag.isEmpty` compiles).
+        let r = try runPipeline("""
+        struct Row { let rowTag: String }
+        final class Report {
+            var row: String = ""
+            func build(_ rows: [Row]) -> Int {
+                var n = 0
+                for row in rows where !row.rowTag.isEmpty { n += 1 }
+                return n
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("rowTag"), "the where-clause member read renames:\n\(r)")
+        XCTAssertTrue(r.contains("where !row."),
+                      "the where clause must read the LOOP VARIABLE, not the property:\n\(r)")
+    }
 }

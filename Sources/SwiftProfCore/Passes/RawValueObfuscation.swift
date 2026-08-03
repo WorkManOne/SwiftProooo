@@ -350,6 +350,8 @@ private final class RawValueUseVisitor: SyntaxVisitor {
     override func visitPost(_ n: ActorDeclSyntax) { exit(n) }
     override func visit(_ n: CodeBlockSyntax) -> SyntaxVisitorContinueKind { enter(n); return .visitChildren }
     override func visitPost(_ n: CodeBlockSyntax) { exit(n) }
+    override func visit(_ n: ForStmtSyntax) -> SyntaxVisitorContinueKind { enter(n); return .visitChildren }
+    override func visitPost(_ n: ForStmtSyntax) { exit(n) }
 
     override func visit(_ node: MemberAccessExprSyntax) -> SyntaxVisitorContinueKind {
         guard strip(node.declName.baseName.text) == "rawValue", let base = node.base else {

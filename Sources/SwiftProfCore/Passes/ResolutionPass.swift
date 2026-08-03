@@ -699,6 +699,10 @@ private final class ResolutionVisitor: SyntaxVisitor {
     override func visitPost(_ node: SwitchCaseSyntax) { exitInnerScope(of: node) }
     override func visit(_ node: CatchClauseSyntax) -> SyntaxVisitorContinueKind { enterInnerScope(of: node); return .visitChildren }
     override func visitPost(_ node: CatchClauseSyntax) { exitInnerScope(of: node) }
+    // The loop VARIABLE's scope — the statement, not the body, since it is declared before the brace
+    // and is also in scope in the `where` clause (B-FIX-44).
+    override func visit(_ node: ForStmtSyntax) -> SyntaxVisitorContinueKind { enterInnerScope(of: node); return .visitChildren }
+    override func visitPost(_ node: ForStmtSyntax) { exitInnerScope(of: node) }
 
     // MARK: - Function calls (handles memberwise-init argument labels)
 

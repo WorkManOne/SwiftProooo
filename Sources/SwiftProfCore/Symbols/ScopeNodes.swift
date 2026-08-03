@@ -19,7 +19,8 @@ public enum ScopeNodes {
         .classDecl, .structDecl, .actorDecl, .enumDecl, .protocolDecl, .extensionDecl,
         // Function scopes (the PARAMETERS live here; the body is a nested block)
         .functionDecl, .initializerDecl, .subscriptDecl,
-        // Block scopes
-        .closureExpr, .switchCase, .catchClause, .codeBlock,
+        // Block scopes. `forStmt` holds the LOOP VARIABLE, which is declared outside the body and
+        // must die with the loop — the body's own `codeBlock` is nested inside it.
+        .closureExpr, .switchCase, .catchClause, .codeBlock, .forStmt,
     ]
 }

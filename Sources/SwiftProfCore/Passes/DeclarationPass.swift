@@ -679,7 +679,17 @@ private final class DeclVisitor: SyntaxVisitor {
     /// TypeInferencePass can deduce x's type from seq's element type later. Tuple patterns
     /// (`for (k, v) in dict`) and `for case`-patterns register their bindings too (untyped,
     /// shadow-correctness only).
+    ///
+    /// The STATEMENT itself is the scope, not its body: a loop variable is declared before the
+    /// opening brace (and is in scope in the `where` clause, which also sits outside the body), and
+    /// it dies with the loop. Registering it into the enclosing scope instead left it visible BELOW
+    /// the loop, where `for row in rows { … }; return row` reads the same-named PROPERTY — so the
+    /// return was resolved to the un-renameable loop variable, kept its original name while the
+    /// property renamed, and shield 1b (the loop variable is an un-renamed namesake) blocked the
+    /// rollback rescue: "cannot find 'row' in scope" (B-FIX-44). The body's own `CodeBlockSyntax`
+    /// scope simply nests inside this one, so a body local still shadows the loop variable.
     override func visit(_ node: ForStmtSyntax) -> SyntaxVisitorContinueKind {
+        _ = push(.block, owner: nil, node: node)
         if let ident = node.pattern.as(IdentifierPatternSyntax.self) {
             let token = ident.identifier
             let name = token.text
@@ -711,6 +721,7 @@ private final class DeclVisitor: SyntaxVisitor {
         }
         return .visitChildren
     }
+    override func visitPost(_ node: ForStmtSyntax) { pop() }
 
     /// `for (offset, row) in rows.enumerated()` — the pattern DESTRUCTURES the element, so each name
     /// takes the component at its own position rather than the whole element (B-FIX-38). Record the
