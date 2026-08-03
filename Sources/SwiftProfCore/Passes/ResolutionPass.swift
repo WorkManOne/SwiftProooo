@@ -449,13 +449,22 @@ private final class ResolutionVisitor: SyntaxVisitor {
     /// or parameter genuinely IS invoked as `content()`, and that branch must keep working. When a
     /// callable wins, the caller's `switch` falls through to `resolveCall`, which does full
     /// label/type-aware overload resolution over the same level.
-    private func lookupCallee(named name: String) -> Symbol? {
+    ///
+    /// `at` is the use-site offset, applied through `Scope.declarations(named:visibleAt:)` so a
+    /// level counts as declaring the name only where the declaration is already VISIBLE (B-FIX-40):
+    /// a closure-typed local shadows a same-named method only from its own declaration onward, so
+    /// `let a = compute(); let compute = { … }` calls the METHOD on the first line (verified against
+    /// swiftc — it compiles and runs). Answering with the local rewrote that call to the local's obf
+    /// ⇒ "use of local variable … before its declaration".
+    private func lookupCallee(named name: String, at offset: Int? = nil) -> Symbol? {
         var s: Scope? = currentScope
+        var at = offset
         while let cur = s {
-            let level = cur.symbols.filter { $0.name == name }
+            let level = cur.declarations(named: name, visibleAt: at)
             if !level.isEmpty {
                 return Self.narrowed(level, to: .callee).first
             }
+            at = cur.offsetForParent(at)
             s = cur.parent
         }
         return nil
@@ -1158,7 +1167,8 @@ private final class ResolutionVisitor: SyntaxVisitor {
             // control falls through to resolveCall (callable-only, overload-aware). Without this,
             // `f(…)` inside `let f = … f(…) …` binds to the value local → the call is left
             // un-renamed while the method decl renames → "use of local variable before its decl".
-            if let sym = lookupCallee(named: name),
+            if let sym = lookupCallee(named: name,
+                                      at: token.positionAfterSkippingLeadingTrivia.utf8Offset),
                !(Self.isValueBinding(sym.kind) && isInsideOwnInitializer(of: sym, node: node)) {
                 switch sym.kind {
                 case .class, .struct, .enum, .protocol, .typealias_, .associatedtype_:

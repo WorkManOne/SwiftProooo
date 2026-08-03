@@ -5070,6 +5070,30 @@ final class PatternTests: XCTestCase {
                       "the shorthand binds the PARAMETER, not the local declared below it:\n\(r)")
     }
 
+    func testCall_localClosureDeclaredBelow_callsTheMethod() throws {
+        // The callee half of the same rule. A closure-typed local shadows a same-named METHOD only
+        // from its own declaration onward, so the call above it invokes the method (verified against
+        // swiftc: this compiles and prints 3). `lookupCallee` scanned the level order-blind and
+        // answered with the local ⇒ "use of local variable … before its declaration".
+        let r = try runPipeline("""
+        final class Runner {
+            func compute() -> Int { return 1 }
+            func run() -> Int {
+                let a = compute()
+                let compute = { () -> Int in 2 }
+                return a + compute()
+            }
+        }
+        """)
+        let methodObf = try firstGroup(#"func (\w+)\(\) -> Int \{ return 1 \}"#, in: r)
+        let localObf = try firstGroup(#"let (\w+) = \{ \(\) -> Int in 2 \}"#, in: r)
+        XCTAssertNotEqual(methodObf, localObf, "method and local are distinct symbols:\n\(r)")
+        XCTAssertTrue(r.contains("let \(try firstGroup(#"let (\w+) = \w+\(\)"#, in: r)) = \(methodObf)()"),
+                      "the call above the local's declaration invokes the METHOD:\n\(r)")
+        XCTAssertTrue(r.contains("return \(try firstGroup(#"let (\w+) = \w+\(\)"#, in: r)) + \(localObf)()"),
+                      "the call below it invokes the LOCAL closure:\n\(r)")
+    }
+
     func testBlockScopedLocal_doesNotShadowPropertyOutsideItsBlock() throws {
         // The flip side: a local confined to an `if` body must not capture a same-named PROPERTY
         // read after that block. Over-scoping the local would rewrite the property read to the

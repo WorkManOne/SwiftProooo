@@ -45,12 +45,27 @@ public final class Scope {
     /// local). Passing no offset keeps the old, order-blind behaviour for callers that resolve a
     /// name with no use-site (a stored type string, a declaration-time lookup).
     public func lookup(name: String, at offset: Int? = nil) -> Symbol? {
-        for sym in symbols where sym.name == name {
-            if let offset, isVisibleOnlyAfterDeclaration(sym), sym.declOffset > offset { continue }
-            return sym
+        if let sym = declarations(named: name, visibleAt: offset).first { return sym }
+        return parent?.lookup(name: name, at: offsetForParent(offset))
+    }
+
+    /// THIS scope's declarations of `name` that are visible at use-site `offset` — the position rule
+    /// of `lookup(name:at:)` for callers that walk the chain themselves (`ResolutionVisitor
+    /// .lookupCallee`, which stops at the innermost LEVEL declaring the name and narrows by kind).
+    /// Such a caller must ask this, not `symbols`: a level whose only declaration is not yet visible
+    /// has not declared the name at that position, and the walk has to continue outward.
+    public func declarations(named name: String, visibleAt offset: Int?) -> [Symbol] {
+        symbols.filter { sym in
+            guard sym.name == name else { return false }
+            guard let offset, isVisibleOnlyAfterDeclaration(sym) else { return true }
+            return sym.declOffset <= offset
         }
-        let outer: Int? = (kind == .function || kind == .type) ? nil : offset
-        return parent?.lookup(name: name, at: outer)
+    }
+
+    /// The offset to carry into the PARENT scope: nil past a `.function`/`.type` boundary, where the
+    /// reference becomes a capture and the position rule no longer applies (see `lookup`).
+    public func offsetForParent(_ offset: Int?) -> Int? {
+        (kind == .function || kind == .type) ? nil : offset
     }
 
     /// A `let`/`var` local or a pattern binding declared in a braced block: the only declarations
