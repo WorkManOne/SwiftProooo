@@ -55,20 +55,59 @@ public final class Scope {
     /// Such a caller must ask this, not `symbols`: a level whose only declaration is not yet visible
     /// has not declared the name at that position, and the walk has to continue outward.
     ///
-    /// Two independent bounds, and both need the use-site offset. The START (`declOffset`) applies
-    /// only to a braced block's value locals — types and functions may be referenced before they are
-    /// declared (B-FIX-40). The END (`visibilityEndOffset`) is carried by the symbol itself and
-    /// applies wherever it is set, because the only symbols that set it are condition bindings,
-    /// whose visibility genuinely stops mid-scope (B-FIX-42) — it is not a property of the scope
-    /// kind, so it must not be filtered through `isVisibleOnlyAfterDeclaration`.
+    /// Two independent visibility rules, and both need the use-site offset.
+    ///
+    /// A CONDITION BINDING (`sym.conditionBinding` — an `if`/`while`/`guard case` binding, which
+    /// `DeclarationPass` flattens into the enclosing scope) carries its own complete REGION and is
+    /// answered entirely by it: from its own declaration, to `end` where it has one, minus the
+    /// `hole` a `guard`'s else body punches in the middle (B-FIX-42). That start is unconditional
+    /// rather than routed through `isVisibleOnlyAfterDeclaration`, because it is not a property of
+    /// the scope kind — the binding is not really a declaration of this scope at all, so it must
+    /// start at its own declaration even in a `.file` scope, which is otherwise order-blind.
+    ///
+    /// Every OTHER declaration follows B-FIX-40: the START (`declOffset`) applies only to a braced
+    /// block's value locals, since types and functions may be referenced before they are declared —
+    /// and at file scope nothing is order-bound, because a top-level value is a global that really
+    /// is forward-referenceable (checked against swiftc: `print(later); let later = 5` in
+    /// `main.swift` compiles AND runs, printing the zero value).
+    ///
+    /// The result is in SHADOWING order — see `shadowingOrder`, which is what makes `lookup`'s
+    /// `.first` mean "the declaration in effect here" rather than "the earliest in the file".
     public func declarations(named name: String, visibleAt offset: Int?) -> [Symbol] {
-        symbols.filter { sym in
+        let visible = symbols.filter { sym in
             guard sym.name == name else { return false }
             guard let offset else { return true }
-            if let end = sym.visibilityEndOffset, offset >= end { return false }
+            if let region = sym.conditionBinding {
+                guard sym.declOffset <= offset else { return false }
+                if let end = region.end, offset >= end { return false }
+                if let hole = region.hole, hole.contains(offset) { return false }
+                return true
+            }
             guard isVisibleOnlyAfterDeclaration(sym) else { return true }
             return sym.declOffset <= offset
         }
+        return Self.shadowingOrder(visible)
+    }
+
+    /// Order visible declarations of one name INNERMOST first, so a `.first` pick is the one in
+    /// effect at the use-site.
+    ///
+    /// One scope holds two visible declarations of a name only because a condition binding was
+    /// flattened into it (B-FIX-42) — Swift itself rejects a redeclaration, and an overload set is
+    /// narrowed by kind and signature downstream, never by this order. Where that happens the
+    /// binding is the lexically NESTED one and shadows the scope's own declaration, including one
+    /// declared ABOVE it, which is legal Swift: `let item = Detail(); if case .calm(let item) = mood
+    /// { item.payloadTag }` compiles, and the body reads the BINDING. Source order answered with the
+    /// enclosing declaration instead, so the binding never won anywhere — a wrong rename no safety
+    /// net catches, since nothing of the original name survives (B-FIX-43).
+    ///
+    /// Only condition bindings are reordered, and only against non-bindings; among themselves the
+    /// most recently declared wins (two sibling `guard case`s binding one name). Everything else
+    /// keeps source order, so no overload set and no cross-file unified type scope is disturbed.
+    private static func shadowingOrder(_ visible: [Symbol]) -> [Symbol] {
+        guard visible.contains(where: { $0.conditionBinding != nil }) else { return visible }
+        return visible.filter { $0.conditionBinding != nil }.sorted { $0.declOffset > $1.declOffset }
+            + visible.filter { $0.conditionBinding == nil }
     }
 
     /// The offset to carry into the PARENT scope: nil past a `.function`/`.type` boundary, where the

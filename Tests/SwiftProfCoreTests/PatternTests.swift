@@ -5436,4 +5436,137 @@ final class PatternTests: XCTestCase {
         XCTAssertFalse(r.contains("payloadTag"), "the guard binding is still typed AFTER the statement:\n\(r)")
         XCTAssertFalse(r.contains("detailTag"), "the else body still reads the property:\n\(r)")
     }
+
+    // MARK: - A condition binding shadows a same-named declaration of the scope it lands in (B-FIX-43)
+
+    func testIfCaseBinding_shadowsASameNamedLocalOfTheSameScope() throws {
+        // The reported shape. B-FIX-42 registers a condition binding into the ENCLOSING scope, so
+        // when that scope already declares the name the two sit side by side — and
+        // `Scope.declarations(named:visibleAt:)` returned them in SOURCE order for a `.first` pick,
+        // which is the LOCAL. The binding then never won anywhere and the in-body read was rewritten
+        // to the local's obf. Swift says the later declaration shadows (checked against swiftc: the
+        // shape compiles, and the binding is the one the body reads).
+        let r = try runPipeline("""
+        struct Payload { let payloadTag: String }
+        struct Detail { let detailTag: String }
+        enum Mood { case calm(Payload), sharp }
+        final class Screen {
+            func render(_ mood: Mood) -> String {
+                let item = Detail(detailTag: "")
+                if case .calm(let item) = mood { return item.payloadTag }
+                return item.detailTag
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("payloadTag"), "the in-body read is typed from the LOCAL, not the binding:\n\(r)")
+        XCTAssertFalse(r.contains("detailTag"), "the read below the statement is not typed from the local:\n\(r)")
+        let localObf = try firstGroup(#"let (\w+) = \w+\("#, in: r)
+        XCTAssertTrue(r.contains("{ return item."),
+                      "the in-body read must be the BINDING (never renamed), not the local:\n\(r)")
+        XCTAssertTrue(r.contains("return \(localObf)."),
+                      "the read below the statement must still be the LOCAL:\n\(r)")
+    }
+
+    func testIfCaseBinding_atFileScope_shadowsASameNamedTopLevelLocal() throws {
+        // Same root one scope out: top-level code puts the local and the binding in one `.file`
+        // scope. Green-but-wrong when both types share the member name — the original prints the
+        // payload's value and the obfuscated one the top-level local's.
+        let r = try runPipeline("""
+        struct Payload { let payloadTag: String }
+        struct Detail { let detailTag: String }
+        enum Mood { case calm(Payload), sharp }
+        let item = Detail(detailTag: "DETAIL")
+        let mood = Mood.calm(Payload(payloadTag: "PAYLOAD"))
+        if case .calm(let item) = mood { print(item.payloadTag) }
+        print(item.detailTag)
+        """, file: "main.swift")
+        XCTAssertFalse(r.contains("payloadTag"), "the in-body read is typed from the top-level local:\n\(r)")
+        XCTAssertFalse(r.contains("detailTag"), "the read below the statement is not typed from the local:\n\(r)")
+        XCTAssertTrue(r.contains("{ print(item."),
+                      "the in-body read must be the BINDING, not the top-level local:\n\(r)")
+    }
+
+    func testIfCaseBinding_atFileScope_notVisibleAboveItsOwnStatement() throws {
+        // The anti-over-shadowing guard for the START bound, which a `.file` scope gets ONLY because
+        // the binding carries it itself: a file scope is otherwise order-blind, and rightly so — a
+        // top-level value is a global that really is forward-referenceable (swiftc: `print(later);
+        // let later = 5` in main.swift compiles and runs). Without the binding's own start, the
+        // shadowing order would hand the read ABOVE the statement to the binding.
+        let r = try runPipeline("""
+        struct Payload { let payloadTag: String }
+        struct Detail { let detailTag: String }
+        enum Mood { case calm(Payload), sharp }
+        let item = Detail(detailTag: "DETAIL")
+        let mood = Mood.calm(Payload(payloadTag: "PAYLOAD"))
+        print(item.detailTag)
+        if case .calm(let item) = mood { print(item.payloadTag) }
+        """, file: "main.swift")
+        XCTAssertFalse(r.contains("detailTag"), "the read above the statement is not typed from the local:\n\(r)")
+        let localObf = try firstGroup(#"let (\w+) = \w+\("#, in: r)
+        XCTAssertTrue(r.contains("print(\(localObf)."),
+                      "the read above the statement must be the top-level LOCAL, not the binding:\n\(r)")
+    }
+
+    func testWhileCaseBinding_shadowsASameNamedLocalOfTheSameScope() throws {
+        // `while case` binds exactly like `if case`, so it shadows the same way.
+        let r = try runPipeline("""
+        struct Payload { let payloadTag: String }
+        struct Detail { let detailTag: String }
+        enum Mood { case calm(Payload), sharp }
+        final class Screen {
+            func render(_ mood: Mood) -> String {
+                let item = Detail(detailTag: "")
+                while case .calm(let item) = mood { return item.payloadTag }
+                return item.detailTag
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("payloadTag"), "the in-loop read is typed from the LOCAL, not the binding:\n\(r)")
+        XCTAssertTrue(r.contains("{ return item."),
+                      "the in-loop read must be the BINDING, not the local:\n\(r)")
+    }
+
+    func testGuardCaseBinding_shadowsASameNamedLocalBelowTheStatement() throws {
+        // A `guard case` binding outlives its statement, so below it the binding — not the
+        // same-named local declared above — is what the name means (checked against swiftc: reaching
+        // for a payload member through the local there is "value of type 'Detail' has no member").
+        let r = try runPipeline("""
+        struct Payload { let payloadTag: String }
+        struct Detail { let detailTag: String }
+        enum Mood { case calm(Payload), sharp }
+        final class Screen {
+            func render(_ mood: Mood) -> String {
+                let item = Detail(detailTag: "")
+                guard case .calm(let item) = mood else { return "" }
+                return item.payloadTag
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("payloadTag"), "the read below the guard is typed from the LOCAL:\n\(r)")
+        XCTAssertTrue(r.contains("return item."),
+                      "the read below the guard must be the BINDING, not the local:\n\(r)")
+    }
+
+    func testGuardCaseBinding_doesNotShadowInsideItsOwnElseBody() throws {
+        // The anti-over-shadowing guard, and the half the shadowing order must NOT swallow: inside
+        // the guard's own `else` the binding is not in scope yet, so the name still means the LOCAL
+        // declared above (checked against swiftc: `item.detailTag` there compiles, `item.payloadTag`
+        // does not).
+        let r = try runPipeline("""
+        struct Payload { let payloadTag: String }
+        struct Detail { let detailTag: String }
+        enum Mood { case calm(Payload), sharp }
+        final class Screen {
+            func render(_ mood: Mood) -> String {
+                let item = Detail(detailTag: "")
+                guard case .calm(let item) = mood else { return item.detailTag }
+                return item.payloadTag
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("detailTag"), "the else-body read is not typed from the local:\n\(r)")
+        let localObf = try firstGroup(#"let (\w+) = \w+\("#, in: r)
+        XCTAssertTrue(r.contains("else { return \(localObf)."),
+                      "the else body must read the LOCAL, not the binding:\n\(r)")
+    }
 }

@@ -325,17 +325,20 @@ private final class DeclVisitor: SyntaxVisitor {
     /// subscript-parameter precedent): it is never renamed itself (not in `renameableParameters`),
     /// but its presence makes body references resolve to it instead of a same-named outer
     /// property/global. Skips `_` and `self`.
-    /// `visibleUntil` is the EXCLUSIVE end of the binding's visibility, set only for an
-    /// `if case` / `while case` condition binding, which dies with its statement's body
-    /// (`ConditionBindingExtent`, B-FIX-42). Every other binding is visible to the end of the scope
-    /// it is registered in, and passes nil.
+    /// `visibleIn` is the REGION the binding is visible in, set only for an `if`/`while`/`guard
+    /// case` CONDITION binding, which is registered into the ENCLOSING scope and so needs one
+    /// (`ConditionBindingExtent`, B-FIX-42): an `if`/`while` binding dies with its statement's body,
+    /// a `guard`'s outlives the statement but is absent from its own `else`. Carrying it also marks
+    /// the symbol as lexically nested in that scope, which is what lets it SHADOW a same-named
+    /// declaration of the scope itself (B-FIX-43). Every other binding is visible to the end of the
+    /// scope it is registered in, and passes nil.
     private func registerLocalBinding(_ token: TokenSyntax, type: TypeSyntax? = nil,
-                                      visibleUntil: Int? = nil) {
-        registerLocalBinding(name: token.text, at: token, type: type, visibleUntil: visibleUntil)
+                                      visibleIn: ConditionBindingExtent.Visibility? = nil) {
+        registerLocalBinding(name: token.text, at: token, type: type, visibleIn: visibleIn)
     }
 
     private func registerLocalBinding(name rawName: String, at token: TokenSyntax,
-                                      type: TypeSyntax? = nil, visibleUntil: Int? = nil) {
+                                      type: TypeSyntax? = nil, visibleIn: ConditionBindingExtent.Visibility? = nil) {
         let name = Self.stripBackticks(rawName)
         guard name != "_", name != "self" else { return }
         let sym = Symbol(
@@ -343,7 +346,7 @@ private final class DeclVisitor: SyntaxVisitor {
             module: file.module, file: file, scope: currentScope,
             declOffset: token.positionAfterSkippingLeadingTrivia.utf8Offset,
             declLength: token.trimmedLength.utf8Length,
-            visibilityEndOffset: visibleUntil
+            conditionBinding: visibleIn
         )
         currentScope.add(symbol: sym)
         table.register(sym)
@@ -385,19 +388,22 @@ private final class DeclVisitor: SyntaxVisitor {
     override func visitPost(_ node: CatchClauseSyntax) { pop() }
 
     /// `if case .foo(let x) = y` / `guard case` / `while case` — bindings are registered into the
-    /// CURRENT scope, with an END offset instead of a dedicated scope node (B-FIX-42): for `if`/
-    /// `while` the binding dies with the statement's BODY, so it is invisible in the `else` and
+    /// CURRENT scope, with a visibility REGION instead of a dedicated scope node (B-FIX-42): for
+    /// `if`/`while` the binding dies with the statement's BODY, so it is invisible in the `else` and
     /// below the statement, while a LATER CONDITION of the same list still sees it (all three
-    /// checked against swiftc). An end offset expresses that exactly; a scope node could not,
-    /// because the `else` body is a child of the same statement.
+    /// checked against swiftc). A region expresses that exactly; a scope node could not, because the
+    /// `else` body is a child of the same statement.
     ///
-    /// `guard case` is the exception and keeps the old unbounded registration: its binding really
-    /// is in scope after the statement. That leaves it over-broad in the guard's own else-body,
-    /// where a same-named property ref resolves to the binding and stays un-renamed → RollbackPass
-    /// reverts the property (safe under-obf, never a wrong rename); the dangerous half, the payload
-    /// TYPE, is already withheld there by `ResolutionPass.visitPost(GuardStmtSyntax)`.
+    /// `guard case` is the shape the region (rather than a bare end) is for: its binding really is
+    /// in scope after the statement, and absent only from the guard's OWN else body — a hole in the
+    /// middle. The payload TYPE half needs no equivalent, being withheld there already by
+    /// `ResolutionPass.visitPost(GuardStmtSyntax)`.
+    ///
+    /// Landing in the enclosing scope means the binding can sit next to a same-named declaration of
+    /// that scope, which it SHADOWS wherever it is visible — the ordering half of the same rule,
+    /// in `Scope.declarations(named:visibleAt:)` (B-FIX-43).
     override func visit(_ node: MatchingPatternConditionSyntax) -> SyntaxVisitorContinueKind {
-        registerCaseItemPattern(node.pattern, visibleUntil: ConditionBindingExtent.endOffset(of: node))
+        registerCaseItemPattern(node.pattern, visibleIn: ConditionBindingExtent.visibility(of: node))
         return .visitChildren
     }
 
@@ -421,54 +427,54 @@ private final class DeclVisitor: SyntaxVisitor {
     /// Pattern in a MATCHING position (switch case item, catch item, if/guard/while-case). Only
     /// `let`/`var` subtrees bind; a bare identifier/expression matches an EXISTING value.
     ///
-    /// `visibleUntil` rides all the way down to `registerLocalBinding` because a single condition
+    /// `visibleIn` rides all the way down to `registerLocalBinding` because a single condition
     /// pattern can bind several names at any nesting depth (`case .pair(let a, let b)`,
     /// `case let .pair((a, b))`) and they ALL end with the same statement. Threading it explicitly
     /// rather than parking it in a field keeps that visible at every hop — the switch/catch callers
     /// pass nothing and keep the scope-wide default.
-    private func registerCaseItemPattern(_ pattern: PatternSyntax, visibleUntil: Int? = nil) {
+    private func registerCaseItemPattern(_ pattern: PatternSyntax, visibleIn: ConditionBindingExtent.Visibility? = nil) {
         if let vb = pattern.as(ValueBindingPatternSyntax.self) {
-            registerBindingSubpattern(vb.pattern, visibleUntil: visibleUntil)
+            registerBindingSubpattern(vb.pattern, visibleIn: visibleIn)
         } else if let expr = pattern.as(ExpressionPatternSyntax.self) {
             // `.foo(let x)` — the bindings are PatternExprs nested inside the expression.
-            registerNestedBindings(in: expr.expression, visibleUntil: visibleUntil)
+            registerNestedBindings(in: expr.expression, visibleIn: visibleIn)
         } else if let tuple = pattern.as(TuplePatternSyntax.self) {
-            for el in tuple.elements { registerCaseItemPattern(el.pattern, visibleUntil: visibleUntil) }
+            for el in tuple.elements { registerCaseItemPattern(el.pattern, visibleIn: visibleIn) }
         }
         // (`case let x?` parses the `x?` as an ExpressionPattern — covered above.)
     }
 
     /// Everything under a `let`/`var` binds: `let x`, `let (a, b)`, `let x?`, `let .foo(a, b)`
     /// (bare refs inside the expression are the bindings).
-    private func registerBindingSubpattern(_ pattern: PatternSyntax, visibleUntil: Int? = nil) {
+    private func registerBindingSubpattern(_ pattern: PatternSyntax, visibleIn: ConditionBindingExtent.Visibility? = nil) {
         if let ident = pattern.as(IdentifierPatternSyntax.self) {
-            registerLocalBinding(ident.identifier, visibleUntil: visibleUntil)
+            registerLocalBinding(ident.identifier, visibleIn: visibleIn)
         } else if let tuple = pattern.as(TuplePatternSyntax.self) {
-            for el in tuple.elements { registerBindingSubpattern(el.pattern, visibleUntil: visibleUntil) }
+            for el in tuple.elements { registerBindingSubpattern(el.pattern, visibleIn: visibleIn) }
         } else if let expr = pattern.as(ExpressionPatternSyntax.self) {
-            registerBindingRefs(in: expr.expression, visibleUntil: visibleUntil)
+            registerBindingRefs(in: expr.expression, visibleIn: visibleIn)
         } else if let vb = pattern.as(ValueBindingPatternSyntax.self) {
-            registerBindingSubpattern(vb.pattern, visibleUntil: visibleUntil)
+            registerBindingSubpattern(vb.pattern, visibleIn: visibleIn)
         }
     }
 
     /// Under a `let`/`var`, `case let .foo(a, b)` binds `a`/`b`. Depending on the exact source
     /// shape the parser represents them either as nested `PatternExprSyntax` (→ IdentifierPattern)
     /// or as bare `DeclReferenceExpr`s inside the call expression. Collect BOTH.
-    private func registerBindingRefs(in expr: ExprSyntax, visibleUntil: Int? = nil) {
+    private func registerBindingRefs(in expr: ExprSyntax, visibleIn: ConditionBindingExtent.Visibility? = nil) {
         let collector = BindingRefCollector()
         collector.walk(expr)
-        for token in collector.found { registerLocalBinding(token, visibleUntil: visibleUntil) }
+        for token in collector.found { registerLocalBinding(token, visibleIn: visibleIn) }
         // These PatternExprs sit UNDER a `let`/`var`, so a bare identifier inside them IS a binding
         // (unlike a top-level matching position) — route through the binding path.
-        for pat in collector.foundPatterns { registerBindingSubpattern(pat, visibleUntil: visibleUntil) }
+        for pat in collector.foundPatterns { registerBindingSubpattern(pat, visibleIn: visibleIn) }
     }
 
     /// `.foo(let x)` — walk the expression for nested PatternExprs and register their bindings.
-    private func registerNestedBindings(in expr: ExprSyntax, visibleUntil: Int? = nil) {
+    private func registerNestedBindings(in expr: ExprSyntax, visibleIn: ConditionBindingExtent.Visibility? = nil) {
         let collector = NestedPatternCollector()
         collector.walk(expr)
-        for pat in collector.found { registerCaseItemPattern(pat, visibleUntil: visibleUntil) }
+        for pat in collector.found { registerCaseItemPattern(pat, visibleIn: visibleIn) }
     }
 
     // MARK: - Function-like declarations

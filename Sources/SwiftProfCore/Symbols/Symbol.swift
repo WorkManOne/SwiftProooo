@@ -33,12 +33,14 @@ public final class Symbol {
     public let declOffset: Int
     public let declLength: Int
 
-    /// EXCLUSIVE end of this symbol's visibility, for the one kind of declaration whose visibility
-    /// ends before its scope does: a binding introduced by an `if case` / `while case` condition,
-    /// which dies with the statement's body (`ConditionBindingExtent`, B-FIX-42). nil — the default
-    /// and the case for every other symbol — means "visible to the end of its scope", which is what
-    /// `declOffset` alone already expressed (B-FIX-40).
-    public let visibilityEndOffset: Int?
+    /// Set for the one kind of declaration that does not span the scope it is registered in: a
+    /// binding introduced by an `if` / `while` / `guard case` CONDITION, which `DeclarationPass`
+    /// flattens into the ENCLOSING scope rather than giving it a scope of its own (B-FIX-42). It
+    /// carries the region the binding is actually visible in, and its mere presence marks the
+    /// symbol as lexically NESTED in that scope — which is what lets it shadow the scope's own
+    /// same-named declarations (B-FIX-43). nil — the default and the case for every other symbol —
+    /// means "visible to the end of its scope", from `declOffset` onward where B-FIX-40 applies.
+    public let conditionBinding: ConditionBindingExtent.Visibility?
 
     public init(
         id: Int,
@@ -49,7 +51,7 @@ public final class Symbol {
         scope: Scope?,
         declOffset: Int,
         declLength: Int,
-        visibilityEndOffset: Int? = nil
+        conditionBinding: ConditionBindingExtent.Visibility? = nil
     ) {
         self.id = id
         self.name = name
@@ -59,6 +61,6 @@ public final class Symbol {
         self.scope = scope
         self.declOffset = declOffset
         self.declLength = declLength
-        self.visibilityEndOffset = visibilityEndOffset
+        self.conditionBinding = conditionBinding
     }
 }

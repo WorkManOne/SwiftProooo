@@ -248,7 +248,7 @@ private final class ResolutionVisitor: SyntaxVisitor {
     /// `end` is the EXCLUSIVE offset the entry stops answering at — set only for an `if case` /
     /// `while case` payload binding, which dies with its statement's body while this frame (the
     /// enclosing block's) lives on to the end of the method (B-FIX-42). It is the type half of the
-    /// same bound `Symbol.visibilityEndOffset` carries for the scope half, and both come from
+    /// same bound `Symbol.conditionBinding` carries for the scope half, and both come from
     /// `ConditionBindingExtent`. nil for every other binding.
     var shadowBindingTypeFrames: [[String: (name: String, scope: Scope, end: Int?)]] = [[:]]
     /// Token ids whose rename decision was already made by qualified-type-chain resolution
