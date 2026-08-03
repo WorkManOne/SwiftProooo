@@ -237,9 +237,58 @@ private final class DeclVisitor: SyntaxVisitor {
     /// order-blind here.
     override func visit(_ node: CodeBlockSyntax) -> SyntaxVisitorContinueKind {
         _ = push(.block, owner: nil, node: node)
+        registerAccessorValueBinding(bodyOf: node)
         return .visitChildren
     }
     override func visitPost(_ node: CodeBlockSyntax) { pop() }
+
+    /// An accessor's implicit value parameter: `set`/`willSet` (and an `init` accessor) bind
+    /// `newValue`, `didSet` binds `oldValue`, and an explicit name in parentheses (`set(incoming)`,
+    /// `didSet(previous)`) REPLACES the implicit one. Same rule and same precedent as the implicit
+    /// `error` of a bare `catch` — register a non-renameable `.parameter` so a body reference
+    /// resolves to the BINDING, never to a same-named property of the enclosing type (B-FIX-41).
+    ///
+    /// Registered into the accessor BODY's scope, which we have just pushed — the binding must not be
+    /// visible outside the braces, and an accessor body is always a `CodeBlockSyntax`, so no new scope
+    /// node (and no `ScopeNodes.kinds` / mirror edit) is needed. The anchor is the accessor keyword
+    /// (or the explicit name token), both of which precede the body, so `Scope.lookup(name:at:)`'s
+    /// position rule (B-FIX-40) sees the binding as visible throughout it.
+    ///
+    /// Only ONE name is bound per accessor: `oldValue` is not in scope in a `willSet`, nor `newValue`
+    /// in a `didSet`, so a same-named property reference there must still follow the property's rename.
+    private func registerAccessorValueBinding(bodyOf block: CodeBlockSyntax) {
+        guard let accessor = block.parent?.as(AccessorDeclSyntax.self), accessor.body == block else { return }
+        let type = Self.accessorValueType(of: accessor)
+        if let explicit = accessor.parameters?.name {
+            registerLocalBinding(explicit, type: type)
+            return
+        }
+        let implicit: String
+        switch accessor.accessorSpecifier.text {
+        case "set", "willSet", "init": implicit = "newValue"
+        case "didSet": implicit = "oldValue"
+        default: return                  // get / _read / _modify introduce no value parameter
+        }
+        registerLocalBinding(name: implicit, at: accessor.accessorSpecifier, type: type)
+    }
+
+    /// The accessor value's type: the WRITTEN annotation of the property it accesses (`var row: Row
+    /// { set { … } }`) or a subscript's written return type. Ground truth only — an inferred
+    /// property type (`var row = makeRow() { didSet { … } }`) is not known at declaration time, and
+    /// guessing one would drive a wrong rename, so it stays nil (the binding is then merely
+    /// untyped, exactly as every unregistered name is today).
+    ///
+    /// Without it the fix would COST a rename in the reported shape: with a property `var newValue:
+    /// Row` in scope, `set { … newValue.rowTag … }` used to type the receiver from that property and
+    /// rewrite `rowTag` — wrongly, but it did rewrite it. Now the binding wins the lookup, so it has
+    /// to carry the type too or the member read stays original while its declaration renames.
+    private static func accessorValueType(of accessor: AccessorDeclSyntax) -> TypeSyntax? {
+        // AccessorDecl → AccessorDeclList → AccessorBlock → PatternBinding / SubscriptDecl.
+        guard let owner = accessor.parent?.parent?.as(AccessorBlockSyntax.self)?.parent else { return nil }
+        if let binding = owner.as(PatternBindingSyntax.self) { return binding.typeAnnotation?.type }
+        if let sub = owner.as(SubscriptDeclSyntax.self) { return sub.returnClause.type }
+        return nil
+    }
 
     // MARK: - Closures (block scope)
 

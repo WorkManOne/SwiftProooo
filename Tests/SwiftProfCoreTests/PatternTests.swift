@@ -1977,6 +1977,24 @@ final class PatternTests: XCTestCase {
                        "static var is not a serialization key — must be obfuscated:\n\(r)")
     }
 
+    func testCodable_observedStoredProperty_stillProtected_andDidSetBindsOldValue() throws {
+        // `didSet`/`willSet` keep a property STORED (`isStoredBinding`), so it is still a synthesized
+        // `CodingKeys` entry and must stay protected — registering the accessor's implicit binding
+        // must not disturb that classification. Both halves asserted in one source.
+        let r = try runPipeline("""
+        struct Settings: Codable {
+            var log: Int = 0
+            var userId: Int = 0 {
+                didSet { log = oldValue }
+            }
+        }
+        """)
+        XCTAssertTrue(r.contains("var userId"),
+                      "an observed stored prop is still a JSON key — must be protected:\n\(r)")
+        XCTAssertTrue(r.contains("= oldValue"),
+                      "didSet body must read the implicit `oldValue`:\n\(r)")
+    }
+
     // MARK: - Property-wrapper projection ($x) / backing store (_x)
 
     func testPropertyWrapper_customWrapper_projectionStaysValid() throws {
@@ -2193,6 +2211,168 @@ final class PatternTests: XCTestCase {
         XCTAssertFalse(rewritten.contains("var error"), "property must stay renamed:\n\(rewritten)")
         XCTAssertTrue(rewritten.contains("_ = error"),
                       "implicit `error` ref must stay original:\n\(rewritten)")
+    }
+
+    // MARK: - Accessor implicit parameters (`newValue` / `oldValue`)
+
+    func testAccessorNewValue_inSetter_shadowsProperty_bodyRefNotRewritten() throws {
+        // `set` binds an implicit `newValue`. Without registering it the body reference walked up to
+        // the TYPE scope and found the PROPERTY `var newValue`, so the setter was rewritten to read
+        // `self.newValue` instead of the value being assigned — same type, green build, wrong storage.
+        let source = """
+        final class Config {
+            var newValue: Int = 0
+            var stored: Int = 0
+            var current: Int {
+                get { stored }
+                set { stored = newValue }
+            }
+        }
+        """
+        let rewritten = try runPipeline(source)
+        XCTAssertFalse(rewritten.contains("var newValue"), "property must stay renamed:\n\(rewritten)")
+        XCTAssertTrue(rewritten.contains("= newValue"),
+                      "setter body must read the implicit `newValue`, not the property's obf:\n\(rewritten)")
+    }
+
+    func testAccessorNewValue_inWillSet_shadowsProperty_bodyRefNotRewritten() throws {
+        let source = """
+        final class Config {
+            var newValue: Int = 0
+            var stored: Int = 0
+            var observed: Int = 0 {
+                willSet { stored = newValue }
+            }
+        }
+        """
+        let rewritten = try runPipeline(source)
+        XCTAssertFalse(rewritten.contains("var newValue"), "property must stay renamed:\n\(rewritten)")
+        XCTAssertTrue(rewritten.contains("= newValue"),
+                      "willSet body must read the implicit `newValue`:\n\(rewritten)")
+    }
+
+    func testAccessorOldValue_inDidSet_shadowsProperty_bodyRefNotRewritten() throws {
+        let source = """
+        final class Config {
+            var oldValue: Int = 0
+            var stored: Int = 0
+            var observed: Int = 0 {
+                didSet { stored = oldValue }
+            }
+        }
+        """
+        let rewritten = try runPipeline(source)
+        XCTAssertFalse(rewritten.contains("var oldValue"), "property must stay renamed:\n\(rewritten)")
+        XCTAssertTrue(rewritten.contains("= oldValue"),
+                      "didSet body must read the implicit `oldValue`:\n\(rewritten)")
+    }
+
+    func testAccessorExplicitParameter_shadowsProperty_bodyRefNotRewritten() throws {
+        // An explicit name in parentheses REPLACES the implicit one, and it shadows a same-named
+        // property exactly the same way.
+        let source = """
+        final class Config {
+            var incoming: Int = 0
+            var stored: Int = 0
+            var current: Int {
+                get { stored }
+                set(incoming) { stored = incoming }
+            }
+        }
+        """
+        let rewritten = try runPipeline(source)
+        XCTAssertFalse(rewritten.contains("var incoming"), "property must stay renamed:\n\(rewritten)")
+        XCTAssertTrue(rewritten.contains("set(incoming) {"),
+                      "accessor parameter decl stays original:\n\(rewritten)")
+        XCTAssertTrue(rewritten.contains("= incoming"),
+                      "setter body must read the accessor PARAMETER, not the property's obf:\n\(rewritten)")
+    }
+
+    func testAccessorImplicitName_doesNotLeakOutsideTheAccessorBody() throws {
+        // The implicit binding belongs to the accessor's body scope only: a `newValue` reference in a
+        // METHOD is the property and must follow its rename.
+        let source = """
+        final class Config {
+            var newValue: Int = 0
+            var stored: Int = 0
+            var current: Int {
+                get { stored }
+                set { stored = newValue }
+            }
+            func reset() -> Int {
+                return newValue
+            }
+        }
+        """
+        let rewritten = try runPipeline(source)
+        let propObf = try firstGroup(#"var (\w+): Int = 0"#, in: rewritten)
+        XCTAssertNotEqual(propObf, "newValue", "the property must be obfuscated:\n\(rewritten)")
+        XCTAssertTrue(rewritten.contains("return \(propObf)"),
+                      "a `newValue` read outside an accessor is the PROPERTY:\n\(rewritten)")
+        XCTAssertTrue(rewritten.contains("= newValue"),
+                      "setter body still reads the implicit `newValue`:\n\(rewritten)")
+    }
+
+    func testAccessorNewValue_memberAccess_typedFromThePropertyAnnotation() throws {
+        // The binding carries the accessed property's WRITTEN type, so a member read through it
+        // still resolves. Without it, registering the binding would COST this rename: the receiver
+        // would go untyped and `rowTag` would stay original while its declaration renames.
+        let source = """
+        struct Row {
+            var rowTag: String = ""
+        }
+        final class Config {
+            var stored: String = ""
+            var current: Row {
+                get { Row() }
+                set { stored = newValue.rowTag }
+            }
+        }
+        """
+        let rewritten = try runPipeline(source)
+        let memberObf = try firstGroup(#"var (\w+): String = ""\n\}"#, in: rewritten)
+        XCTAssertNotEqual(memberObf, "rowTag", "the member must be obfuscated:\n\(rewritten)")
+        XCTAssertTrue(rewritten.contains("newValue.\(memberObf)"),
+                      "member read through `newValue` must resolve via the property's type:\n\(rewritten)")
+    }
+
+    func testAccessorNewValue_inSubscriptSetter_typedFromTheReturnClause() throws {
+        let source = """
+        struct Row {
+            var rowTag: String = ""
+        }
+        final class Config {
+            var stored: String = ""
+            subscript(index: Int) -> Row {
+                get { Row() }
+                set { stored = newValue.rowTag }
+            }
+        }
+        """
+        let rewritten = try runPipeline(source)
+        let memberObf = try firstGroup(#"var (\w+): String = ""\n\}"#, in: rewritten)
+        XCTAssertNotEqual(memberObf, "rowTag", "the member must be obfuscated:\n\(rewritten)")
+        XCTAssertTrue(rewritten.contains("newValue.\(memberObf)"),
+                      "member read through a subscript setter's `newValue` must resolve:\n\(rewritten)")
+    }
+
+    func testAccessorWillSet_oldValueStillMeansTheProperty() throws {
+        // `willSet` binds `newValue` only — `oldValue` is NOT in scope there, so a same-named property
+        // reference must still follow the property's rename (no blanket registration of both names).
+        let source = """
+        final class Config {
+            var oldValue: Int = 0
+            var stored: Int = 0
+            var observed: Int = 0 {
+                willSet { stored = oldValue }
+            }
+        }
+        """
+        let rewritten = try runPipeline(source)
+        let propObf = try firstGroup(#"var (\w+): Int = 0\n"#, in: rewritten)
+        XCTAssertNotEqual(propObf, "oldValue", "the property must be obfuscated:\n\(rewritten)")
+        XCTAssertTrue(rewritten.contains("= \(propObf)"),
+                      "`oldValue` inside willSet is the PROPERTY, not a binding:\n\(rewritten)")
     }
 
     func testTupleDestructuring_shadowsProperty_bodyRefNotRewritten() throws {
