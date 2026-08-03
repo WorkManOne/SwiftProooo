@@ -446,7 +446,8 @@ public final class TypeResolver {
               let (call, closureArgIndex) = hofContext(of: closure) else {
             return nil
         }
-        return hofClosureParamType(call: call, closureArgIndex: closureArgIndex, paramIndex: index, in: scope)
+        return hofClosureParamType(call: call, closureArgIndex: closureArgIndex, paramIndex: index,
+                                   closureArity: Self.closureArity(of: closure), in: scope)
     }
 
     /// Resolve a named closure parameter like `arr.filter { item in item.x }` where the inner
@@ -468,12 +469,43 @@ public final class TypeResolver {
                let idx = parameterIndex(named: name, in: paramClause) {
                 // This closure introduces `name`; it can be typed only if it is a HOF argument.
                 guard let (call, closureArgIndex) = hofContext(of: closure) else { return nil }
-                return hofClosureParamType(call: call, closureArgIndex: closureArgIndex, paramIndex: idx, in: scope)
+                return hofClosureParamType(call: call, closureArgIndex: closureArgIndex, paramIndex: idx,
+                                           closureArity: Self.closureArity(of: closure), in: scope)
             }
             guard let parent = closure.parent else { return nil }
             node = parent
         }
         return nil
+    }
+
+    /// How many values `cl`'s parameter list BINDS — the number a tuple element would have to be
+    /// destructured into (B-FIX-38).
+    ///
+    /// An explicit list answers directly. An implicit one is measured by the highest `$N` the body
+    /// uses, because that is the only syntactic evidence of arity there is: `{ print($0, $1) }` over
+    /// `enumerated()` binds two values, `{ $0.element }` binds one (the whole tuple). Getting this
+    /// wrong cannot produce a wrong type — the caller destructures only when the component count
+    /// EQUALS the arity — it can only cost a rename.
+    ///
+    /// `$N` inside a NESTED closure belongs to that closure, so those are not counted.
+    static func closureArity(of cl: ClosureExprSyntax) -> Int {
+        if let params = cl.signature?.parameterClause {
+            if let list = params.as(ClosureShorthandParameterListSyntax.self) { return list.count }
+            if let list = params.as(ClosureParameterClauseSyntax.self) { return list.parameters.count }
+        }
+        var maxIndex = -1
+        func scan(_ node: Syntax) {
+            for child in node.children(viewMode: .sourceAccurate) {
+                if child.is(ClosureExprSyntax.self) { continue }   // its own `$0`
+                if let ref = child.as(DeclReferenceExprSyntax.self) {
+                    let text = ref.baseName.text
+                    if text.hasPrefix("$"), let n = Int(text.dropFirst()) { maxIndex = max(maxIndex, n) }
+                }
+                scan(child)
+            }
+        }
+        scan(Syntax(cl.statements))
+        return maxIndex + 1
     }
 
     /// Innermost `ClosureExpr` strictly enclosing `node` (nil if `node` is not inside a closure).
@@ -528,6 +560,7 @@ public final class TypeResolver {
         call: FunctionCallExprSyntax,
         closureArgIndex: Int,
         paramIndex: Int,
+        closureArity: Int,
         in scope: Scope
     ) -> (name: String, scope: Scope)? {
         // Method-style: `receiver.method(...)`
@@ -535,19 +568,29 @@ public final class TypeResolver {
            let receiver = memberCall.base {
             let methodName = Self.stripBackticks(memberCall.declName.baseName.text)
             if let sig = HOFRegistry.signature(forMethod: methodName),
-               sig.closureArgIndex == closureArgIndex,
-               paramIndex < sig.closureParamSources.count {
-                return resolveSource(sig.closureParamSources[paramIndex], call: call, receiver: receiver, in: scope)
+               sig.closureArgIndex == closureArgIndex {
+                if let t = destructuredElement(sources: sig.closureParamSources, paramIndex: paramIndex,
+                                               closureArity: closureArity, receiver: receiver, in: scope) {
+                    return t
+                }
+                if paramIndex < sig.closureParamSources.count {
+                    return resolveSource(sig.closureParamSources[paramIndex], call: call, receiver: receiver, in: scope)
+                }
             }
         }
         // Init-style: `TypeName(data, ...) { ... }`
         if let ref = call.calledExpression.as(DeclReferenceExprSyntax.self) {
             let typeName = Self.stripBackticks(ref.baseName.text)
             if let initSig = HOFRegistry.initSignature(forType: typeName, closureAt: closureArgIndex),
-               paramIndex < initSig.closureParamSources.count,
                initSig.sequenceArgIndex < call.arguments.count {
                 let arg = call.arguments[call.arguments.index(call.arguments.startIndex, offsetBy: initSig.sequenceArgIndex)]
-                return resolveSource(initSig.closureParamSources[paramIndex], call: call, receiver: arg.expression, in: scope)
+                if let t = destructuredElement(sources: initSig.closureParamSources, paramIndex: paramIndex,
+                                               closureArity: closureArity, receiver: arg.expression, in: scope) {
+                    return t
+                }
+                if paramIndex < initSig.closureParamSources.count {
+                    return resolveSource(initSig.closureParamSources[paramIndex], call: call, receiver: arg.expression, in: scope)
+                }
             }
         }
         // User-defined HOF fallback (B-FIX-2): no stdlib registry entry, but the callee is one of
@@ -572,6 +615,39 @@ public final class TypeResolver {
             return (inputs[paramIndex], callee.scope ?? scope)
         }
         return nil
+    }
+
+    /// The type of closure parameter `paramIndex` when the closure DESTRUCTURES a tuple element
+    /// (B-FIX-38): the HOF hands the closure ONE value, the closure names several, and each name
+    /// binds one component — `rows.enumerated().forEach { offset, row in … }`,
+    /// `dict.forEach { key, value in … }`.
+    ///
+    /// nil means "not a destructuring", and the caller falls back to the ordinary per-source path.
+    /// Three conditions gate it, and each one is what keeps a mis-read from becoming a wrong type:
+    ///   - the HOF supplies exactly ONE closure value (a 2-source HOF like `sorted` hands the whole
+    ///     element to BOTH parameters, which is a different shape);
+    ///   - the closure binds more than one name;
+    ///   - the element parses as a tuple of EXACTLY that many components.
+    /// Anything else keeps today's behaviour, so the worst outcome remains a missed rename.
+    private func destructuredElement(
+        sources: [HOFRegistry.HOFParamSource],
+        paramIndex: Int,
+        closureArity: Int,
+        receiver: ExprSyntax,
+        in scope: Scope
+    ) -> (name: String, scope: Scope)? {
+        guard sources.count == 1, case .element = sources[0], closureArity > 1,
+              paramIndex < closureArity else { return nil }
+        guard let info = receiverTypeInfo(of: receiver, in: scope) else { return nil }
+        // Same typealias expansion `resolveSource` does — a collection name resolves to no
+        // declaration, so an alias for one has to be followed textually.
+        let expanded = expandedTypeName(info.name, in: info.declScope)
+        // The ITERATION element, which is dictionary-aware: iterating `[K: V]` yields
+        // `(key: K, value: V)` even though subscripting it yields `V`.
+        guard let element = CollectionMemberRegistry.iterationElement(of: expanded.name),
+              let components = TupleTypeName.components(of: element),
+              components.count == closureArity else { return nil }
+        return (components[paramIndex], expanded.scope)
     }
 
     /// Resolve the callee of a function call to a unique callable Symbol by name + argument labels.
@@ -1062,15 +1138,21 @@ public final class TypeResolver {
     /// Parse a collection type string and return the element type name.
     /// Handles `[T]`, `Array<T>`, `Set<T>`, `ArraySlice<T>`, `ContiguousArray<T>`, plus
     /// `Optional<T>` / `T?` which (for HOF purposes) expose `Wrapped` as element-equivalent.
-    /// Returns nil for unrecognised forms (Dictionaries, tuples, etc).
+    /// Returns nil for unrecognised forms — Dictionaries above all, whose Element is a tuple while
+    /// their SUBSCRIPT yields the Value (`CollectionMemberRegistry.iterationElement` is the one that
+    /// answers the iteration question).
     public static func extractElement(from typeName: String) -> String? {
         var name = typeName
         while name.hasSuffix("?") || name.hasSuffix("!") {
             name = String(name.dropLast())
         }
         if name.hasPrefix("[") && name.hasSuffix("]") {
-            let inner = name.dropFirst().dropLast()
-            if inner.contains(":") { return nil }
+            let inner = String(name.dropFirst().dropLast())
+            // Only a TOP-LEVEL colon means "dictionary". A tuple element (`[(offset: Int,
+            // element: Row)]`, what `enumerated()` yields) carries its colons inside the parens, and
+            // the old unbalanced `contains(":")` rejected it — which is why a destructuring closure
+            // over `enumerated()` had no element to destructure at all (B-FIX-38).
+            if topLevelIndex(of: ":", in: inner) != nil { return nil }
             let elem = inner.trimmingCharacters(in: .whitespaces)
             return elem.isEmpty ? nil : elem
         }

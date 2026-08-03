@@ -41,6 +41,15 @@ public final class TypeInferencePass {
         // 2. For-loop variable inference: element type of the sequence.
         for sym in table.symbols where table.declaredType[sym.id] == nil {
             guard let seq = table.forLoopSequence[sym.id], let scope = sym.scope else { continue }
+            if let position = table.forLoopTuplePosition[sym.id] {
+                if let componentName = inferTupleComponentType(of: seq, position: position, in: scope) {
+                    table.declaredType[sym.id] = componentName
+                    inferred += 1
+                    logger.log("[infer-loop-tuple] \(sym.name)#\(sym.id)[\(position.index)] → \(componentName)",
+                               verbose: true)
+                }
+                continue
+            }
             if let elementName = inferElementType(of: seq, in: scope) {
                 table.declaredType[sym.id] = elementName
                 inferred += 1
@@ -74,6 +83,30 @@ public final class TypeInferencePass {
     /// - Property/var with type `Set<T>` (same)
     /// - Member access chains where the leaf has a known sequence type
     /// - Direct expression of form `[X]` (array literals — skipped for MVP)
+    /// The type of a loop variable bound at `position` of a TUPLE pattern: the sequence element's
+    /// COMPONENT at that index (B-FIX-38). `for (offset, row) in rows.enumerated()` types `row` as
+    /// the element, `offset` as `Int`.
+    ///
+    /// Fail-closed on everything it cannot read as a tuple of exactly the pattern's arity — a
+    /// destructuring we mis-count would type the binding as the WRONG component, which is a wrong
+    /// rename RollbackPass cannot catch. Refusing costs a rename instead.
+    private func inferTupleComponentType(of expr: ExprSyntax, position: (index: Int, arity: Int),
+                                         in scope: Scope) -> String? {
+        guard let leaf = leafDeclaredType(of: expr, in: scope),
+              // The ITERATION element — dictionary-aware, unlike `extractElement`: `for (k, v) in
+              // dict` destructures `(key: K, value: V)` while `dict[k]` still yields `V`.
+              let element = CollectionMemberRegistry.iterationElement(of: leaf.name),
+              let components = TupleTypeName.components(of: element),
+              components.count == position.arity, position.index < components.count else { return nil }
+        let component = components[position.index]
+        // Qualified in the scope the element name was WRITTEN in, exactly as the element path below —
+        // a bare nested name is invisible from the loop body (B-FIX-23).
+        if let sym = resolver.typeSymbol(forQualifiedName: component, in: leaf.scope) {
+            return Self.qualifiedName(of: sym)
+        }
+        return component
+    }
+
     private func inferElementType(of expr: ExprSyntax, in scope: Scope) -> String? {
         // Resolve the expression's type symbol via TypeResolver — but the sequence's type is
         // usually a generic `Array<Element>` which we DON'T capture in declaredType (we only

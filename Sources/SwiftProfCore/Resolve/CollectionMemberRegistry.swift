@@ -18,10 +18,16 @@ import Foundation
 /// member EXISTS (we only ever look up members we then find in a real scope) and it never renames a
 /// stdlib member.
 ///
-/// Deliberately EXCLUDED (their result element differs from the receiver's, or is a tuple we don't
-/// model): `map`/`compactMap`/`flatMap`/`joined`/`enumerated`/`zip`, a Dictionary's `first`/`sorted`
-/// (they yield `(key, value)`), `mapValues`. Wrong here would be a wrong rename, so absence is the
-/// safe default.
+/// Deliberately EXCLUDED (their result element differs from the receiver's in a way we don't model):
+/// `map`/`compactMap`/`flatMap`/`joined`/`zip`, a Dictionary's `first`/`sorted`, `mapValues`. Wrong
+/// here would be a wrong rename, so absence is the safe default.
+///
+/// `enumerated()` used to be excluded on the same grounds ("its element is a tuple"), and that gap
+/// is what left `rows.enumerated().forEach { i, row in row.member }` untyped (B-FIX-38). Its element
+/// IS modelled now — as the written tuple `(offset: Int, element: E)` — because a tuple name is
+/// honest information: it resolves to no declaration, so every consumer that wants a declaration
+/// still fails closed exactly as before, while the consumers that destructure it
+/// (`TupleTypeName.components`) finally get the component they need.
 enum CollectionMemberRegistry {
 
     /// The result type NAME of `receiver.member` / `receiver.member(...)`, where `receiverType` is
@@ -36,13 +42,39 @@ enum CollectionMemberRegistry {
             case "keys":   return "[\(key)]"
             case "values": return "[\(value)]"
             case "filter": return receiverType   // a Dictionary's filter keeps the dictionary type
+            case "enumerated": return "[\(enumeratedElement(of: "(key: \(key), value: \(value))"))]"
             default:       return nil
             }
         }
         guard let element = sequenceElement(of: receiverType) else { return nil }
+        if member == "enumerated" { return "[\(enumeratedElement(of: element))]" }
         if elementMembers.contains(member) { return element }
         if sameElementMembers.contains(member) { return "[\(element)]" }
         return nil
+    }
+
+    /// The element `enumerated()` yields over a sequence whose own element is `element`. Spelled with
+    /// the stdlib's own labels so a consumer that later learns tuple MEMBER access (`pair.element`)
+    /// reads them from one place.
+    private static func enumeratedElement(of element: String) -> String {
+        "(offset: Int, element: \(element))"
+    }
+
+    /// The Element a type hands to a closure or a `for` pattern when ITERATED as a Sequence: a
+    /// Dictionary yields the tuple `(key: K, value: V)`, everything else yields what
+    /// `TypeResolver.extractElement` reports (arrays, sets, and — for `Optional.map` — the Wrapped
+    /// type).
+    ///
+    /// Deliberately SEPARATE from `extractElement`, which must stay dictionary-blind: that one
+    /// answers the SUBSCRIPT question, where `dict[k]` yields `V?` and never the tuple. Iterating a
+    /// dictionary and subscripting it are different questions with different answers, and merging
+    /// them would type `dict[k].member` as a tuple — a wrong rename (B-FIX-38).
+    static func iterationElement(of typeName: String) -> String? {
+        if let key = TypeResolver.dictionaryKeyType(from: typeName),
+           let value = TypeResolver.dictionaryValueType(from: typeName) {
+            return "(key: \(key), value: \(value))"
+        }
+        return TypeResolver.extractElement(from: typeName)
     }
 
     /// Element type of an ARRAY/SET-like collection name, or nil. Narrower than

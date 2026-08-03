@@ -4761,4 +4761,132 @@ final class PatternTests: XCTestCase {
         XCTAssertTrue(a.contains("let userId: String"),
                       "extension-declared Codable is never subject to --objc-protection:\n\(a)")
     }
+
+    // MARK: - A closure's parameter LIST may destructure a tuple element (B-FIX-38)
+
+    func testEnumerated_tupleDestructuringClosure_elementMemberResolves() throws {
+        let r = try runPipeline("""
+        struct Row {
+            var flagged: Bool
+            var caption: String?
+        }
+        final class Holder {
+            private var rows: [Row] = []
+            func refresh() {
+                rows.enumerated().forEach { idx, row in
+                    guard !row.flagged else { return }
+                    rows[idx].caption = "x"
+                }
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("var flagged"), "Row.flagged must be obfuscated:\n\(r)")
+        XCTAssertFalse(r.contains("row.flagged"),
+                       "the destructured element parameter must type from enumerated()'s tuple:\n\(r)")
+    }
+
+    func testDictionary_tupleDestructuringClosure_valueMemberResolves() throws {
+        // The other stdlib source of a tuple element: a Dictionary's Element is `(key:value:)`.
+        let r = try runPipeline("""
+        struct Row { var flagged: Bool }
+        func check(_ map: [String: Row]) {
+            map.forEach { key, row in
+                _ = key
+                _ = row.flagged
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("var flagged"), "Row.flagged must be obfuscated:\n\(r)")
+        XCTAssertFalse(r.contains("row.flagged"),
+                       "the destructured value parameter must type from the dictionary's element:\n\(r)")
+    }
+
+    func testEnumerated_positionalDollarParams_elementMemberResolves() throws {
+        // An implicit parameter list destructures too. Its arity is only readable from the highest
+        // `$N` the body uses — here `$1`, so the closure binds two values and `$1` is the element.
+        let r = try runPipeline("""
+        struct Row { var flagged: Bool }
+        func check(_ rows: [Row]) {
+            rows.enumerated().forEach { _ = ($0, $1.flagged) }
+        }
+        """)
+        XCTAssertFalse(r.contains("var flagged"), "Row.flagged must be obfuscated:\n\(r)")
+        XCTAssertFalse(r.contains("$1.flagged"), "$1 must type as the tuple's element component:\n\(r)")
+    }
+
+    func testForInTuplePattern_overEnumerated_elementMemberResolves() throws {
+        // The same invariant at the OTHER binding site: a for-in tuple pattern destructures the
+        // element exactly as a closure parameter list does.
+        let r = try runPipeline("""
+        struct Row { var flagged: Bool }
+        func check(_ rows: [Row]) {
+            for (idx, row) in rows.enumerated() {
+                _ = idx
+                _ = row.flagged
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("var flagged"), "Row.flagged must be obfuscated:\n\(r)")
+        XCTAssertFalse(r.contains("row.flagged"),
+                       "the for-in tuple binding must type from enumerated()'s tuple:\n\(r)")
+    }
+
+    func testForInTuplePattern_overDictionary_valueMemberResolves() throws {
+        let r = try runPipeline("""
+        struct Row { var flagged: Bool }
+        func check(_ map: [String: Row]) {
+            for (key, row) in map {
+                _ = key
+                _ = row.flagged
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("var flagged"), "Row.flagged must be obfuscated:\n\(r)")
+        XCTAssertFalse(r.contains("row.flagged"),
+                       "the for-in tuple binding must type from the dictionary's element:\n\(r)")
+    }
+
+    func testForInTuplePattern_wildcardComponent_keepsPositions() throws {
+        // `_` binds no symbol but still OCCUPIES a position, so the surviving name must take the
+        // component at its own index rather than sliding down to index 0.
+        let r = try runPipeline("""
+        struct Row { var flagged: Bool }
+        func check(_ rows: [Row]) {
+            for (_, row) in rows.enumerated() {
+                _ = row.flagged
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("var flagged"), "Row.flagged must be obfuscated:\n\(r)")
+        XCTAssertFalse(r.contains("row.flagged"), "the named component must keep its position:\n\(r)")
+    }
+
+    func testForInTuplePattern_arityMismatch_staysUnresolved() throws {
+        // Fail-closed guard: the pattern's arity must EQUAL the tuple's component count. A plain
+        // (non-tuple) element under a tuple pattern must type nothing rather than guess a component.
+        let r = try runPipeline("""
+        struct Row { var flagged: Bool }
+        func check(_ rows: [Row]) {
+            for (a, b) in rows.enumerated().enumerated() {
+                _ = a
+                _ = b
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("var flagged"), "Row.flagged is unused here, so it still renames:\n\(r)")
+    }
+
+    func testDictionarySubscript_stillYieldsValueNotTuple() throws {
+        // Iterating a dictionary and subscripting it are different questions: `map[k]` is the VALUE,
+        // never the `(key:value:)` element. Guards the split between `iterationElement` and
+        // `extractElement` — merging them would type `map[k].member` as a tuple (a wrong rename).
+        let r = try runPipeline("""
+        struct Row { var flagged: Bool }
+        func check(_ map: [String: Row]) {
+            _ = map["a"]?.flagged
+        }
+        """)
+        XCTAssertFalse(r.contains("var flagged"), "Row.flagged must be obfuscated:\n\(r)")
+        XCTAssertFalse(r.contains("?.flagged"), "the dictionary subscript must still yield the Value:\n\(r)")
+    }
 }

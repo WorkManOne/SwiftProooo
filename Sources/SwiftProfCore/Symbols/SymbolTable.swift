@@ -49,6 +49,11 @@ public final class SymbolTable {
     /// For-loop sequence expressions, by loop-variable symbol id. The variable's type is the
     /// sequence's Element type — inferred when that information is available.
     public internal(set) var forLoopSequence: [Int: ExprSyntax] = [:]
+    /// For a loop variable bound by a TUPLE pattern (`for (offset, row) in rows.enumerated()`), its
+    /// position in that pattern and the pattern's total arity. The variable's type is then the
+    /// element's COMPONENT at `index`, not the element itself (B-FIX-38) — and the arity is what
+    /// lets the consumer refuse to destructure anything that is not a tuple of exactly that size.
+    public internal(set) var forLoopTuplePosition: [Int: (index: Int, arity: Int)] = [:]
     /// IDs of method/property symbols declared with the `override` modifier. OverrideLinker unifies
     /// each override's obf with the base member it overrides — without it, the base and the override
     /// get INDEPENDENT obfs and Swift reports "method/property does not override any … from its

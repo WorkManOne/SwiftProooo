@@ -600,10 +600,41 @@ private final class DeclVisitor: SyntaxVisitor {
             }
         } else if node.caseKeyword != nil {
             registerCaseItemPattern(node.pattern)
+        } else if let tuple = node.pattern.as(TuplePatternSyntax.self), node.typeAnnotation == nil {
+            registerForInTuplePattern(tuple, sequence: node.sequence)
         } else {
             registerDeclarationPattern(node.pattern)
         }
         return .visitChildren
+    }
+
+    /// `for (offset, row) in rows.enumerated()` — the pattern DESTRUCTURES the element, so each name
+    /// takes the component at its own position rather than the whole element (B-FIX-38). Record the
+    /// sequence AND the position; TypeInferencePass resolves the pair once the table is complete.
+    ///
+    /// Only a flat list of plain identifiers and wildcards is handled — a nested tuple or a
+    /// sub-pattern falls back to the untyped registration below, which is what every element of this
+    /// pattern used to get. A `_` binds nothing but still OCCUPIES a position, so it is counted:
+    /// `for (_, row) in rows.enumerated()` must take component 1, not component 0.
+    private func registerForInTuplePattern(_ tuple: TuplePatternSyntax, sequence: ExprSyntax) {
+        let elements = Array(tuple.elements)
+        func isFlat(_ p: PatternSyntax) -> Bool {
+            p.is(IdentifierPatternSyntax.self) || p.is(WildcardPatternSyntax.self)
+        }
+        guard elements.count > 1, elements.allSatisfy({ isFlat($0.pattern) }) else {
+            registerDeclarationPattern(PatternSyntax(tuple))
+            return
+        }
+        for (index, element) in elements.enumerated() {
+            guard let ident = element.pattern.as(IdentifierPatternSyntax.self) else { continue }
+            registerLocalBinding(ident.identifier)
+            // `registerLocalBinding` skips `_`/`self`; only a symbol it actually created can be typed.
+            guard let sym = currentScope.symbols.last,
+                  sym.declOffset == ident.identifier.positionAfterSkippingLeadingTrivia.utf8Offset
+            else { continue }
+            table.forLoopSequence[sym.id] = sequence
+            table.forLoopTuplePosition[sym.id] = (index: index, arity: elements.count)
+        }
     }
 
     /// Cheap initializer-based type inference. Handles `let x = Foo()` and `let x = Foo.init()`.
