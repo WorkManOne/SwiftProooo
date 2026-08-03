@@ -5670,4 +5670,208 @@ final class PatternTests: XCTestCase {
         XCTAssertTrue(r.contains("where !row."),
                       "the where clause must read the LOOP VARIABLE, not the property:\n\(r)")
     }
+
+    // MARK: - B-FIX-45: an `if let` / `while let` binding ends with its statement's body
+
+    func testOptionalBinding_ifLet_doesNotLeakPastTheStatement() throws {
+        // The reported shape. `shadowFrames` is keyed by NAME with no extent, and the frame the
+        // binding lands in is the ENCLOSING block's (the condition is visited before the body's
+        // scope is entered), so `value` stayed "a local" for the rest of the method and the read
+        // below the statement was skipped entirely instead of following the renamed property.
+        let r = try runPipeline("""
+        final class Store {
+            var slotTag: Int = 7
+            func pick(_ maybe: Int?) -> Int {
+                if let slotTag = maybe { return slotTag }
+                return slotTag
+            }
+        }
+        """)
+        let propObf = try firstGroup(#"var (\w+): Int = 7"#, in: r)
+        XCTAssertTrue(r.contains("if let slotTag = "), "the binding itself is never renamed:\n\(r)")
+        XCTAssertTrue(r.contains("{ return slotTag }"), "the in-body read is the BINDING:\n\(r)")
+        XCTAssertTrue(r.contains("return \(propObf)\n"),
+                      "the read below the statement is the PROPERTY:\n\(r)")
+    }
+
+    func testOptionalBinding_ifLet_doesNotLeakIntoTheElseBody() throws {
+        // The other half of the statement: inside the `else` the binding is not in scope, so the
+        // name reads the same-named property (checked against swiftc — it prints the property).
+        let r = try runPipeline("""
+        final class Store {
+            var elseTag: Int = 13
+            func pick(_ maybe: Int?) -> Int {
+                if let elseTag = maybe { return elseTag } else { return elseTag }
+            }
+        }
+        """)
+        let propObf = try firstGroup(#"var (\w+): Int = 13"#, in: r)
+        XCTAssertTrue(r.contains("{ return elseTag } else { return \(propObf) }"),
+                      "the then-body reads the BINDING and the else body the PROPERTY:\n\(r)")
+    }
+
+    func testOptionalBinding_whileLet_doesNotLeakPastTheLoop() throws {
+        // `while let` binds exactly like `if let`, and its binding dies with the loop body.
+        let r = try runPipeline("""
+        final class Store {
+            var loopTag: Int = 17
+            func drain(_ items: inout [Int]) -> Int {
+                while let loopTag = items.popLast() { _ = loopTag }
+                return loopTag
+            }
+        }
+        """)
+        let propObf = try firstGroup(#"var (\w+): Int = 17"#, in: r)
+        XCTAssertTrue(r.contains("{ _ = loopTag }"), "the in-body read is the BINDING:\n\(r)")
+        XCTAssertTrue(r.contains("return \(propObf)\n"),
+                      "the read below the loop is the PROPERTY:\n\(r)")
+    }
+
+    func testOptionalBinding_ifLet_memberAccessBelowTheStatement_readsTheProperty() throws {
+        // The member-access form of the same leak: the BASE below the statement was treated as the
+        // still-live binding and left original, while the property's declaration renamed ⇒
+        // "cannot find 'item' in scope". Binding and property share a type here so the member half
+        // is not in play — this test is about the base.
+        let r = try runPipeline("""
+        struct Detail { let detailTag: String }
+        final class Screen {
+            var item: Detail = Detail(detailTag: "")
+            func render(_ maybe: Detail?) -> String {
+                if let item = maybe { return item.detailTag }
+                return item.detailTag
+            }
+        }
+        """)
+        let propObf = try firstGroup(#"var (\w+): \w+ = "#, in: r)
+        XCTAssertFalse(r.contains("detailTag"), "the member renames in both positions:\n\(r)")
+        XCTAssertTrue(r.contains("{ return item."), "the in-body base is the BINDING:\n\(r)")
+        XCTAssertTrue(r.contains("return \(propObf)."),
+                      "the base below the statement is the PROPERTY:\n\(r)")
+    }
+
+    func testOptionalBinding_ifLet_insideTheBody_stillShadowsTheProperty() throws {
+        // The anti-over-narrowing guard, and the DANGEROUS direction: if the binding stopped
+        // covering its own body, the in-body read would resolve to the same-named property and be
+        // rewritten to its obf — a silent read of the wrong storage that no safety net sees.
+        let r = try runPipeline("""
+        final class Store {
+            var bodyTag: String = "PROPERTY"
+            func pick(_ maybe: String?) -> String {
+                if let bodyTag = maybe { return bodyTag }
+                return "fallback"
+            }
+        }
+        """)
+        let propObf = try firstGroup(#"var (\w+): String = "#, in: r)
+        XCTAssertTrue(r.contains("{ return bodyTag }"), "the in-body read is the BINDING:\n\(r)")
+        XCTAssertFalse(r.contains("return \(propObf) }"),
+                       "the in-body read must NOT be rewritten to the property's obf:\n\(r)")
+    }
+
+    func testOptionalBinding_ifLet_visibleInALaterConditionOfTheSameList() throws {
+        // A LATER condition of the same list does see the binding (`if let x = m, x > 3` compiles),
+        // so ending the region at the body's START would be the identical wrong rename one
+        // position to the left.
+        let r = try runPipeline("""
+        final class Store {
+            var chainTag: Int = 19
+            func pick(_ maybe: Int?) -> Int {
+                if let chainTag = maybe, chainTag > 3 { return chainTag }
+                return chainTag
+            }
+        }
+        """)
+        let propObf = try firstGroup(#"var (\w+): Int = 19"#, in: r)
+        XCTAssertTrue(r.contains(", chainTag > 3"), "the later condition reads the BINDING:\n\(r)")
+        XCTAssertTrue(r.contains("return \(propObf)\n"),
+                      "the read below the statement is the PROPERTY:\n\(r)")
+    }
+
+    func testOptionalBinding_ifLet_capturedByNestedFunctionInsideTheBody() throws {
+        // A nested `func` in the body captures the binding (swiftc agrees), and its body sits
+        // textually inside the region, so the end bound must not cut it off.
+        let r = try runPipeline("""
+        final class Store {
+            var captureTag: Int = 31
+            func pick(_ maybe: Int?) -> Int {
+                if let captureTag = maybe {
+                    func inner() -> Int { return captureTag }
+                    return inner()
+                }
+                return captureTag
+            }
+        }
+        """)
+        let propObf = try firstGroup(#"var (\w+): Int = 31"#, in: r)
+        XCTAssertTrue(r.contains("{ return captureTag }"),
+                      "the nested function captures the BINDING:\n\(r)")
+        XCTAssertTrue(r.contains("return \(propObf)\n"),
+                      "the read below the statement is the PROPERTY:\n\(r)")
+    }
+
+    func testOptionalBinding_guardLet_stillVisibleAfterTheStatement() throws {
+        // The deliberate exception this change must not break: a `guard let` binding IS in scope
+        // after its statement, so it carries no end at all.
+        let r = try runPipeline("""
+        final class Store {
+            var guardTag: Int = 23
+            func pick(_ maybe: Int?) -> Int {
+                guard let guardTag = maybe else { return 0 }
+                return guardTag
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("var guardTag"), "the property still renames:\n\(r)")
+        XCTAssertTrue(r.contains("return guardTag\n"),
+                      "the read below the guard is still the BINDING:\n\(r)")
+    }
+
+    func testOptionalBinding_ifLetInsideAGuardLetOfTheSameName_guardBindingSurvivesBelow() throws {
+        // Two bindings of one name land in the SAME frame, so an entry per name is not enough:
+        // replacing the guard's unbounded entry with the `if let`'s bounded one would leave the
+        // name unbound below the statement, and the read there would follow the PROPERTY instead
+        // of the still-live guard binding.
+        let r = try runPipeline("""
+        final class Store {
+            var tag: Int = 41
+            func pick(_ a: Int?, _ b: Int?) -> Int {
+                guard let tag = a else { return 0 }
+                if let tag = b { return tag }
+                return tag
+            }
+        }
+        """)
+        let propObf = try firstGroup(#"var (\w+): Int = 41"#, in: r)
+        XCTAssertTrue(r.contains("{ return tag }"), "the if body reads the INNER binding:\n\(r)")
+        XCTAssertTrue(r.contains("return tag\n"),
+                      "below the statement the name is still the GUARD binding:\n\(r)")
+        XCTAssertFalse(r.contains("return \(propObf)\n"),
+                       "the read below must not follow the property:\n\(r)")
+    }
+
+    func testOptionalBinding_ifLetInsideAGuardLetOfTheSameName_guardBindingTypeSurvivesBelow() throws {
+        // The TYPE half of the same shape. Both entries live in one frame: inside the `if` body
+        // the newest live one (the `if let`, a Payload) answers, below the statement it has
+        // expired and the guard's (a Detail) answers again. Both types declare `hold`, so getting
+        // this wrong is a wrong rename rather than a missed one.
+        let r = try runPipeline("""
+        struct Payload { let hold: String }
+        struct Detail { let hold: String }
+        final class Screen {
+            func makeDetail() -> Detail? { return nil }
+            func makePayload() -> Payload? { return nil }
+            func render() -> String {
+                guard let box = makeDetail() else { return "" }
+                if let box = makePayload() { return box.hold }
+                return box.hold
+            }
+        }
+        """)
+        let holds = try allGroups(#"let (\w+): String"#, in: r)
+        XCTAssertEqual(holds.count, 2, "both `hold` declarations rename distinctly:\n\(r)")
+        XCTAssertTrue(r.contains("{ return box.\(holds[0]) }"),
+                      "the in-body read is typed from the `if let` binding (Payload):\n\(r)")
+        XCTAssertTrue(r.contains("return box.\(holds[1])\n"),
+                      "the read below is typed from the still-live guard binding (Detail):\n\(r)")
+    }
 }

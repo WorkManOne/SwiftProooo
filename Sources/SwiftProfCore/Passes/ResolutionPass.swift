@@ -230,8 +230,14 @@ private final class ResolutionVisitor: SyntaxVisitor {
     /// are currently in lexical scope. Such a name shadows any same-named property/global —
     /// references to it must NOT be renamed to the shadowed declaration's obf. Flow-sensitive:
     /// a binding is added only AFTER its initializer has been visited (so `guard let x = x`
-    /// correctly resolves the RHS to the outer `x`). Frames align with function/closure scopes.
-    var shadowFrames: [Set<String>] = [[]]
+    /// correctly resolves the RHS to the outer `x`).
+    ///
+    /// A frame is pushed per SCOPE NODE — every kind in `ScopeNodes.kinds`, so since B-FIX-39 that
+    /// includes every braced block, not just functions and closures. That is exactly why an entry
+    /// needs an end: an `if let` condition is visited BEFORE the body's block scope is entered, so
+    /// its binding lands in the ENCLOSING frame and would otherwise outlive the statement
+    /// (B-FIX-45). See `BindingFrames` for the rule.
+    var shadowFrames = BindingFrames<Void>()
     /// Parallel to `shadowFrames`: the STATIC TYPE of each in-scope binding, keyed by bound name. An
     /// `if let u = makeURL()` binding carries no `declaredType` (it's not a declared symbol), so a
     /// call `c.f(u)` had no way to disambiguate overloads. Recording the binding's type here lets
@@ -245,12 +251,13 @@ private final class ResolutionVisitor: SyntaxVisitor {
     /// initializer (resolves in the type's DECLARING scope — a nested `Row` is invisible from the
     /// use-site). Re-resolving a bare name at the use-site is the B-FIX-23 defect.
     ///
-    /// `end` is the EXCLUSIVE offset the entry stops answering at — set only for an `if case` /
-    /// `while case` payload binding, which dies with its statement's body while this frame (the
-    /// enclosing block's) lives on to the end of the method (B-FIX-42). It is the type half of the
+    /// Each entry stops answering at the EXCLUSIVE offset it was bound `until` — the statement
+    /// body's end for an `if case`/`while case` payload binding (B-FIX-42) and for an `if let` /
+    /// `while let` optional binding (B-FIX-45), both of which die with their statement while this
+    /// frame (the enclosing block's) lives on to the end of the method. It is the type half of the
     /// same bound `Symbol.conditionBinding` carries for the scope half, and both come from
-    /// `ConditionBindingExtent`. nil for every other binding.
-    var shadowBindingTypeFrames: [[String: (name: String, scope: Scope, end: Int?)]] = [[:]]
+    /// `ConditionBindingExtent`. nil for a `guard`, whose binding genuinely outlives its statement.
+    var shadowBindingTypeFrames = BindingFrames<(name: String, scope: Scope)>()
     /// Token ids whose rename decision was already made by qualified-type-chain resolution
     /// (`A.B.C`). Set by the outermost MemberType node; consulted by the inner MemberType nodes
     /// and the root IdentifierType so they do NOT independently rename a partial root match
@@ -382,9 +389,13 @@ private final class ResolutionVisitor: SyntaxVisitor {
 
     /// True if `name` is shadowed by an in-scope optional binding (so it's a local, not a
     /// reference to the same-named declaration we may have renamed).
-    private func isLocallyShadowed(_ name: String) -> Bool {
-        for frame in shadowFrames where frame.contains(name) { return true }
-        return false
+    ///
+    /// `at` is the USE-SITE offset, and an `if let` / `while let` binding stops answering at the
+    /// end of its statement's body (B-FIX-45): without it the name stayed "a local" for the rest
+    /// of the enclosing block, so the read BELOW the statement — which is the same-named property —
+    /// was skipped entirely while that property's declaration renamed.
+    private func isLocallyShadowed(_ name: String, at offset: Int?) -> Bool {
+        shadowFrames.isBound(name, at: offset)
     }
 
     /// Swift scoping invariant: a `let`/`var` local is NOT in scope within its OWN initializer.
@@ -483,37 +494,32 @@ private final class ResolutionVisitor: SyntaxVisitor {
     private func enterInnerScope(of node: some SyntaxProtocol) {
         if let s = table.innerScope[node.id] {
             scopeStack.append(s)
-            shadowFrames.append([])   // new lexical frame for bindings
-            shadowBindingTypeFrames.append([:])
+            shadowFrames.push()   // new lexical frame for bindings
+            shadowBindingTypeFrames.push()
         }
     }
     private func exitInnerScope(of node: some SyntaxProtocol) {
         if table.innerScope[node.id] != nil {
             scopeStack.removeLast()
-            shadowFrames.removeLast()
-            shadowBindingTypeFrames.removeLast()
+            shadowFrames.pop()
+            shadowBindingTypeFrames.pop()
         }
     }
 
     /// The static type of an in-scope binding named `name`, if recorded: the type NAME plus the scope
     /// that name resolves in. Searches frames innermost-out (mirrors `shadowFrames`).
     ///
-    /// `at` is the use-site offset, and an entry that carries an `end` stops answering there — the
-    /// frame outlives the `if case` that recorded it, so without this the payload type still typed
-    /// the same-named outer symbol below the statement (B-FIX-42). A caller with no use-site passes
-    /// nothing and keeps the old, position-blind answer.
+    /// `at` is the use-site offset, and an entry that ends stops answering there — the frame
+    /// outlives the `if case` / `if let` that recorded it, so without this the binding's type still
+    /// typed the same-named outer symbol below the statement (B-FIX-42, B-FIX-45). A caller with no
+    /// use-site passes nothing and keeps the old, position-blind answer.
     ///
-    /// An expired entry does not end the search, it is SKIPPED: the name is simply not bound by that
-    /// frame at this position, so an outer frame's still-live binding of the same name is the right
-    /// answer (a `guard case` binding an inner `if case` shadowed for the length of its body). Same
-    /// rule `Scope.declarations(named:visibleAt:)` applies to the scope chain.
+    /// An expired entry does not end the search, it is SKIPPED: the name is simply not bound by
+    /// that entry at this position, so an earlier still-live binding of the same name is the right
+    /// answer (a `guard` binding that an inner `if let` shadowed for the length of its body). Same
+    /// rule `Scope.declarations(named:visibleAt:)` applies to the scope chain — see `BindingFrames`.
     private func shadowBindingType(_ name: String, at offset: Int?) -> (name: String, scope: Scope)? {
-        for frame in shadowBindingTypeFrames.reversed() {
-            guard let t = frame[name] else { continue }
-            if let offset, let end = t.end, offset >= end { continue }
-            return (t.name, t.scope)
-        }
-        return nil
+        shadowBindingTypeFrames.newest(name, at: offset)
     }
 
     /// Type the bindings of an enum-case pattern (`case .run(let m)`, `case let .run(m)`) from the
@@ -543,8 +549,7 @@ private final class ResolutionVisitor: SyntaxVisitor {
     /// own scope, the latter's binding genuinely outlives its statement.
     private func recordEnumPayloadBindingTypes(pattern: PatternSyntax, matching subject: ExprSyntax,
                                                visibleUntil: Int? = nil) {
-        guard !shadowBindingTypeFrames.isEmpty,
-              let enumSym = typeResolver.typeSymbol(of: subject, in: currentScope),
+        guard let enumSym = typeResolver.typeSymbol(of: subject, in: currentScope),
               enumSym.kind == .enum,
               let enumScope = innerScope(of: enumSym),
               let (caseName, bindings) = Self.enumPatternBindings(of: pattern),
@@ -559,8 +564,8 @@ private final class ResolutionVisitor: SyntaxVisitor {
             // hoping the qualified form resolves from wherever it is read (B-FIX-35).
             let resolved = typeResolver.typeSymbol(forQualifiedName: type, in: caseScope)
             let info = resolved.map { ($0.name, $0.scope ?? caseScope) } ?? (type, caseScope)
-            shadowBindingTypeFrames[shadowBindingTypeFrames.count - 1][binding] =
-                (name: info.0, scope: info.1, end: visibleUntil)
+            shadowBindingTypeFrames.bind(binding, until: visibleUntil,
+                                         (name: info.0, scope: info.1))
         }
     }
 
@@ -597,13 +602,15 @@ private final class ResolutionVisitor: SyntaxVisitor {
     /// Record an optional binding's type into the current frame (best-effort; nil results skipped).
     /// The ONE place a `let`/`var` optional binding gets a type — every entry form (`if let`,
     /// `while let`, `guard let`) routes here so the annotation rule cannot be forgotten at one of them.
+    ///
+    /// `until` is where the binding stops being visible, from `ConditionBindingExtent`: the end of
+    /// the statement's body for `if let`/`while let`, nil for a `guard let` (B-FIX-45). It is the
+    /// same bound `shadowFrames` gets for the same binding — the two must agree or one half keeps
+    /// answering for a name the other has already released.
     private func recordShadowBindingType(name: String, annotation: TypeAnnotationSyntax?,
-                                         initializer: ExprSyntax) {
-        guard !shadowBindingTypeFrames.isEmpty,
-              let info = bindingType(annotation: annotation, initializer: initializer) else { return }
-        // No end bound: an optional binding's frame extent is its own (separate) question.
-        shadowBindingTypeFrames[shadowBindingTypeFrames.count - 1][name] =
-            (name: info.name, scope: info.scope, end: nil)
+                                         initializer: ExprSyntax, until: Int?) {
+        guard let info = bindingType(annotation: annotation, initializer: initializer) else { return }
+        shadowBindingTypeFrames.bind(name, until: until, (name: info.name, scope: info.scope))
     }
 
     /// The static type of a binding, as a (name, resolving-scope) pair.
@@ -816,8 +823,11 @@ private final class ResolutionVisitor: SyntaxVisitor {
     }
 
     /// After an optional binding's initializer has been resolved, the bound name becomes a
-    /// LOCAL that shadows any same-named declaration for the rest of the lexical scope.
-    /// Record it so subsequent references resolve to the local (and stay un-renamed).
+    /// LOCAL that shadows any same-named declaration — until the end of the statement's BODY, which
+    /// is where an `if let` / `while let` binding stops (B-FIX-45; `guard let` is the exception and
+    /// is handled in `visitPost(GuardStmtSyntax)`). Record it so subsequent references inside that
+    /// region resolve to the local (and stay un-renamed) while a read below the statement follows
+    /// the same-named declaration again.
     /// Only for the EXPLICIT form (`guard let X = expr`); the shorthand form is rewritten above
     /// and intentionally renamed instead.
     override func visitPost(_ node: OptionalBindingConditionSyntax) {
@@ -830,12 +840,14 @@ private final class ResolutionVisitor: SyntaxVisitor {
         // scope`. Defer guard bindings to visitPost(GuardStmt), which runs after the else body.
         if isInGuardCondition(node) { return }
         let name = stripBackticks(ident.identifier.text)
-        if !shadowFrames.isEmpty {
-            shadowFrames[shadowFrames.count - 1].insert(name)
-        }
+        // The same region for both halves — the statement's body, from the one helper the `if case`
+        // family already answers with. The frame this lands in is the ENCLOSING block's, so without
+        // the bound the binding outlives its statement by the whole method.
+        let until = ConditionBindingExtent.endOffset(of: node)
+        shadowFrames.bind(name, until: until)
         if let initializer = node.initializer {
             recordShadowBindingType(name: name, annotation: node.typeAnnotation,
-                                    initializer: initializer.value)
+                                    initializer: initializer.value, until: until)
         }
     }
 
@@ -844,7 +856,6 @@ private final class ResolutionVisitor: SyntaxVisitor {
     /// Guard bindings come into scope only AFTER the whole guard statement. Register them now
     /// (the `else` body has already been visited with the outer meaning of these names intact).
     override func visitPost(_ node: GuardStmtSyntax) {
-        guard !shadowFrames.isEmpty else { return }
         for cond in node.conditions {
             // `guard case .run(let m) = c else { … }` — the payload binding, deferred here for the
             // same reason: inside the `else` body `m` is NOT in scope, so a same-named property
@@ -859,9 +870,12 @@ private final class ResolutionVisitor: SyntaxVisitor {
                   let initializer = binding.initializer,
                   let ident = binding.pattern.as(IdentifierPatternSyntax.self) else { continue }
             let name = stripBackticks(ident.identifier.text)
-            shadowFrames[shadowFrames.count - 1].insert(name)
+            // No end: a `guard let` binding genuinely outlives its statement, and its one gap (the
+            // guard's own `else` body) is already excluded by recording here, after that body has
+            // been visited.
+            shadowFrames.bind(name, until: nil)
             recordShadowBindingType(name: name, annotation: binding.typeAnnotation,
-                                    initializer: initializer.value)
+                                    initializer: initializer.value, until: nil)
         }
     }
 
@@ -1196,8 +1210,12 @@ private final class ResolutionVisitor: SyntaxVisitor {
         // self/Self/super/etc — skip.
         if NamePool.swiftKeywords.contains(name) { return .skipChildren }
         // Local optional-binding shadow (`guard let x = x; ... x ...`) — `x` here is the local,
-        // not the same-named property we may have renamed. Leave it untouched.
-        if isLocallyShadowed(name) { return .skipChildren }
+        // not the same-named property we may have renamed. Leave it untouched. At the use-site's
+        // POSITION: an `if let x` binding is gone below its statement, where `x` is the property
+        // again (B-FIX-45).
+        if isLocallyShadowed(name, at: token.positionAfterSkippingLeadingTrivia.utf8Offset) {
+            return .skipChildren
+        }
 
         // Callee of a function call `name(args)`.
         if let call = node.parent?.as(FunctionCallExprSyntax.self),
@@ -1913,7 +1931,9 @@ private final class ResolutionVisitor: SyntaxVisitor {
                 // (the nested, lexically-nearest type), NOT some other module's same-named type.
                 // Only when no lexical type is visible do we fall back to the global,
                 // module-aware table. (Skip if the name is a shadowed local — that's a value.)
-                if !isLocallyShadowed(baseName) {
+                if !isLocallyShadowed(
+                       baseName,
+                       at: baseRef.baseName.positionAfterSkippingLeadingTrivia.utf8Offset) {
                     let baseTypeSym: Symbol? = {
                         if let s = currentScope.lookup(name: baseName), s.kind.isTypeLike { return s }
                         return lookupType(named: baseName)
