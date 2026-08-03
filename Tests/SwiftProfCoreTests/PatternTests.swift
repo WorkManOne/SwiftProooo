@@ -498,6 +498,15 @@ final class PatternTests: XCTestCase {
         return ns.substring(with: m.range(at: 1))
     }
 
+    /// Every capture-group-1 match, in source order (for patterns that legitimately occur twice,
+    /// e.g. the same local name declared in two sibling blocks).
+    private func allGroups(_ pattern: String, in text: String) throws -> [String] {
+        let re = try NSRegularExpression(pattern: pattern)
+        let ns = text as NSString
+        return re.matches(in: text, range: NSRange(location: 0, length: ns.length))
+            .map { ns.substring(with: $0.range(at: 1)) }
+    }
+
     // MARK: - Extension owner resolves module-aware (not registration-order `.first`)
 
     func testExtensionOwner_bindsToLocalModuleType_notForeignSameName() throws {
@@ -4888,5 +4897,109 @@ final class PatternTests: XCTestCase {
         """)
         XCTAssertFalse(r.contains("var flagged"), "Row.flagged must be obfuscated:\n\(r)")
         XCTAssertFalse(r.contains("?.flagged"), "the dictionary subscript must still yield the Value:\n\(r)")
+    }
+
+    // MARK: - A braced block is a lexical scope (B-FIX-39)
+
+    func testLocalVariable_shadowsParameter_memberResolvesToLocalsType() throws {
+        // A body local may shadow a PARAMETER of the same name (different scopes: parameters sit
+        // outside the body's braces). Registering both in one flat function scope made
+        // `Scope.lookup` hand back the first-in-order symbol — the parameter — so `slot.ribbonTag`
+        // was typed as the parameter's `Mode` and the member never resolved.
+        let r = try runPipeline("""
+        enum Mode { case idle }
+        struct Detail { let ribbonTag: String }
+        struct Wrapper { let detailPart: Detail }
+        final class Runner {
+            func handle(for slot: Mode, _ wrapper: Wrapper) -> String {
+                let slot: Detail = wrapper.detailPart
+                return slot.ribbonTag
+            }
+        }
+        """)
+        let memberObf = try firstGroup(#"let (\w+): String"#, in: r)
+        XCTAssertNotEqual(memberObf, "ribbonTag", "Detail.ribbonTag must be obfuscated:\n\(r)")
+        let localObf = try firstGroup(#"let (\w+): \w+ = \w+\.\w+"#, in: r)
+        XCTAssertTrue(r.contains("return \(localObf).\(memberObf)"),
+                      "the member read must resolve through the LOCAL's type, not the parameter's:\n\(r)")
+    }
+
+    func testBlockScopedLocals_siblingBlocks_eachUseResolvesToItsOwnLocal() throws {
+        // Two `if` bodies each declaring `parts`: legal Swift, two distinct locals. Without a scope
+        // per braced block both landed in the function scope, and every use resolved to the FIRST
+        // one — the second block's use was rewritten to a name declared in the other block
+        // ("cannot find … in scope"), a wrong rename RollbackPass cannot see.
+        let r = try runPipeline("""
+        final class Reporter {
+            func build(_ flag: Bool) -> String {
+                var out = ""
+                if flag {
+                    let parts: [String] = ["a"]
+                    out = parts.joined(separator: "-")
+                }
+                if !flag {
+                    let parts: [String] = ["b"]
+                    out = parts.joined(separator: "+")
+                }
+                return out
+            }
+        }
+        """)
+        let declared = try allGroups(#"let (\w+): \[String\]"#, in: r)
+        XCTAssertEqual(declared.count, 2, "both locals must still be declared:\n\(r)")
+        XCTAssertEqual(Set(declared).count, 2, "the two locals are distinct symbols:\n\(r)")
+        for obf in declared {
+            XCTAssertTrue(r.contains("\(obf).joined"),
+                          "each block's use must resolve to the local declared in THAT block:\n\(r)")
+        }
+    }
+
+    func testBlockScopedLocals_loopAndDoBodies_areSeparateScopes() throws {
+        // Same invariant through the other braced statement bodies (`for` and `do`), which are the
+        // forms a real method mixes with `if`.
+        let r = try runPipeline("""
+        final class Walker {
+            func run(_ rows: [Int]) -> Int {
+                var total = 0
+                for row in rows {
+                    let step: Int = row * 2
+                    total += step
+                }
+                do {
+                    let step: Int = 7
+                    total += step
+                }
+                return total
+            }
+        }
+        """)
+        let declared = try allGroups(#"let (\w+): Int"#, in: r)
+        XCTAssertEqual(Set(declared).count, 2, "the loop body and the do body declare distinct locals:\n\(r)")
+        for obf in declared {
+            XCTAssertTrue(r.contains("+= \(obf)"),
+                          "each body's use must resolve to its own local:\n\(r)")
+        }
+    }
+
+    func testBlockScopedLocal_doesNotShadowPropertyOutsideItsBlock() throws {
+        // The flip side: a local confined to an `if` body must not capture a same-named PROPERTY
+        // read after that block. Over-scoping the local would rewrite the property read to the
+        // local's obf — a silent wrong-storage read.
+        let r = try runPipeline("""
+        final class Holder {
+            var marker: Int = 1
+            func run(_ flag: Bool) -> Int {
+                if flag {
+                    let marker: Int = 2
+                    _ = marker
+                }
+                return marker
+            }
+        }
+        """)
+        let propObf = try firstGroup(#"var (\w+): Int = 1"#, in: r)
+        XCTAssertNotEqual(propObf, "marker", "the property must be obfuscated:\n\(r)")
+        XCTAssertTrue(r.contains("return \(propObf)"),
+                      "the read after the block is the PROPERTY, not the block-local:\n\(r)")
     }
 }

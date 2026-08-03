@@ -338,6 +338,18 @@ private final class RawValueUseVisitor: SyntaxVisitor {
     override func visitPost(_ n: InitializerDeclSyntax) { exit(n) }
     override func visit(_ n: ClosureExprSyntax) -> SyntaxVisitorContinueKind { enter(n); return .visitChildren }
     override func visitPost(_ n: ClosureExprSyntax) { exit(n) }
+    // The remaining block scopes (`ScopeNodes.kinds`). A mirror that skips one resolves a base
+    // declared under it against an outer same-named symbol instead of the local binding.
+    override func visit(_ n: SwitchCaseSyntax) -> SyntaxVisitorContinueKind { enter(n); return .visitChildren }
+    override func visitPost(_ n: SwitchCaseSyntax) { exit(n) }
+    override func visit(_ n: CatchClauseSyntax) -> SyntaxVisitorContinueKind { enter(n); return .visitChildren }
+    override func visitPost(_ n: CatchClauseSyntax) { exit(n) }
+    override func visit(_ n: SubscriptDeclSyntax) -> SyntaxVisitorContinueKind { enter(n); return .visitChildren }
+    override func visitPost(_ n: SubscriptDeclSyntax) { exit(n) }
+    override func visit(_ n: ActorDeclSyntax) -> SyntaxVisitorContinueKind { enter(n); return .visitChildren }
+    override func visitPost(_ n: ActorDeclSyntax) { exit(n) }
+    override func visit(_ n: CodeBlockSyntax) -> SyntaxVisitorContinueKind { enter(n); return .visitChildren }
+    override func visitPost(_ n: CodeBlockSyntax) { exit(n) }
 
     override func visit(_ node: MemberAccessExprSyntax) -> SyntaxVisitorContinueKind {
         guard strip(node.declName.baseName.text) == "rawValue", let base = node.base else {

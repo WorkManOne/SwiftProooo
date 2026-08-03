@@ -643,6 +643,10 @@ private final class ResolutionVisitor: SyntaxVisitor {
     override func visitPost(_ node: SubscriptDeclSyntax) { exitInnerScope(of: node) }
     override func visit(_ node: ClosureExprSyntax) -> SyntaxVisitorContinueKind { enterInnerScope(of: node); return .visitChildren }
     override func visitPost(_ node: ClosureExprSyntax) { exitInnerScope(of: node) }
+    // A braced block is a scope (statement bodies, accessor bodies, a function's own body). Missing
+    // it made every local of a method resolve against the flat function scope — see `ScopeNodes`.
+    override func visit(_ node: CodeBlockSyntax) -> SyntaxVisitorContinueKind { enterInnerScope(of: node); return .visitChildren }
+    override func visitPost(_ node: CodeBlockSyntax) { exitInnerScope(of: node) }
     override func visit(_ node: SwitchCaseSyntax) -> SyntaxVisitorContinueKind {
         enterInnerScope(of: node)
         recordEnumPayloadBindingTypes(of: node)

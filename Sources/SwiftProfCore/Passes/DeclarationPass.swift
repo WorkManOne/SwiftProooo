@@ -71,6 +71,10 @@ private final class DeclVisitor: SyntaxVisitor {
     private var currentScope: Scope { scopeStack.last! }
 
     private func push(_ kind: ScopeKind, owner: Symbol? = nil, node: some SyntaxProtocol) -> Scope {
+        // Every scope node must be listed in `ScopeNodes.kinds`, whose doc names the passes that
+        // mirror this tree — a mirror missing a kind resolves use-sites under it to outer symbols.
+        assert(ScopeNodes.kinds.contains(node.kind),
+               "scope attached to \(node.kind), which is not in ScopeNodes.kinds; mirrors will drift")
         let s = Scope(kind: kind, parent: currentScope)
         s.owner = owner
         currentScope.add(child: s)
@@ -212,6 +216,28 @@ private final class DeclVisitor: SyntaxVisitor {
         return nil
     }
     override func visitPost(_ node: ExtensionDeclSyntax) { pop() }
+
+    // MARK: - Braced blocks (block scope)
+
+    /// A braced block is a lexical scope of its own, and a local declared in it is visible only
+    /// inside it. This covers every statement body (`if` / `else` / `for` / `while` / `repeat` /
+    /// `do` / `guard`'s else), accessor bodies, and — the load-bearing one — a function's OWN body,
+    /// whose parent is the function scope holding the PARAMETERS.
+    ///
+    /// Without it every local of a method landed in one flat function scope, where
+    /// `Scope.lookup(name:)` answers with the first declaration in SOURCE order. Two consequences,
+    /// both wrong renames that RollbackPass cannot see (no original name survives):
+    /// `func f(for slot: Mode) { let slot: Detail = …; slot.tag }` resolved `slot` to the PARAMETER
+    /// (declared first), and two sibling `if` bodies each declaring `parts` collapsed onto the first
+    /// one, so the second block's use was rewritten to a name declared in the other block.
+    ///
+    /// Source order within ONE block needs no modelling: Swift rejects both a redeclaration in the
+    /// same block and a use before the declaration, so the block's whole extent is the right answer.
+    override func visit(_ node: CodeBlockSyntax) -> SyntaxVisitorContinueKind {
+        _ = push(.block, owner: nil, node: node)
+        return .visitChildren
+    }
+    override func visitPost(_ node: CodeBlockSyntax) { pop() }
 
     // MARK: - Closures (block scope)
 
