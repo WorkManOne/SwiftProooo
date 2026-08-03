@@ -5049,6 +5049,27 @@ final class PatternTests: XCTestCase {
                       "the nested function captures the LOCAL declared below it:\n\(r)")
     }
 
+    func testIfLetShorthand_localDeclaredBelow_expandsToTheParameter() throws {
+        // The shorthand `if let X` has to find the symbol X shadows in order to expand into
+        // `if let <obf> = <obf>`. Looking it up WITHOUT the use-site offset answered with the local
+        // declared BELOW the `if`, so the expansion read `if let <local> = <local>` ⇒ "use of local
+        // variable … before its declaration". The shadowed symbol here is the PARAMETER.
+        let r = try runPipeline("""
+        final class Runner {
+            func handle(_ marker: Int?) -> Int {
+                if let marker { return marker }
+                let marker = 5
+                return marker
+            }
+        }
+        """)
+        let paramObf = try firstGroup(#"func \w+\(_ (\w+): Int\?"#, in: r)
+        let localObf = try firstGroup(#"let (\w+) = 5"#, in: r)
+        XCTAssertNotEqual(paramObf, localObf, "parameter and local are distinct symbols:\n\(r)")
+        XCTAssertTrue(r.contains("if let \(paramObf) = \(paramObf)"),
+                      "the shorthand binds the PARAMETER, not the local declared below it:\n\(r)")
+    }
+
     func testBlockScopedLocal_doesNotShadowPropertyOutsideItsBlock() throws {
         // The flip side: a local confined to an `if` body must not capture a same-named PROPERTY
         // read after that block. Over-scoping the local would rewrite the property read to the

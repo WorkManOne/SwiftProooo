@@ -746,7 +746,12 @@ private final class ResolutionVisitor: SyntaxVisitor {
             return .visitChildren
         }
         let name = stripBackticks(ident.identifier.text)
-        guard let target = currentScope.lookup(name: name),
+        // The shadowed symbol is the one visible AT THE `if`, so the lookup carries the use-site
+        // offset (B-FIX-40): `if let opt { … }; let opt = 5` shadows the PARAMETER, and an
+        // order-blind lookup answered with the local declared below, expanding the shorthand into
+        // `if let <local obf> = <local obf>` ⇒ "use of local variable … before its declaration".
+        guard let target = currentScope.lookup(
+                  name: name, at: ident.identifier.positionAfterSkippingLeadingTrivia.utf8Offset),
               let obf = map.obf(for: target) else {
             return .visitChildren
         }
