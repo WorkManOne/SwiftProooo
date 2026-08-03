@@ -183,43 +183,18 @@ public final class TypeResolver {
             if name == "self" || name == "Self" {
                 return Self.enclosingTypeScope(of: scope)?.owner
             }
-            if let sym = scope.lookup(name: name) {
-                if sym.kind.isTypeLike { return unwrapTypealias(sym, in: scope) }
-                if let typeName = table.declaredType[sym.id] {
-                    // Resolve the stored type name in the symbol's DECLARING scope, not the
-                    // use-site: a bare nested type (`var p: S3` inside `enum E1`) is written
-                    // relative to where it was declared and isn't visible from other scopes.
-                    return typeSymbol(forQualifiedName: typeName, in: sym.scope ?? scope)
-                }
-                // Registered-but-untyped local binding (unannotated closure param, case-let
-                // binding): try HOF closure-param inference before giving up — registering the
-                // binding for shadow correctness must not disable the typing that previously ran
-                // when the name was absent from the scope tree.
-                if sym.kind == .parameter,
-                   let t = inferNamedClosureParamType(name: name, from: ref, in: scope) {
-                    return typeSymbol(forQualifiedName: t.name, in: t.scope)
-                }
-                // A REGISTERED but untyped binding whose type the caller knows out-of-band — an
-                // enum-case payload bound by `case .run(let m)`, recorded flow-sensitively by
-                // ResolutionVisitor. Without this the provider was reachable only for bindings that
-                // are absent from the scope tree (`if let`), so every payload binding stayed untyped.
-                if sym.kind == .parameter, let provider = localBindingTypeName,
-                   let t = provider(name) {
-                    return typeSymbol(forQualifiedName: t.name, in: t.scope)
-                }
-                return nil
+            if let sym = scope.lookup(name: name), sym.kind.isTypeLike {
+                return unwrapTypealias(sym, in: scope)
             }
-            // Optional-binding local (`if let acc = makeFoo()`) — not a scope Symbol, but the caller
-            // (ResolutionVisitor) may know its type out-of-band. Consult the injected provider so a
-            // chain `acc.x.y` types `acc` and resolves through it. Returns nil for external types
-            // (URL, …) → falls through, leaving external members untouched (B-FIX-12).
-            if let provider = localBindingTypeName, let t = provider(name) {
+            // Every non-type source of a value's written type, in one place (B-FIX-37) — resolving
+            // it here to a DECLARATION is what makes `p.member` work; `receiverTypeInfo` asks the
+            // same helper for the name with its brackets intact.
+            if let t = bareValueTypeInfo(named: name, from: ref, in: scope) {
                 return typeSymbol(forQualifiedName: t.name, in: t.scope)
             }
-            // Maybe `name` is a named closure parameter — find enclosing closure and check.
-            if let t = inferNamedClosureParamType(name: name, from: ref, in: scope) {
-                return typeSymbol(forQualifiedName: t.name, in: t.scope)
-            }
+            // A name that IS in the scope tree but has no known type is answered, not guessed: a
+            // global type of the same name is not what a value reference denotes.
+            if scope.lookup(name: name) != nil { return nil }
             if let target = preferredConcreteType(named: name) {
                 return unwrapTypealias(target, in: scope)
             }
@@ -294,11 +269,9 @@ public final class TypeResolver {
         if let ref = expr.as(DeclReferenceExprSyntax.self) {
             var name = Self.stripBackticks(ref.baseName.text)
             if name.hasPrefix("$") || name.hasPrefix("_") { name = String(name.dropFirst()) }
-            if let sym = scope.lookup(name: name), !sym.kind.isTypeLike,
-               let t = table.declaredType[sym.id] {
-                return Self.unwrapOptionalName(t)
-            }
-            return nil
+            // All three type sources, not just `declaredType` (B-FIX-37) — so a binding used as a
+            // call argument (`f(rows)`) carries a signal into overload disambiguation.
+            return bareValueTypeInfo(named: name, from: ref, in: scope).map { Self.unwrapOptionalName($0.name) }
         }
         if let member = expr.as(MemberAccessExprSyntax.self), let base = member.base,
            let baseSym = typeSymbol(of: base, in: scope),
@@ -309,6 +282,53 @@ public final class TypeResolver {
             }
         }
         return nil
+    }
+
+    /// The WRITTEN type name of a bare value reference (`rows`, `$x`, `_x`), together with the scope
+    /// that name must be resolved in. THE one answer to "what type does this value have", for every
+    /// caller that needs the name rather than a declaration.
+    ///
+    /// A value's type comes from three sources, and each of them is the only source for a whole
+    /// class of bindings (B-FIX-37):
+    ///   1. `table.declaredType` — a declared property / parameter / local;
+    ///   2. HOF closure-parameter inference — `rows.map { row in … }`, where `row` is registered for
+    ///      shadow correctness (F1) but carries no declared type;
+    ///   3. the injected flow-sensitive provider — an optional binding (`guard let rows = …`,
+    ///      B-FIX-12) or an enum-case payload (`case .load(let rows)`, B-FIX-29), which live outside
+    ///      the table entirely.
+    ///
+    /// `typeSymbol(of:)` consulted all three; `receiverTypeInfo` and `declaredTypeName` consulted
+    /// only the first, and that is the bug this helper exists to make unrepeatable. The two of them
+    /// are the paths that keep a COLLECTION name intact (`typeSymbol` answers nil for one, B-FIX-28),
+    /// so a binding typed as a collection had no way through them: `case .load(let rows)` followed by
+    /// `rows.map { $0.field }` left `$0` untyped, every member read through it survived while its
+    /// declaration renamed, and the desync shipped wherever a shield blocked the revert. The same nil
+    /// silently disabled subscript results (`rows[0].field`) and stdlib-collection members
+    /// (`rows.first?.field`) on any binding.
+    ///
+    /// Order matches the three-source list and is load-bearing where sources overlap: a recorded
+    /// `declaredType` is a written fact and outranks both inferences.
+    private func bareValueTypeInfo(named name: String, from ref: DeclReferenceExprSyntax,
+                                   in scope: Scope) -> (name: String, scope: Scope)? {
+        if let sym = scope.lookup(name: name) {
+            if sym.kind.isTypeLike { return nil }
+            if let t = table.declaredType[sym.id] {
+                // The DECLARING scope, not the use-site: a bare nested type (`var p: S3` inside
+                // `enum E1`) is written relative to where it was declared and is invisible from
+                // other scopes (B-FIX-23).
+                return (t, sym.scope ?? scope)
+            }
+            // Registered but untyped — a closure parameter or a case-let binding. Registering it for
+            // shadow correctness must not disable the typing that ran when the name was absent from
+            // the scope tree, so both remaining sources are tried here too.
+            guard sym.kind == .parameter else { return nil }
+            if let t = inferNamedClosureParamType(name: name, from: ref, in: scope) { return t }
+            return localBindingTypeName?(name)
+        }
+        // Not a scope Symbol at all — an optional binding (`if let acc = makeFoo()`). Returns nil for
+        // external types (URL, …), leaving external members untouched.
+        if let t = localBindingTypeName?(name) { return t }
+        return inferNamedClosureParamType(name: name, from: ref, in: scope)
     }
 
     /// Strip trailing optional markers (`?`/`!`) from a type-name string.
@@ -704,11 +724,11 @@ public final class TypeResolver {
             if lookupName.hasPrefix("$") || lookupName.hasPrefix("_") {
                 lookupName = String(lookupName.dropFirst())
             }
-            if let sym = scope.lookup(name: lookupName), !sym.kind.isTypeLike,
-               let t = table.declaredType[sym.id] {
-                return (t, sym.scope ?? scope)
-            }
-            return nil
+            // All three type sources (B-FIX-37). This branch is the one that must keep a collection
+            // name intact, so a binding typed `[Row]` reaches element extraction, subscript results
+            // and the collection-member registry instead of dying at a missing `declaredType`.
+            return bareValueTypeInfo(named: lookupName, from: ref, in: scope)
+                .map { (name: $0.name, declScope: $0.scope) }
         }
         if let member = expr.as(MemberAccessExprSyntax.self), let base = member.base {
             let memberName = Self.stripBackticks(member.declName.baseName.text)

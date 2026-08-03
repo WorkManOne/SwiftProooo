@@ -3686,6 +3686,102 @@ final class PatternTests: XCTestCase {
         XCTAssertFalse(r.contains("self.m.tag"), "the else-body property member must resolve to Marker's own member:\n\(r)")
     }
 
+    // MARK: - A flow-tracked binding has a written type name too (B-FIX-37)
+    // Invariant: `receiverTypeInfo` answers "what is the WRITTEN type name of this expression", so it
+    // must know every type source `typeSymbol(of:)` knows — a recorded `declaredType`, a HOF closure
+    // parameter, AND the flow-sensitive binding provider. It knew only the first, so any binding
+    // (enum-case payload, `if`/`guard let`) typed as a COLLECTION was invisible to every consumer
+    // that needs the brackets: HOF element typing, subscript results, stdlib-collection members.
+
+    func testEnumCasePayload_collectionBindingAsHOFReceiver_closureParamResolves() throws {
+        // The reported red build. `case load([Row])` types `rows` as `[Row]`, but only in the
+        // flow-sensitive binding table — `rows` has no `declaredType`. `resolveSource(.element)` asks
+        // `receiverTypeInfo`, got nil, and `$0` stayed untyped: every member read through it survived
+        // while its declaration renamed ("Value of type 'Container.Meta' has no member 'metaStamp'").
+        let r = try runPipeline("""
+        enum Container {
+            enum Command {
+                case idle
+                case load([Row])
+            }
+            struct Row {
+                let rowCaption: String
+                let rowMeta: Meta
+            }
+            struct Meta {
+                let metaStamp: Int
+            }
+            struct Card {
+                let cardHeading: String
+                let cardMark: Int
+            }
+        }
+        func handle(_ c: Container.Command) -> [Container.Card] {
+            switch c {
+            case .load(let rows):
+                return rows.map { Container.Card(cardHeading: $0.rowCaption, cardMark: $0.rowMeta.metaStamp) }
+            case .idle:
+                return []
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("let rowCaption"), "Row.rowCaption must be obfuscated:\n\(r)")
+        XCTAssertFalse(r.contains("$0.rowCaption"), "the closure param must type from the payload binding's element:\n\(r)")
+        XCTAssertFalse(r.contains(".rowMeta"), "the chained member through the closure param must resolve:\n\(r)")
+        XCTAssertFalse(r.contains(".metaStamp"), "the leaf member of the chain must resolve:\n\(r)")
+    }
+
+    func testOptionalBinding_collectionBindingAsHOFReceiver_closureParamResolves() throws {
+        // Same gap through the other binding entry point: `guard let` records its type in the same
+        // table, so a collection-typed optional binding used as a HOF receiver failed identically.
+        let r = try runPipeline("""
+        struct Row { let rowCaption: String }
+        struct Holder { let stored: [Row]? }
+        func handle(_ h: Holder) -> [String] {
+            guard let rows = h.stored else { return [] }
+            return rows.map { $0.rowCaption }
+        }
+        """)
+        XCTAssertFalse(r.contains("let rowCaption"), "Row.rowCaption must be obfuscated:\n\(r)")
+        XCTAssertFalse(r.contains("$0.rowCaption"), "the closure param must type from the optional binding's element:\n\(r)")
+    }
+
+    func testEnumCasePayload_collectionBindingSubscript_memberResolves() throws {
+        // The same chokepoint feeds subscript-result typing (B-FIX-22), so `rows[0].rowCaption`
+        // broke for the identical reason. Proves the fix is at `receiverTypeInfo`, not at the HOF.
+        let r = try runPipeline("""
+        enum Command {
+            case idle
+            case load([Row])
+        }
+        struct Row { let rowCaption: String }
+        func handle(_ c: Command) -> String {
+            switch c {
+            case .load(let rows):
+                return rows[0].rowCaption
+            case .idle:
+                return ""
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("let rowCaption"), "Row.rowCaption must be obfuscated:\n\(r)")
+        XCTAssertFalse(r.contains("].rowCaption"), "the subscript element member must resolve:\n\(r)")
+    }
+
+    func testHOFClosureParam_collectionTypedParamAsNestedHOFReceiver_resolves() throws {
+        // The third source `receiverTypeInfo` did not know: a HOF closure parameter that is itself a
+        // collection. `groups.forEach { g in g.rows.map { … } }` works (g has a declaredType through
+        // Group), but binding the collection DIRECTLY (`[[Row]]`) did not.
+        let r = try runPipeline("""
+        struct Row { let rowCaption: String }
+        func handle(_ groups: [[Row]]) -> [String] {
+            return groups.flatMap { group in group.map { $0.rowCaption } }
+        }
+        """)
+        XCTAssertFalse(r.contains("let rowCaption"), "Row.rowCaption must be obfuscated:\n\(r)")
+        XCTAssertFalse(r.contains("$0.rowCaption"), "the inner closure param must type from the outer param's element:\n\(r)")
+    }
+
     // MARK: - A written type annotation is ground truth (B-FIX-35)
     // Invariant: an optional binding takes its type from its OWN `typeAnnotation` when one is
     // written, in preference to any inference from the initializer; the name in it resolves in the
