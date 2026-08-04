@@ -420,8 +420,9 @@ private final class DeclVisitor: SyntaxVisitor {
     ///
     /// `guard case` is the shape the region (rather than a bare end) is for: its binding really is
     /// in scope after the statement, and absent only from the guard's OWN else body — a hole in the
-    /// middle. The payload TYPE half needs no equivalent, being withheld there already by
-    /// `ResolutionPass.visitPost(GuardStmtSyntax)`.
+    /// middle. The payload TYPE half applies the SAME region since B-FIX-50; it used to be withheld
+    /// from the else body by being recorded after that body was visited, which cost it the later
+    /// conditions of the guard's own list.
     ///
     /// Landing in the enclosing scope means the binding can sit next to a same-named declaration of
     /// that scope, which it SHADOWS wherever it is visible — the ordering half of the same rule,

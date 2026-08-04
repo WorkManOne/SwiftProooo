@@ -6542,4 +6542,156 @@ final class PatternTests: XCTestCase {
         XCTAssertTrue(r.contains("slot.holdA"),
                       "an untyped binding types nothing — the member stays original:\n\(r)")
     }
+
+    // MARK: - B-FIX-50: a guard binding is visible to the LATER CONDITIONS of its own list
+
+    func testGuardBinding_annotatedType_memberInALaterConditionResolves() throws {
+        // The reported shape. `entry` is bound by condition 1 and read by condition 2 of the SAME
+        // guard. The binding's type used to be recorded in visitPost(GuardStmt), which runs after
+        // the whole statement, so condition 2 saw an untyped receiver and `entry.blobData` was left
+        // original while the property renamed. `blobData` is also an optional-binding NAME here, so
+        // rollback shield 1e blocks the revert and the desync ships as a red build.
+        let r = try runPipeline("""
+        import Foundation
+        struct Payload {
+            var blobData: Data?
+        }
+        final class Holder {
+            var items: [Payload] = []
+            func firstBlob() -> Data? {
+                guard
+                    let entry: Payload = items.first,
+                    let blobData: Data = entry.blobData
+                else { return nil }
+                return blobData
+            }
+        }
+        """)
+        let obf = try firstGroup(#"var (\w+): Data\?"#, in: r)
+        XCTAssertNotEqual(obf, "blobData", "the property decl must stay obfuscated:\n\(r)")
+        XCTAssertTrue(r.contains("entry.\(obf)"),
+                      "a member read in a LATER condition must resolve through the binding:\n\(r)")
+    }
+
+    func testGuardBinding_annotatedNestedType_memberInALaterConditionResolves() throws {
+        // Same defect where the later condition is a plain EXPRESSION rather than another binding,
+        // and the annotation names a nested type qualified. `alpha` is an Apple API name, so shield
+        // 1c blocks its revert and this one reaches the compiler as "has no member 'alpha'".
+        let r = try runPipeline("""
+        enum Wrapper {
+            struct Inner {
+                var alpha: Bool
+                var beta: Bool
+            }
+        }
+        final class Holder {
+            var boxes: [Wrapper.Inner] = []
+            func check() -> Bool {
+                guard
+                    let box: Wrapper.Inner = boxes.first,
+                    box.alpha == false || box.beta == false
+                else { return false }
+                return true
+            }
+        }
+        """)
+        let alphaObf = try firstGroup(#"var (\w+): Bool\n"#, in: r)
+        XCTAssertNotEqual(alphaObf, "alpha", "the property decl must stay obfuscated:\n\(r)")
+        XCTAssertTrue(r.contains("box.\(alphaObf)"),
+                      "a member read in a LATER condition must resolve through the binding:\n\(r)")
+    }
+
+    func testGuardBinding_inferredType_memberInALaterConditionResolves() throws {
+        // No annotation: the type comes from the initializer instead, through the same recorder.
+        let r = try runPipeline("""
+        struct Payload {
+            var flagOne: Bool
+        }
+        final class Holder {
+            var items: [Payload] = []
+            func check() -> Bool {
+                guard
+                    let entry = items.first,
+                    entry.flagOne
+                else { return false }
+                return true
+            }
+        }
+        """)
+        let obf = try firstGroup(#"var (\w+): Bool"#, in: r)
+        XCTAssertNotEqual(obf, "flagOne", "the property decl must stay obfuscated:\n\(r)")
+        XCTAssertTrue(r.contains("entry.\(obf)"),
+                      "an inferred binding type must reach the later condition too:\n\(r)")
+    }
+
+    func testGuardBinding_bareReferenceInALaterCondition_readsTheBindingNotTheProperty() throws {
+        // The NAME half of the same root cause, and the dangerous one: nothing survives, so
+        // RollbackPass reports `0 names desynced` and coverage reads 100%. The binding was not
+        // marked as a local yet, so `value` in condition 2 resolved to the same-named PROPERTY and
+        // was rewritten to its obf — a GREEN build that changed behaviour (verified against swiftc:
+        // the control returns 0 for `pick(-5)`, the obfuscated output returned -5).
+        let r = try runPipeline("""
+        final class Box {
+            var value = 100
+            func pick(_ m: Int?) -> Int {
+                guard let value = m, value > 0 else { return 0 }
+                return value
+            }
+        }
+        """)
+        let obf = try firstGroup(#"var (\w+) = 100"#, in: r)
+        XCTAssertNotEqual(obf, "value", "the property decl must stay obfuscated:\n\(r)")
+        XCTAssertTrue(r.contains("value > 0"),
+                      "the later condition reads the BINDING and must stay original:\n\(r)")
+        XCTAssertFalse(r.contains("\(obf) > 0"),
+                       "the later condition must not be rewritten to the property's obf:\n\(r)")
+    }
+
+    func testGuardCasePayloadBinding_memberInALaterConditionResolves() throws {
+        // The payload half: `guard case .calm(let detail) = m, detail.payloadTag…`. Its type was
+        // deferred to visitPost(GuardStmt) for the same reason and lost the same condition.
+        let r = try runPipeline("""
+        struct Detail {
+            var payloadTag: String
+        }
+        enum Mood {
+            case calm(Detail)
+            case sharp
+        }
+        final class Reader {
+            func read(_ m: Mood) -> String {
+                guard
+                    case .calm(let detail) = m,
+                    detail.payloadTag.isEmpty == false
+                else { return "" }
+                return detail.payloadTag
+            }
+        }
+        """)
+        let obf = try firstGroup(#"var (\w+): String"#, in: r)
+        XCTAssertNotEqual(obf, "payloadTag", "the property decl must stay obfuscated:\n\(r)")
+        XCTAssertTrue(r.contains("detail.\(obf).isEmpty"),
+                      "a payload member read in a LATER condition must resolve:\n\(r)")
+    }
+
+    func testGuardBinding_bareReferenceInsideTheElseBody_readsTheProperty() throws {
+        // The guard-rail for the HOLE, on the name half. Making the binding visible from its own
+        // condition means it is now live across the `else` body's offsets too, and the else is the
+        // one place a `guard let` binding is NOT in scope — swiftc reads the same-named property
+        // there. Without the hole the reference would be left original while the property renamed.
+        let r = try runPipeline("""
+        final class Box {
+            var value = 100
+            func pick(_ m: Int?) -> Int {
+                guard let value = m else { return self.value + value1() }
+                return value
+            }
+            func value1() -> Int { return 1 }
+        }
+        """)
+        let obf = try firstGroup(#"var (\w+) = 100"#, in: r)
+        XCTAssertNotEqual(obf, "value", "the property decl must stay obfuscated:\n\(r)")
+        XCTAssertTrue(r.contains("self.\(obf)"),
+                      "inside the else body the name is still the PROPERTY:\n\(r)")
+    }
 }

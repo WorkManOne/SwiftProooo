@@ -14,10 +14,12 @@ import SwiftSyntax
 ///
 /// The two consumers are the two halves of "what does this name mean here", and they must agree or
 /// the wrong one wins: the scope SYMBOL registered by `DeclarationPass` (which decides which
-/// declaration a bare reference names) and the payload TYPE recorded by `ResolutionPass` into
-/// `shadowBindingTypeFrames` (which decides what its members are). Hence one shared answer. The
-/// type half needs no `hole`: `ResolutionPass.visitPost(GuardStmtSyntax)` records a guard's payload
-/// types only after the else body has been visited, which excludes it by construction.
+/// declaration a bare reference names) and the flow-sensitive frames `ResolutionPass` keeps for the
+/// bindings that are NOT symbols (`shadowFrames` / `shadowBindingTypeFrames`, which decide whether
+/// a name is a local here and what its members are). Hence one shared answer, `hole` included:
+/// `ResolutionPass` used to sidestep the hole by recording a guard's bindings only after the else
+/// body had been visited, which also hid them from the later conditions of the guard's own list,
+/// where they are in scope (B-FIX-50).
 public enum ConditionBindingExtent {
     /// The region a condition's bindings are visible in, relative to their own declaration.
     ///
@@ -70,9 +72,4 @@ public enum ConditionBindingExtent {
         return nil
     }
 
-    /// The EXCLUSIVE end offset alone, for callers that track only the end (the payload-TYPE half —
-    /// see the note above on why it needs no `hole`).
-    public static func endOffset(of node: some SyntaxProtocol) -> Int? {
-        visibility(of: node)?.end
-    }
 }

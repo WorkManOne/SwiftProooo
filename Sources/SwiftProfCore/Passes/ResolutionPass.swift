@@ -270,12 +270,13 @@ private final class ResolutionVisitor: SyntaxVisitor {
     /// initializer (resolves in the type's DECLARING scope — a nested `Row` is invisible from the
     /// use-site). Re-resolving a bare name at the use-site is the B-FIX-23 defect.
     ///
-    /// Each entry stops answering at the EXCLUSIVE offset it was bound `until` — the statement
-    /// body's end for an `if case`/`while case` payload binding (B-FIX-42) and for an `if let` /
-    /// `while let` optional binding (B-FIX-45), both of which die with their statement while this
-    /// frame (the enclosing block's) lives on to the end of the method. It is the type half of the
-    /// same bound `Symbol.conditionBinding` carries for the scope half, and both come from
-    /// `ConditionBindingExtent`. nil for a `guard`, whose binding genuinely outlives its statement.
+    /// Each entry answers only over the REGION it was bound in — the statement body for an `if
+    /// case`/`while case` payload binding (B-FIX-42) and for an `if let` / `while let` optional
+    /// binding (B-FIX-45), both of which die with their statement while this frame (the enclosing
+    /// block's) lives on to the end of the method; and for a `guard`, whose binding outlives its
+    /// statement, no end but a HOLE over the guard's own `else` body (B-FIX-50). It is the type half
+    /// of the same region `Symbol.conditionBinding` carries for the scope half, and both come from
+    /// `ConditionBindingExtent`.
     var shadowBindingTypeFrames: BindingFrames<(name: String, scope: Scope)>
     /// Token ids whose rename decision was already made by qualified-type-chain resolution
     /// (`A.B.C`). Set by the outermost MemberType node; consulted by the inner MemberType nodes
@@ -599,12 +600,12 @@ private final class ResolutionVisitor: SyntaxVisitor {
     /// Core of the above, shared with the `if/guard/while case .run(let m) = value` condition form:
     /// one pattern matched against one expression. Same fail-closed contract.
     ///
-    /// `visibleUntil` is the offset the recorded types stop answering at — set by the `if case` /
-    /// `while case` entry point, whose bindings die with the statement's body while this frame does
-    /// not (B-FIX-42). A `switch` case and a `guard` pass nil: the former's frame is popped with its
-    /// own scope, the latter's binding genuinely outlives its statement.
+    /// `visibleIn` is the region the recorded types answer over — set by the condition entry point,
+    /// whose bindings die with the statement's body (`if case` / `while case`) or skip the `else`
+    /// body (`guard case`) while this frame does neither (B-FIX-42, B-FIX-50). A `switch` case
+    /// passes nil: its frame is popped with its own scope.
     private func recordEnumPayloadBindingTypes(pattern: PatternSyntax, matching subject: ExprSyntax,
-                                               visibleUntil: Int? = nil) {
+                                               visibleIn extent: ConditionBindingExtent.Visibility? = nil) {
         guard let enumSym = typeResolver.typeSymbol(of: subject, in: currentScope),
               enumSym.kind == .enum,
               let enumScope = innerScope(of: enumSym),
@@ -620,7 +621,7 @@ private final class ResolutionVisitor: SyntaxVisitor {
             // hoping the qualified form resolves from wherever it is read (B-FIX-35).
             let resolved = typeResolver.typeSymbol(forQualifiedName: type, in: caseScope)
             let info = resolved.map { ($0.name, $0.scope ?? caseScope) } ?? (type, caseScope)
-            shadowBindingTypeFrames.bind(binding, until: visibleUntil,
+            shadowBindingTypeFrames.bind(binding, visibleIn: extent,
                                          (name: info.0, scope: info.1))
         }
     }
@@ -659,14 +660,16 @@ private final class ResolutionVisitor: SyntaxVisitor {
     /// The ONE place a `let`/`var` optional binding gets a type — every entry form (`if let`,
     /// `while let`, `guard let`) routes here so the annotation rule cannot be forgotten at one of them.
     ///
-    /// `until` is where the binding stops being visible, from `ConditionBindingExtent`: the end of
-    /// the statement's body for `if let`/`while let`, nil for a `guard let` (B-FIX-45). It is the
-    /// same bound `shadowFrames` gets for the same binding — the two must agree or one half keeps
-    /// answering for a name the other has already released.
+    /// `visibleIn` is where the binding answers, from `ConditionBindingExtent`: the end of the
+    /// statement's body for `if let`/`while let`, and for a `guard let` no end at all but a hole
+    /// over its own `else` body (B-FIX-45, B-FIX-50). It is the same region `shadowFrames` gets for
+    /// the same binding — the two must agree or one half keeps answering for a name the other has
+    /// already released.
     private func recordShadowBindingType(name: String, annotation: TypeAnnotationSyntax?,
-                                         initializer: ExprSyntax, until: Int?) {
+                                         initializer: ExprSyntax,
+                                         visibleIn extent: ConditionBindingExtent.Visibility?) {
         guard let info = bindingType(annotation: annotation, initializer: initializer) else { return }
-        shadowBindingTypeFrames.bind(name, until: until, (name: info.name, scope: info.scope))
+        shadowBindingTypeFrames.bind(name, visibleIn: extent, (name: info.name, scope: info.scope))
     }
 
     /// The static type of a binding, as a (name, resolving-scope) pair.
@@ -884,89 +887,49 @@ private final class ResolutionVisitor: SyntaxVisitor {
     }
 
     /// After an optional binding's initializer has been resolved, the bound name becomes a
-    /// LOCAL that shadows any same-named declaration — until the end of the statement's BODY, which
-    /// is where an `if let` / `while let` binding stops (B-FIX-45; `guard let` is the exception and
-    /// is handled in `visitPost(GuardStmtSyntax)`). Record it so subsequent references inside that
-    /// region resolve to the local (and stay un-renamed) while a read below the statement follows
-    /// the same-named declaration again.
+    /// LOCAL that shadows any same-named declaration — over the region
+    /// `ConditionBindingExtent.visibility(of:)` answers with: the statement's BODY for an
+    /// `if let` / `while let` (B-FIX-45), and everything after the condition EXCEPT the `else` body
+    /// for a `guard let` (B-FIX-50). Record it so subsequent references inside that region resolve
+    /// to the local (and stay un-renamed) while a read outside it follows the same-named
+    /// declaration again.
     /// Only for the EXPLICIT form (`guard let X = expr`); the shorthand form is rewritten above
     /// and intentionally renamed instead.
+    ///
+    /// This runs for a `guard` condition too, and that is the point. Recording a guard's bindings
+    /// only in `visitPost(GuardStmtSyntax)` kept them out of the `else` body correctly, but it also
+    /// kept them out of the LATER CONDITIONS of the guard's own list, where they ARE in scope:
+    /// `guard let e = items.first, let d = e.blob else { … }` typed nothing for `e`, so `e.blob`
+    /// stayed original while the property renamed. The `else` body is now excluded by the `hole`
+    /// instead, which is the same bound the SYMBOL half already applies.
     override func visitPost(_ node: OptionalBindingConditionSyntax) {
         guard node.initializer != nil,
               let ident = node.pattern.as(IdentifierPatternSyntax.self) else { return }
-        // A `guard let X = …` binding is in scope AFTER the guard (the enclosing block), but NOT
-        // inside the guard's `else` body. Adding it to the shadow frame here would shadow `X`
-        // inside `else` too — so a reference like `if let X = X` in the else (where the RHS `X` is
-        // actually the same-named PROPERTY) would be wrongly left un-renamed → `cannot find X in
-        // scope`. Defer guard bindings to visitPost(GuardStmt), which runs after the else body.
-        if isInGuardCondition(node) { return }
         let name = stripBackticks(ident.identifier.text)
-        // The same region for both halves — the statement's body, from the one helper the `if case`
-        // family already answers with. The frame this lands in is the ENCLOSING block's, so without
-        // the bound the binding outlives its statement by the whole method.
-        let until = ConditionBindingExtent.endOffset(of: node)
-        shadowFrames.bind(name, until: until)
+        // The same region for both halves, from the one helper the `if case` family already answers
+        // with. The frame this lands in is the ENCLOSING block's, so without the bound the binding
+        // outlives its statement by the whole method.
+        let extent = ConditionBindingExtent.visibility(of: node)
+        shadowFrames.bind(name, visibleIn: extent)
         if let initializer = node.initializer {
             recordShadowBindingType(name: name, annotation: node.typeAnnotation,
-                                    initializer: initializer.value, until: until)
+                                    initializer: initializer.value, visibleIn: extent)
         }
     }
 
-    override func visit(_ node: GuardStmtSyntax) -> SyntaxVisitorContinueKind { return .visitChildren }
-
-    /// Guard bindings come into scope only AFTER the whole guard statement. Register them now
-    /// (the `else` body has already been visited with the outer meaning of these names intact).
-    override func visitPost(_ node: GuardStmtSyntax) {
-        for cond in node.conditions {
-            // `guard case .run(let m) = c else { … }` — the payload binding, deferred here for the
-            // same reason: inside the `else` body `m` is NOT in scope, so a same-named property
-            // referenced there must keep its own type (typing it as the payload would rewrite its
-            // members to the payload enum's obfs — a wrong rename RollbackPass cannot catch).
-            if let matching = cond.condition.as(MatchingPatternConditionSyntax.self) {
-                recordEnumPayloadBindingTypes(pattern: matching.pattern,
-                                              matching: matching.initializer.value)
-                continue
-            }
-            guard let binding = cond.condition.as(OptionalBindingConditionSyntax.self),
-                  let initializer = binding.initializer,
-                  let ident = binding.pattern.as(IdentifierPatternSyntax.self) else { continue }
-            let name = stripBackticks(ident.identifier.text)
-            // No end: a `guard let` binding genuinely outlives its statement, and its one gap (the
-            // guard's own `else` body) is already excluded by recording here, after that body has
-            // been visited.
-            shadowFrames.bind(name, until: nil)
-            recordShadowBindingType(name: name, annotation: binding.typeAnnotation,
-                                    initializer: initializer.value, until: nil)
-        }
-    }
-
-    /// `if case .run(let m) = value` / `while case …` — the payload binding of a MATCHING pattern
-    /// condition, typed exactly like a `switch` case's (B-FIX-29 covered only `switch`). In
-    /// `visitPost` so the matched expression has been resolved first, and skipped for a `guard`,
-    /// whose bindings are deferred to `visitPost(GuardStmt)` (see there).
+    /// `if case .run(let m) = value` / `while case …` / `guard case …` — the payload binding of a
+    /// MATCHING pattern condition, typed exactly like a `switch` case's (B-FIX-29 covered only
+    /// `switch`). In `visitPost` so the matched expression has been resolved first.
     ///
     /// The frame this records into is the ENCLOSING block's and lives to the end of the method,
-    /// while the binding dies with the statement's body — hence the end bound (B-FIX-42). Without
+    /// while the binding dies with the statement's body — hence the region (B-FIX-42). Without
     /// it, `if case .calm(let item) = mood { … }` still typed a same-named property below the
-    /// statement as the payload and rewrote its members to the payload type's obfs.
+    /// statement as the payload and rewrote its members to the payload type's obfs. A `guard case`
+    /// binding outlives its statement and is excluded from the `else` body by the region's `hole`,
+    /// for the reason spelled out above `visitPost(OptionalBindingConditionSyntax)`.
     override func visitPost(_ node: MatchingPatternConditionSyntax) {
-        guard !isInGuardCondition(node) else { return }
         recordEnumPayloadBindingTypes(pattern: node.pattern, matching: node.initializer.value,
-                                      visibleUntil: ConditionBindingExtent.endOffset(of: node))
-    }
-
-    /// True when a condition belongs to a `guard` (vs `if let` / `while let` / `if case`).
-    private func isInGuardCondition(_ node: some SyntaxProtocol) -> Bool {
-        var p: Syntax? = node.parent
-        while let cur = p {
-            if cur.is(GuardStmtSyntax.self) { return true }
-            // Stop once we leave the condition list into a body or a different statement.
-            if cur.is(IfExprSyntax.self) || cur.is(WhileStmtSyntax.self) || cur.is(CodeBlockSyntax.self) {
-                return false
-            }
-            p = cur.parent
-        }
-        return false
+                                      visibleIn: ConditionBindingExtent.visibility(of: node))
     }
 
     // MARK: - Key paths

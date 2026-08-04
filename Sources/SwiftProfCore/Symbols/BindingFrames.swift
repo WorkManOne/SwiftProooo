@@ -28,6 +28,13 @@
 ///     Verified against swiftc on all six shapes (enclosing property, enclosing parameter, local of
 ///     the same block above the statement, local of the body block, local of a closure in the body,
 ///     local of a nested `func` in the body).
+///  4. **An entry may have a HOLE inside its region** — a `guard`'s own `else` body, where its
+///     binding is not in scope yet (B-FIX-50). Both bounds come from the one shared answer
+///     `ConditionBindingExtent.visibility(of:)`, which is also what the SYMBOL half applies in
+///     `Scope.declarations(named:visibleAt:)`, so the two halves cannot disagree about the region.
+///     Before this the type half sidestepped the hole by RECORDING a guard's bindings only after
+///     the else body had been visited — which also hid them from the later conditions of the
+///     guard's own list, where they are very much in scope.
 ///
 /// Among the entries live at a position the NEWEST wins (innermost frame first, and within a frame
 /// the most recently bound), which is what makes the inner `if let` shadow the outer `guard let`
@@ -36,6 +43,8 @@ struct BindingFrames<Value> {
     private struct Entry {
         /// EXCLUSIVE offset the entry stops answering at; nil = live to the end of the frame.
         let until: Int?
+        /// A gap inside the region where the binding is not in scope (a `guard`'s `else` body).
+        let hole: Range<Int>?
         let value: Value
     }
 
@@ -60,9 +69,11 @@ struct BindingFrames<Value> {
         frames.removeLast()
     }
 
-    /// Bind `name` in the innermost frame until `until` (nil = to the end of that frame).
-    mutating func bind(_ name: String, until: Int?, _ value: Value) {
-        frames[frames.count - 1].bindings[name, default: []].append(Entry(until: until, value: value))
+    /// Bind `name` in the innermost frame over `extent` (nil = live to the end of that frame).
+    mutating func bind(_ name: String, visibleIn extent: ConditionBindingExtent.Visibility?,
+                       _ value: Value) {
+        frames[frames.count - 1].bindings[name, default: []]
+            .append(Entry(until: extent?.end, hole: extent?.hole, value: value))
     }
 
     /// The value of the newest binding of `name` that is still live at `offset` AND not out-scoped
@@ -79,7 +90,10 @@ struct BindingFrames<Value> {
         for frame in frames.reversed() {
             guard let entries = frame.bindings[name] else { continue }
             for entry in entries.reversed() {
-                if let offset, let until = entry.until, offset >= until { continue }
+                if let offset {
+                    if let until = entry.until, offset >= until { continue }
+                    if let hole = entry.hole, hole.contains(offset) { continue }
+                }
                 if competitorScope == nil { competitorScope = competitor() }
                 if let declared = competitorScope!, declared.isNested(in: frame.scope) { continue }
                 return entry.value
@@ -106,7 +120,9 @@ public enum LocalBindingType {
 }
 
 extension BindingFrames where Value == Void {
-    mutating func bind(_ name: String, until: Int?) { bind(name, until: until, ()) }
+    mutating func bind(_ name: String, visibleIn extent: ConditionBindingExtent.Visibility?) {
+        bind(name, visibleIn: extent, ())
+    }
 
     /// True when `name` is bound at `offset` — the "this is a local, not the declaration we may
     /// have renamed" question. See `newest` for `competitor`.
