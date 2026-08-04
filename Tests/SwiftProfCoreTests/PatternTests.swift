@@ -5460,6 +5460,188 @@ final class PatternTests: XCTestCase {
         }
     }
 
+    // MARK: - An implicit getter body is a scope (B-FIX-49)
+
+    func testImplicitGetter_siblingComputedProperties_eachUseResolvesToItsOwnLocal() throws {
+        // `var x: T { … }` has NO `CodeBlockSyntax`: its braces belong to the `AccessorBlock`, whose
+        // `.getter` form holds the statements directly. B-FIX-39 keyed the block scope on
+        // `CodeBlockSyntax`, so both getters' locals landed in the enclosing TYPE scope — where the
+        // position rule does not apply — and every use in the SECOND getter was rewritten to the
+        // FIRST getter's local ("cannot find … in scope"), which RollbackPass reports as 0 desyncs.
+        let r = try runPipeline("""
+        final class Widget {
+            var alphaTag: String = ""
+        }
+        final class Factory {
+            static var cached: Widget {
+                let slot: Widget = fresh
+                return slot
+            }
+            static var fresh: Widget {
+                let slot = Widget()
+                slot.alphaTag = "A"
+                return slot
+            }
+        }
+        """)
+        let cachedLocal = try firstGroup(#"let (\w+): \w+ = "#, in: r)
+        let freshLocal = try firstGroup(#"let (\w+) = \w+\(\)"#, in: r)
+        XCTAssertNotEqual(cachedLocal, freshLocal, "each getter declares its own local:\n\(r)")
+        XCTAssertTrue(r.contains("\(freshLocal)."),
+                      "the member write must resolve to the local of ITS OWN getter:\n\(r)")
+        XCTAssertFalse(r.contains("\(cachedLocal)."),
+                       "the first getter's local is not reachable from the second:\n\(r)")
+    }
+
+    func testImplicitGetter_localShadowsSameNamedProperty_memberResolvesToTheLocal() throws {
+        // The getter's local landing in the TYPE scope put it next to a same-named stored property,
+        // which is declared FIRST and therefore won the lookup — so the body read the PROPERTY's
+        // storage. Red here only because the two types differ; with matching types it is a GREEN
+        // build that silently changed behaviour.
+        let r = try runPipeline("""
+        final class Gadget { var gammaTag: String = "" }
+        final class Widget { var alphaTag: String = "" }
+        final class Holder {
+            var slot: Gadget = Gadget()
+            var made: Widget {
+                let slot = Widget()
+                slot.alphaTag = "A"
+                return slot
+            }
+        }
+        """)
+        let propertyObf = try firstGroup(#"var (\w+): \w+ = \w+\(\)"#, in: r)
+        let localObf = try firstGroup(#"let (\w+) = \w+\(\)"#, in: r)
+        XCTAssertNotEqual(propertyObf, localObf, "property and local are distinct symbols:\n\(r)")
+        XCTAssertTrue(r.contains("\(localObf)."),
+                      "the member write must read the LOCAL, not the same-named property:\n\(r)")
+        XCTAssertFalse(r.contains("\(propertyObf)."),
+                       "the property is shadowed inside the getter:\n\(r)")
+    }
+
+    func testImplicitGetter_localDoesNotLeakBelowTheProperty() throws {
+        // With no scope of its own, a getter-body local stayed visible in the ENCLOSING block —
+        // here the function body that declares the computed `var` — so the sibling local below it
+        // resolved to the getter's local, which is not in scope there.
+        let r = try runPipeline("""
+        final class Gadget { var gammaTag: String = "" }
+        final class Widget { var alphaTag: String = "" }
+        final class Runner {
+            func build() -> Widget {
+                var inner: Widget {
+                    let slot = Widget()
+                    slot.alphaTag = "in"
+                    return slot
+                }
+                let slot = Gadget()
+                slot.gammaTag = "out"
+                return inner
+            }
+        }
+        """)
+        let locals = try allGroups(#"let (\w+) = \w+\(\)"#, in: r)
+        XCTAssertEqual(locals.count, 2, "both locals are still declared:\n\(r)")
+        XCTAssertEqual(Set(locals).count, 2, "they are distinct symbols:\n\(r)")
+        let inBase = try firstGroup(#"(\w+)\.\w+ = "in""#, in: r)
+        let outBase = try firstGroup(#"(\w+)\.\w+ = "out""#, in: r)
+        XCTAssertEqual(inBase, locals[0], "the getter's write reads the getter's local:\n\(r)")
+        XCTAssertEqual(outBase, locals[1],
+                       "the write below the property reads the local declared THERE:\n\(r)")
+    }
+
+    func testImplicitGetter_atFileScope_siblingGettersDoNotCollide() throws {
+        // File scope is deliberately order-blind (a global is forward-referenceable), so two
+        // top-level computed vars whose getters share a local name collapsed onto the first one
+        // with nothing to bound them.
+        let r = try runPipeline("""
+        final class Widget { var alphaTag: String = "" }
+        var firstOne: Widget {
+            let slot = Widget()
+            slot.alphaTag = "one"
+            return slot
+        }
+        var secondOne: Widget {
+            let slot = Widget()
+            slot.alphaTag = "two"
+            return slot
+        }
+        """)
+        let locals = try allGroups(#"let (\w+) = \w+\(\)"#, in: r)
+        XCTAssertEqual(Set(locals).count, 2, "each getter declares its own local:\n\(r)")
+        XCTAssertEqual(try firstGroup(#"(\w+)\.\w+ = "one""#, in: r), locals[0],
+                       "the first getter's write reads its own local:\n\(r)")
+        XCTAssertEqual(try firstGroup(#"(\w+)\.\w+ = "two""#, in: r), locals[1],
+                       "the second getter's write reads its own local:\n\(r)")
+    }
+
+    func testSubscriptImplicitGetter_localShadowsParameter_memberResolvesToTheLocal() throws {
+        // A subscript's implicit getter has no `CodeBlockSyntax` either, so its locals landed in the
+        // subscript's PARAMETER scope. The parameter is declared first, so the body read it — and
+        // the parameter is not renameable, so the surviving name shields the desync from rollback.
+        let r = try runPipeline("""
+        final class Widget { var alphaTag: String = "" }
+        final class Bench {
+            subscript(slot: Int) -> Widget {
+                let slot = Widget()
+                slot.alphaTag = "x"
+                return slot
+            }
+        }
+        """)
+        let localObf = try firstGroup(#"let (\w+) = \w+\(\)"#, in: r)
+        XCTAssertNotEqual(localObf, "slot", "the local is renamed:\n\(r)")
+        XCTAssertTrue(r.contains("\(localObf)."),
+                      "the member write must read the LOCAL, not the same-named parameter:\n\(r)")
+    }
+
+    func testImplicitGetter_bodyStillReadsEnclosingProperty() throws {
+        // The anti-over-narrowing guard: the new scope must not hide the enclosing type's members
+        // from the getter body.
+        let r = try runPipeline("""
+        final class Holder {
+            var storedTag: String = "s"
+            var derivedTag: String {
+                let prefix = "p"
+                return prefix + storedTag
+            }
+        }
+        """)
+        let storedObf = try firstGroup(#"var (\w+): String = "s""#, in: r)
+        let localObf = try firstGroup(#"let (\w+) = "p""#, in: r)
+        XCTAssertTrue(r.contains("\(localObf) + \(storedObf)"),
+                      "the getter body still sees the enclosing property:\n\(r)")
+    }
+
+    func testExplicitGetAccessor_siblingGetters_eachUseResolvesToItsOwnLocal() throws {
+        // The form that already worked — an explicit `get` HAS a `CodeBlockSyntax` body — must keep
+        // working: the fix adds a scope for the implicit form only.
+        let r = try runPipeline("""
+        final class Widget { var alphaTag: String = "" }
+        final class Factory {
+            static var cached: Widget {
+                get {
+                    let slot = Widget()
+                    slot.alphaTag = "one"
+                    return slot
+                }
+            }
+            static var fresh: Widget {
+                get {
+                    let slot = Widget()
+                    slot.alphaTag = "two"
+                    return slot
+                }
+            }
+        }
+        """)
+        let locals = try allGroups(#"let (\w+) = \w+\(\)"#, in: r)
+        XCTAssertEqual(Set(locals).count, 2, "each accessor declares its own local:\n\(r)")
+        XCTAssertEqual(try firstGroup(#"(\w+)\.\w+ = "one""#, in: r), locals[0],
+                       "the first accessor's write reads its own local:\n\(r)")
+        XCTAssertEqual(try firstGroup(#"(\w+)\.\w+ = "two""#, in: r), locals[1],
+                       "the second accessor's write reads its own local:\n\(r)")
+    }
+
     // MARK: - A local is visible only AFTER its declaration (B-FIX-40)
 
     func testLocalVariable_referencedBeforeItsDeclaration_readsTheParameter() throws {

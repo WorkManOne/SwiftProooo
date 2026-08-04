@@ -242,6 +242,30 @@ private final class DeclVisitor: SyntaxVisitor {
     }
     override func visitPost(_ node: CodeBlockSyntax) { pop() }
 
+    /// The body of an IMPLICIT getter (`var x: T { … }`, `subscript(i: Int) -> T { … }`) — the one
+    /// braced body in the language that is not a `CodeBlockSyntax`. Its statements hang off the
+    /// `AccessorBlock` directly (`Accessors.getter`), so the block scope above never fired for it and
+    /// its locals were registered into the ENCLOSING scope (B-FIX-49).
+    ///
+    /// Where they landed decided the symptom, and none of the three was caught by a safety net:
+    /// in a TYPE scope (the common case) the position rule of B-FIX-40 does not apply, so two
+    /// sibling computed properties' same-named locals collapsed onto the first-declared one and a
+    /// getter's local lost to a same-named stored PROPERTY; in a `.function`/`.block` scope the
+    /// local merely leaked past the property, over a sibling local below it or the subscript's own
+    /// parameter.
+    ///
+    /// Pushed only for the `.getter` form: an explicit `get`/`set` accessor has a `CodeBlockSyntax`
+    /// body that already carries the scope, and pushing here as well would add an empty level for
+    /// every computed property in the project. The two mirrors named in `ScopeNodes` key on
+    /// `innerScope[node.id]`, so they follow this condition without repeating it.
+    override func visit(_ node: AccessorBlockSyntax) -> SyntaxVisitorContinueKind {
+        if case .getter = node.accessors { _ = push(.block, owner: nil, node: node) }
+        return .visitChildren
+    }
+    override func visitPost(_ node: AccessorBlockSyntax) {
+        if case .getter = node.accessors { pop() }
+    }
+
     /// An accessor's implicit value parameter: `set`/`willSet` (and an `init` accessor) bind
     /// `newValue`, `didSet` binds `oldValue`, and an explicit name in parentheses (`set(incoming)`,
     /// `didSet(previous)`) REPLACES the implicit one. Same rule and same precedent as the implicit

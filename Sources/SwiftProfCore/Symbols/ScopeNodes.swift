@@ -21,6 +21,10 @@ public enum ScopeNodes {
         .functionDecl, .initializerDecl, .subscriptDecl,
         // Block scopes. `forStmt` holds the LOOP VARIABLE, which is declared outside the body and
         // must die with the loop — the body's own `codeBlock` is nested inside it.
-        .closureExpr, .switchCase, .catchClause, .codeBlock, .forStmt,
+        // `accessorBlock` is the IMPLICIT getter's body (`var x: T { … }`), whose statements hang
+        // off the accessor block directly — there is no `codeBlock` under it to carry the scope.
+        // An EXPLICIT accessor (`get { … }` / `set { … }`) keeps its `codeBlock` body and pushes
+        // nothing here, so that form's scope tree is unchanged (B-FIX-49).
+        .closureExpr, .switchCase, .catchClause, .codeBlock, .forStmt, .accessorBlock,
     ]
 }

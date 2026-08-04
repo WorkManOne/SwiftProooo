@@ -350,6 +350,9 @@ private final class RawValueUseVisitor: SyntaxVisitor {
     override func visitPost(_ n: ActorDeclSyntax) { exit(n) }
     override func visit(_ n: CodeBlockSyntax) -> SyntaxVisitorContinueKind { enter(n); return .visitChildren }
     override func visitPost(_ n: CodeBlockSyntax) { exit(n) }
+    // The implicit getter's body — not a `CodeBlockSyntax`, scoped by DeclarationPass (B-FIX-49).
+    override func visit(_ n: AccessorBlockSyntax) -> SyntaxVisitorContinueKind { enter(n); return .visitChildren }
+    override func visitPost(_ n: AccessorBlockSyntax) { exit(n) }
     override func visit(_ n: ForStmtSyntax) -> SyntaxVisitorContinueKind { enter(n); return .visitChildren }
     override func visitPost(_ n: ForStmtSyntax) { exit(n) }
 

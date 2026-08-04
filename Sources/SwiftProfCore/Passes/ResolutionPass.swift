@@ -754,6 +754,11 @@ private final class ResolutionVisitor: SyntaxVisitor {
     // it made every local of a method resolve against the flat function scope — see `ScopeNodes`.
     override func visit(_ node: CodeBlockSyntax) -> SyntaxVisitorContinueKind { enterInnerScope(of: node); return .visitChildren }
     override func visitPost(_ node: CodeBlockSyntax) { exitInnerScope(of: node) }
+    // An IMPLICIT getter's body (`var x: T { … }`) is the one braced body that is not a
+    // `CodeBlockSyntax` — DeclarationPass scopes it here (B-FIX-49). Unconditional, because
+    // `enterInnerScope` is a no-op unless a scope was actually attached to this node.
+    override func visit(_ node: AccessorBlockSyntax) -> SyntaxVisitorContinueKind { enterInnerScope(of: node); return .visitChildren }
+    override func visitPost(_ node: AccessorBlockSyntax) { exitInnerScope(of: node) }
     override func visit(_ node: SwitchCaseSyntax) -> SyntaxVisitorContinueKind {
         enterInnerScope(of: node)
         recordEnumPayloadBindingTypes(of: node)
