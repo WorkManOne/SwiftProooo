@@ -167,6 +167,13 @@ enum UnresolvedCause: String {
     case mixedKindCandidates = "mixed-kind-candidates"
     /// Several same-kind candidates and no argument signal picks one.
     case ambiguousOverload = "ambiguous-overload"
+    /// The receiver's own scope declares this name at the WRONG kind for the position and an
+    /// ancestor declares it at the right one, but which of the two the compiler picks depends on
+    /// type information we do not have (B-FIX-47) — a closure-typed subclass property really does
+    /// shadow the base method it is called instead of, and a function-typed context really does
+    /// pick the subclass method over the base property. Fail closed: the use-site keeps its
+    /// original name, so RollbackPass sees the survivor and reverts.
+    case inheritedKindConflict = "inherited-kind-conflict"
     /// Resolved to exactly one declaration which is deliberately not renamed (protected or
     /// policy-skipped). Low-signal: the use-site is correct as it stands.
     case candidateHasNoObf = "candidate-has-no-obf"
@@ -224,6 +231,9 @@ private final class ResolutionVisitor: SyntaxVisitor {
     /// a candidate's OWN module). Reused so we don't allocate a fresh TypeResolver — and discard its
     /// memo cache — on every call (C-3).
     private var resolverByModule: [String: TypeResolver] = [:]
+    /// `class symbol id → its LOCAL ancestors, nearest first`. `SuperclassChain.ancestors` re-parses
+    /// the declaring file to read the inheritance clause, and `inheritedMembers` asks per use-site.
+    var ancestorCache: [Int: [Symbol]] = [:]
     var renames: [Rename] = []
     var scopeStack: [Scope]
     /// Names introduced by optional bindings (`guard let x`, `if let x`, `while let x`) that
@@ -1276,6 +1286,23 @@ private final class ResolutionVisitor: SyntaxVisitor {
                     emitRename(for: token, target: sym)
                     return .skipChildren
                 case .parameter, .property:
+                    // A MEMBER property of a class does not shadow an inherited method the way a
+                    // local or a parameter does: Swift unions a class's own members with its
+                    // ancestors', so `tick()` inside `class Sub: Base { var tick: String }` calls
+                    // `Base.tick()` — while the same name as a LOCAL or PARAMETER really does
+                    // shadow it (`func f(tick: String) { tick() }` is "cannot call value of
+                    // non-function type 'String'", checked against swiftc). Same B-FIX-47 rule as
+                    // `lookupMember`, on the other lookup path: this branch used to rename the CALL
+                    // to the property's obf and `return`, never reaching `resolveCall`.
+                    if sym.kind == .property, let owner = memberOwnerClass(of: sym),
+                       !inheritedMembers(name, of: owner, admitting: .callee).isEmpty {
+                        guard isKnownNonFunctionTyped(sym) else {
+                            // Might be closure-typed, in which case the property IS what is called.
+                            reportUnresolved(.inheritedKindConflict, name: name, token: token)
+                            return .skipChildren
+                        }
+                        break   // to `resolveCall`, which finds the inherited callable
+                    }
                     // A closure-typed value being invoked, e.g. `content()` where
                     // `content: () -> String`. Single binding — rename directly, no overload logic.
                     emitRename(for: token, target: sym)
@@ -1867,13 +1894,33 @@ private final class ResolutionVisitor: SyntaxVisitor {
         let declared = typeScope.members(named: name)
         guard !declared.isEmpty else { return .failed(.noCandidateInScope) }
         let call = enclosingCall(of: node)
+        let position: UsePosition = call != nil ? .callee : .value
         // Narrow by SYNTACTIC POSITION before any fail-closed bail: a member access in callee
         // position denotes a callable, one that is not denotes a non-callable. Without this, a type
         // declaring both `var pf2: Bool` and `func pf2(for:) -> Bool` produced a mixed-kind set that
         // the bail below refused outright, so `p1.pf2(for: path)` was never rewritten while the
         // method's declaration was — and rollback shield 1b (the un-renamed property is a namesake)
         // blocked the rescue, so the desync SHIPPED as "cannot call value of non-function type".
-        let candidates = Self.narrowed(declared, to: call != nil ? .callee : .value)
+        var candidates = Self.narrowed(declared, to: position)
+        // Position narrowing can only pick from the set it is GIVEN, and a subclass scope is not
+        // that set: `SuperclassVisibility` copies an ancestor's non-callables only, and its
+        // name-keyed shadowing drops even those once the subclass declares the name at any kind.
+        // So `class Sub: Base { var run: Bool }` over `class Base { func run() }` reaches here with
+        // one candidate of the WRONG kind, `narrowed` falls back to it (by contract — a
+        // closure-typed property IS legitimately called), and the `count == 1` exit below rewrites
+        // `s.run()` to the PROPERTY's obf. Complete the set from the superclass chain first
+        // (B-FIX-47).
+        if !candidates.contains(where: { position.admits($0.kind) }) {
+            switch inheritedCompletion(name, of: typeScope.owner, position: position,
+                                       local: candidates) {
+            case .none:
+                break
+            case .use(let inherited):
+                candidates = inherited
+            case .unknowable:
+                return .failed(.inheritedKindConflict, candidates: candidates.count)
+            }
+        }
         if candidates.count == 1 { return outcome(for: candidates[0]) }
         // Checked BEFORE label filtering on purpose: a call may omit a defaulted label in a way
         // `labelsMatch` can't model, and when every candidate shares one obf the outcome is right
@@ -1887,6 +1934,105 @@ private final class ResolutionVisitor: SyntaxVisitor {
             return .failed(.ambiguousOverload, candidates: candidates.count)
         }
         return outcome(for: picked)
+    }
+
+    /// What the superclass chain adds to a member candidate set that has nothing of the right kind.
+    enum InheritedCompletion {
+        /// No ancestor declares the name at the demanded kind — the local set is the whole story.
+        case none
+        /// These inherited declarations ARE the candidate set: every local candidate is a
+        /// non-callable of a KNOWN, non-function type, so the compiler cannot be reading one of them.
+        case use([Symbol])
+        /// Both readings are live and only type inference settles it — fail closed.
+        case unknowable
+    }
+
+    /// Complete a member candidate set from the LOCAL superclass chain when the receiver's own scope
+    /// declares the name only at the wrong KIND for this use-site's position (B-FIX-47).
+    ///
+    /// The three shapes, all run through swiftc as programs before this was written:
+    ///
+    ///   1. `class Base { func run() -> String }` / `class Sub: Base { var run: Bool }` — `s.run()`
+    ///      prints `BASE-METHOD`: a `Bool` is not callable, so the base METHOD is what is called.
+    ///      Answer `.use([Base.run])`.
+    ///   2. Same shape with `var run: () -> String` — `s.run()` prints `PROP`: a closure-typed
+    ///      property IS callable and shadows the base method. `WrittenTypeName.of` returns nil for a
+    ///      function type, so a property that might be one is exactly a property with no recorded
+    ///      `declaredType` — that is the `.unknowable` test, and it also covers `var run = { … }`.
+    ///   3. Mirror image, `class Base { var flag: Bool }` / `class Sub: Base { func flag() }` —
+    ///      `let a = s.flag` reads the base PROPERTY, but `let g: () -> Int = s.flag` picks the
+    ///      subclass METHOD. The use-site's contextual type decides, and this tier does not model
+    ///      contextual types, so VALUE position is always `.unknowable`. That still fixes the bug it
+    ///      is there for: today the local method is rewritten anyway (a wrong rename nothing
+    ///      catches), and `.unknowable` turns it into a surviving original name RollbackPass reverts.
+    ///
+    /// Deliberately a RESOLVER-side walk, not an injection into the subclass scope: an inherited
+    /// method placed in a lexical scope becomes a false unique match in `resolveCall` and shadows the
+    /// protocol-extension overload a call actually selects (the regression that keeps
+    /// `SuperclassVisibility` non-callable-only — `testOverloadByArgType_…`). Nothing here touches
+    /// `resolveCall`.
+    private func inheritedCompletion(_ name: String, of owner: Symbol?, position: UsePosition,
+                                     local: [Symbol]) -> InheritedCompletion {
+        guard let owner, owner.kind == .class else { return .none }
+        let inherited = inheritedMembers(name, of: owner, admitting: position)
+        guard !inherited.isEmpty else { return .none }
+        guard position == .callee else { return .unknowable }
+        // Callee position: the local candidates keep the call only if one of them can be called AS A
+        // VALUE, i.e. is or might be function-typed. Anything with a known non-function type cannot.
+        return local.allSatisfy(isKnownNonFunctionTyped) ? .use(inherited) : .unknowable
+    }
+
+    /// The CLASS a symbol is a member of, or nil when it is a local, a parameter, or a member of a
+    /// struct/enum/protocol — the kinds that have no superclass chain to complete a set from.
+    private func memberOwnerClass(of sym: Symbol) -> Symbol? {
+        guard let scope = sym.scope, scope.kind == .type,
+              let owner = scope.owner, owner.kind == .class else { return nil }
+        return owner
+    }
+
+    /// Members named `name` that `position` admits, taken from the NEAREST ancestor declaring the
+    /// name at that kind — stopping at the first level is Swift's shadowing rule between levels.
+    /// Memoized per class: the chain walk re-parses the declaring file's inheritance clause.
+    private func inheritedMembers(_ name: String, of cls: Symbol,
+                                  admitting position: UsePosition) -> [Symbol] {
+        let chain: [Symbol]
+        if let cached = ancestorCache[cls.id] {
+            chain = cached
+        } else {
+            chain = SuperclassChain.ancestors(of: cls, in: table)
+            ancestorCache[cls.id] = chain
+        }
+        for ancestor in chain {
+            guard let scope = innerScope(of: ancestor) else { continue }
+            let found = scope.members(named: name).filter { position.admits($0.kind) }
+            if !found.isEmpty { return found }
+        }
+        return []
+    }
+
+    /// True when `sym`'s type is KNOWN and is not a function type — the only state in which we can
+    /// say the compiler is NOT calling this member at `obj.name()`.
+    ///
+    /// `WrittenTypeName.of` (the single reducer behind `declaredType` and `typealiasTarget`) returns
+    /// nil for a function type, so "no recorded type" already means "possibly callable" — and so does
+    /// a chain that ends at a typealias with no recorded target, which is how
+    /// `typealias Handler = () -> Void; var run: Handler` reaches us.
+    private func isKnownNonFunctionTyped(_ sym: Symbol) -> Bool {
+        var typeName = table.declaredType[sym.id]
+        var scope = sym.scope
+        var hops = 0
+        while let written = typeName, hops < 8 {
+            hops += 1
+            guard let resolved = typeResolver.typeSymbol(forQualifiedName: written,
+                                                         in: scope ?? currentScope) else {
+                return true                       // a name we don't own — a written, non-function type
+            }
+            guard resolved.kind == .typealias_ else { return true }
+            guard let target = table.typealiasTarget[resolved.id] else { return false }
+            typeName = target
+            scope = resolved.scope
+        }
+        return false
     }
 
     /// A resolved candidate, tagged `candidate-has-no-obf` when it carries no obf: the use-site is

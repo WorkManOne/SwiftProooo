@@ -20,24 +20,28 @@ import SwiftSyntax
 /// separate, still-open `OverrideLinker` concern; this pass does not touch overridden members).
 ///
 /// **Only NON-callable members are copied** (stored/computed properties, nested types, typealiases)
-/// — NOT methods. Reason: `ResolutionPass.resolveCall` returns early when the lexical scope yields a
-/// single same-named callable, BEFORE consulting the global `table.callables(named:)` fallback that
-/// gathers cross-type/extension overloads. Injecting an inherited method into the subclass scope can
-/// make it a false UNIQUE scope match and shadow a protocol-extension overload the call actually
-/// selects (regressed `testOverloadByArgType_…`). Properties never overload, so they have no such
-/// hazard. Inherited *method* uses are already covered for bare calls (the global callable fallback);
-/// the residual `self.inheritedMethod()` member-access case is left to a future superclass-aware
-/// member resolver / `OverrideLinker`.
+/// — NOT methods, and this is still deliberate. Reason: `ResolutionPass.resolveCall` returns early
+/// when the lexical scope yields a single same-named callable, BEFORE consulting the global
+/// `table.callables(named:)` fallback that gathers cross-type/extension overloads. Injecting an
+/// inherited method into the subclass scope can make it a false UNIQUE scope match and shadow a
+/// protocol-extension overload the call actually selects (regressed `testOverloadByArgType_…`).
+/// Properties never overload, so they have no such hazard.
 ///
-/// Safety (mirrors ConformanceVisibility's B-FIX-5 discipline):
-///   - Superclass name resolution is **module-aware and fail-closed** (`preferredClass`): the
-///     same-module candidate wins; a sole cross-module candidate is accepted; several same-named
-///     classes in OTHER modules with none here ⇒ skip (never an arbitrary `.first`, which would copy
-///     the wrong module's members and produce a wrong rename).
-///   - An EXTERNAL superclass (UIKit's `UIViewController`, …) is not in our table ⇒ doesn't resolve
-///     ⇒ the chain stops there (its members stay external/original, as they must).
-///   - Generic superclasses (`Base<T>`) resolve by their base name (`Base`); element substitution is
-///     not modelled (the documented partial-generics limit).
+/// Inherited *method* CALLS are therefore covered elsewhere, and both routes are now closed:
+/// the bare `inheritedMethod()` form by the global callable fallback above, and the
+/// `sub.inheritedMethod()` / `self.inheritedMethod()` MEMBER-ACCESS form by
+/// `ResolutionVisitor.inheritedMembers` (B-FIX-47), which completes the candidate set from the
+/// superclass chain inside the RESOLVER — no symbol is injected into any scope, so
+/// `resolveCall`'s precedence is untouched and the regression above cannot come back.
+///
+/// The name-keyed `seenNames` shadowing here is likewise kind-BLIND on purpose: a subclass
+/// `func flag()` blocks the copy of an ancestor's `var flag`, which is exactly right for this pass
+/// (copying it would inject a mixed-kind set into the scope) and is handled at the use-site by the
+/// same B-FIX-47 completion.
+///
+/// Safety (mirrors ConformanceVisibility's B-FIX-5 discipline): the chain walk, its module-aware
+/// fail-closed superclass lookup, the external-superclass stop and the generics limit all live in
+/// `SuperclassChain` — one implementation shared with `OverrideLinker` and the resolver.
 public final class SuperclassVisibility {
     public let table: SymbolTable
     public let logger: Logger
@@ -56,11 +60,7 @@ public final class SuperclassVisibility {
             // Names already visible in the subclass (own decls + nearer-ancestor copies) shadow
             // farther ones — seed with the subclass's own members, then walk ancestors nearest-first.
             var seenNames = Set(inner.symbols.map { $0.name })
-            var visitedClassIds: Set<Int> = [sym.id]   // cycle guard (invalid Swift, but be safe)
-            var current = sym
-            while let superSym = superclass(of: current),
-                  !visitedClassIds.contains(superSym.id) {
-                visitedClassIds.insert(superSym.id)
+            for superSym in SuperclassChain.ancestors(of: sym, in: table) {
                 if let superParent = superSym.scope,
                    let superScope = superParent.children.first(where: { $0.owner?.id == superSym.id }) {
                     for member in superScope.symbols
@@ -70,7 +70,6 @@ public final class SuperclassVisibility {
                         inherited += 1
                     }
                 }
-                current = superSym
             }
         }
         if inherited > 0 {
@@ -89,33 +88,4 @@ public final class SuperclassVisibility {
         }
     }
 
-    /// The single LOCAL class a class directly inherits from, or nil (external / no superclass /
-    /// ambiguous). A class has at most one superclass; the remaining inheritance entries are
-    /// protocols, which resolve to nil here.
-    ///
-    /// Deliberately reads the PRIMARY declaration only, not `SymbolTable.conformanceNames`: Swift
-    /// does not allow an extension to add a superclass, so the extension half can contribute nothing
-    /// but protocol names this function must discard anyway.
-    private func superclass(of sym: Symbol) -> Symbol? {
-        for name in inheritanceNames(for: sym) {
-            // Strip generic args (`Base<T>` → `Base`) before lookup — partial-generics limit applies.
-            var base = name
-            if let lt = base.firstIndex(of: "<") { base = String(base[..<lt]) }
-            if let cls = preferredClass(named: base, forModule: sym.module.name) {
-                return cls
-            }
-        }
-        return nil
-    }
-
-    /// Module-aware, fail-closed class lookup (same discipline as
-    /// `ConformanceVisibility.preferredProtocol`): same-module candidate wins; a single cross-module
-    /// candidate is accepted; multiple cross-module candidates with none in `module` ⇒ nil.
-    private func preferredClass(named name: String, forModule module: String) -> Symbol? {
-        table.preferredType(kind: .class, named: name, inModule: module)
-    }
-
-    private func inheritanceNames(for sym: Symbol) -> [String] {
-        InheritanceClause.names(atOffset: sym.declOffset, in: sym.file.syntax)
-    }
 }

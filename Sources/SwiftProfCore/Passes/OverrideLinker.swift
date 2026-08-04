@@ -14,8 +14,8 @@ import SwiftSyntax
 /// use-site while member-access method calls frequently don't.)
 ///
 /// Policy (mirrors WitnessLinker's group-rollback):
-///   - Walk the LOCAL superclass chain (module-aware, fail-closed `preferredClass`) to pair each
-///     override with the nearest ancestor member it overrides. Union the override + its base into
+///   - Walk the LOCAL superclass chain (`SuperclassChain.ancestors` — module-aware, fail-closed) to
+///     pair each override with the nearest ancestor member it overrides. Union the override + base into
 ///     one group; a multi-level chain (`Base.f` ← `Mid.f` ← `Leaf.f`) collapses to one group.
 ///   - **Local base** → every member in the group adopts the base's obf (the base is the group's
 ///     only non-override root). Base + all overrides rename identically → green AND obfuscated.
@@ -108,16 +108,12 @@ public final class OverrideLinker {
     /// ancestor, look for a member of the same kind + name (and, for methods, a compatible
     /// signature). Returns nil when the base is external / unresolved (→ caller reverts the group).
     private func findLocalBase(of m: Symbol, startingFrom cls: Symbol) -> Symbol? {
-        var visited: Set<Int> = [cls.id]
-        var current = cls
-        while let superSym = superclass(of: current), !visited.contains(superSym.id) {
-            visited.insert(superSym.id)
+        for superSym in SuperclassChain.ancestors(of: cls, in: table) {
             for scope in scopesByOwner[superSym.id] ?? [] {
                 for cand in scope.symbols where cand.kind == m.kind && cand.name == m.name {
                     if m.kind == .property || signaturesCompatible(m, cand) { return cand }
                 }
             }
-            current = superSym
         }
         return nil
     }
@@ -126,26 +122,6 @@ public final class OverrideLinker {
     private func ownerClass(of m: Symbol) -> Symbol? {
         guard let owner = m.scope?.owner, owner.kind == .class else { return nil }
         return owner
-    }
-
-    /// The single LOCAL class `sym` directly inherits from, or nil (external / none / ambiguous).
-    /// A class's first resolvable inheritance entry is its superclass; the rest are protocols.
-    ///
-    /// Primary declaration only, on purpose (same reason as SuperclassVisibility): an extension
-    /// cannot add a superclass, so `SymbolTable.conformanceNames` would only add protocol names.
-    private func superclass(of sym: Symbol) -> Symbol? {
-        for name in inheritanceNames(for: sym) {
-            var base = name
-            if let lt = base.firstIndex(of: "<") { base = String(base[..<lt]) }   // strip `Base<T>`
-            if let cls = preferredClass(named: base, forModule: sym.module.name) { return cls }
-        }
-        return nil
-    }
-
-    /// Module-aware, fail-closed class lookup (same discipline as
-    /// `SuperclassVisibility.preferredClass` / `ConformanceVisibility.preferredProtocol`).
-    private func preferredClass(named name: String, forModule module: String) -> Symbol? {
-        table.preferredType(kind: .class, named: name, inModule: module)
     }
 
     /// Method signature compatibility for override pairing: external labels equal and no KNOWN
@@ -187,9 +163,5 @@ public final class OverrideLinker {
     private func collect(_ scope: Scope) {
         if let ownerId = scope.owner?.id { scopesByOwner[ownerId, default: []].append(scope) }
         for c in scope.children { collect(c) }
-    }
-
-    private func inheritanceNames(for sym: Symbol) -> [String] {
-        InheritanceClause.names(atOffset: sym.declOffset, in: sym.file.syntax)
     }
 }

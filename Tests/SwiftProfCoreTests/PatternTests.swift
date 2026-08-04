@@ -1844,6 +1844,160 @@ final class PatternTests: XCTestCase {
         XCTAssertFalse(r.contains("alpha"), "inherited use must rename through 2 levels:\n\(r)")
     }
 
+    // MARK: - Inherited member vs. same-named subclass member of another kind (B-FIX-47)
+
+    /// The reported shape: a subclass declares a PROPERTY named like an inherited METHOD (legal
+    /// Swift, no `override`, different kind). `s.run()` calls `Base.run()` because a `Bool` is not
+    /// callable, `s.run` reads the property. The subclass scope holds only the property, so the
+    /// position filter had nothing to pick and the `count == 1` exit rewrote BOTH sites to the
+    /// property's obf: "cannot call value of non-function type 'Bool'", with 0 desyncs reported.
+    func testInheritedMethod_sameNamedSubclassProperty_callResolvesToBaseMethod() throws {
+        let r = try runPipeline("""
+        class Base { func run() -> String { return "BASE-METHOD" } }
+        class Sub: Base { var run: Bool = false }
+        func demo() -> String {
+            let s = Sub()
+            let a = s.run()
+            let b = s.run
+            return a + "/" + String(b)
+        }
+        """)
+        let methodObf = try firstGroup(#"func (\w+)\(\) -> String"#, in: r)
+        let propObf = try firstGroup(#"var (\w+): Bool = false"#, in: r)
+        XCTAssertNotEqual(methodObf, "run", "base method must be obfuscated:\n\(r)")
+        XCTAssertNotEqual(propObf, "run", "subclass property must be obfuscated:\n\(r)")
+        XCTAssertNotEqual(methodObf, propObf, "the two are unrelated declarations:\n\(r)")
+        XCTAssertTrue(r.contains(".\(methodObf)()"),
+                      "the CALL must take the inherited method's obf \(methodObf):\n\(r)")
+        XCTAssertTrue(r.contains(".\(propObf)\n"),
+                      "the value READ must take the property's obf \(propObf):\n\(r)")
+        XCTAssertFalse(r.contains(".\(propObf)()"),
+                       "the property must never be called:\n\(r)")
+    }
+
+    /// The same, reached through `self` inside the subclass and across TWO levels of inheritance —
+    /// the chain walk must not stop at the immediate superclass.
+    func testInheritedMethod_selfCallThroughTwoLevels_resolvesToGrandparentMethod() throws {
+        let r = try runPipeline("""
+        class Grand { func tick() -> String { return "GRAND" } }
+        class Mid: Grand { }
+        final class Leaf: Mid {
+            var tick: Bool = false
+            func probe() -> String { return self.tick() + String(self.tick) }
+        }
+        """)
+        let methodObf = try firstGroup(#"func (\w+)\(\) -> String \{ return "GRAND" \}"#, in: r)
+        let propObf = try firstGroup(#"var (\w+): Bool = false"#, in: r)
+        XCTAssertNotEqual(methodObf, "tick", "grandparent method must be obfuscated:\n\(r)")
+        XCTAssertTrue(r.contains("self.\(methodObf)()"),
+                      "`self.tick()` must resolve two levels up to \(methodObf):\n\(r)")
+        XCTAssertTrue(r.contains("String(self.\(propObf))"),
+                      "`self.tick` must still read the subclass property:\n\(r)")
+    }
+
+    /// The one case in which the subclass property WINS: a closure-typed property is genuinely
+    /// callable and shadows the base method (`swiftc` prints `PROP`). `WrittenTypeName.of` returns
+    /// nil for a function type, so such a property is exactly "a property with no recorded type" —
+    /// the resolver must fail CLOSED there rather than redirect the call to the base method.
+    /// Fail-closed means the use-site keeps its original name, RollbackPass sees the survivor and
+    /// reverts, so the whole name ends up un-obfuscated: green, one name lost.
+    func testClosureTypedSubclassProperty_callIsNotRedirectedToInheritedMethod() throws {
+        let r = try runPipeline("""
+        class Base { func run() -> String { return "BASE" } }
+        final class Sub: Base { var run: () -> String = { return "PROP" } }
+        func demo() -> String {
+            let s = Sub()
+            return s.run()
+        }
+        """)
+        XCTAssertTrue(r.contains("var run: () -> String"),
+                      "the closure property must be reverted, not renamed:\n\(r)")
+        XCTAssertTrue(r.contains(".run()"),
+                      "the call must keep the ORIGINAL name — the property is what is called:\n\(r)")
+        XCTAssertTrue(r.contains("func run() -> String { return \"BASE\" }"),
+                      "the base method reverts with it (rollback group):\n\(r)")
+    }
+
+    /// Guard test for the reason `narrowed` falls back to its unfiltered set at all: calling a
+    /// closure-typed property is ordinary Swift and must keep renaming when no superclass is
+    /// involved. B-FIX-47 must not cost this its obf.
+    func testClosureTypedProperty_calledAsValue_stillRenames() throws {
+        let r = try runPipeline("""
+        final class Widget { var handler: () -> String = { return "H" } }
+        func demo() -> String {
+            let w = Widget()
+            return w.handler()
+        }
+        """)
+        let propObf = try firstGroup(#"var (\w+): \(\) -> String"#, in: r)
+        XCTAssertNotEqual(propObf, "handler", "the closure property must still be obfuscated:\n\(r)")
+        XCTAssertTrue(r.contains(".\(propObf)()"),
+                      "`w.handler()` must still rewrite to the property's obf:\n\(r)")
+    }
+
+    /// The same defect on the OTHER lookup path: a BARE `tick()` inside the subclass. `lookupCallee`
+    /// finds the subclass property, and the `case .parameter, .property` branch renamed the call to
+    /// its obf and returned, so `resolveCall`'s global callable fallback (which does cover bare
+    /// inherited calls) was never reached — `String(tick())` became `String(p0())`, red.
+    func testInheritedMethod_bareCallUnderSameNamedProperty_resolvesToBaseMethod() throws {
+        let r = try runPipeline("""
+        class Base { func tick() -> Int { return 1 } }
+        final class Sub: Base {
+            var tick: String = "s"
+            func probe() -> String { return String(tick()) + tick }
+        }
+        """)
+        let methodObf = try firstGroup(#"func (\w+)\(\) -> Int"#, in: r)
+        let propObf = try firstGroup(#"var (\w+): String = "s""#, in: r)
+        XCTAssertNotEqual(methodObf, "tick", "base method must be obfuscated:\n\(r)")
+        XCTAssertTrue(r.contains("String(\(methodObf)()) + \(propObf)"),
+                      "bare `tick()` must call the base method and bare `tick` read the property:\n\(r)")
+    }
+
+    /// Guard for the line the branch above sits on: a LOCAL or PARAMETER really does shadow an
+    /// inherited method (`func f(tick: String) { tick() }` is "cannot call value of non-function
+    /// type 'String'" — checked against swiftc), so the closure-value call idiom must be untouched.
+    func testClosureParameter_calledAsValue_isNotRedirectedToAnInheritedMethod() throws {
+        let r = try runPipeline("""
+        class Base { func render() -> String { return "BASE" } }
+        final class Sub: Base {
+            func build(with render: () -> String) -> String { return render() }
+        }
+        """)
+        let methodObf = try firstGroup(#"func (\w+)\(\) -> String"#, in: r)
+        let paramObf = try firstGroup(#"with (\w+): \(\) -> String"#, in: r)
+        XCTAssertNotEqual(paramObf, "render", "the closure parameter must still be obfuscated:\n\(r)")
+        XCTAssertTrue(r.contains("return \(paramObf)()"),
+                      "`render()` must stay the PARAMETER call — a parameter shadows the "
+                          + "inherited method:\n\(r)")
+        XCTAssertFalse(r.contains("return \(methodObf)()"),
+                       "the call must NOT be redirected to the inherited method:\n\(r)")
+    }
+
+    /// The mirror image: an inherited PROPERTY under a same-named subclass METHOD. `let a = s.flag`
+    /// reads `Base.flag`, but `let g: () -> Int = s.flag` picks `Sub.flag` — the contextual type
+    /// decides and this tier does not model it. Before B-FIX-47 the local method was rewritten
+    /// regardless (a wrong rename nothing catches, and a SILENT one: the site still compiles, it
+    /// just reads a function value instead of a Bool). Fail closed instead: the survivor makes
+    /// RollbackPass revert.
+    func testInheritedProperty_sameNamedSubclassMethod_valueReadStaysFailClosed() throws {
+        let r = try runPipeline("""
+        class Base { var flag: Bool = true }
+        final class Sub: Base { func flag() -> Int { return 7 } }
+        func demo() -> String {
+            let s = Sub()
+            let a = s.flag
+            return String(describing: a)
+        }
+        """)
+        XCTAssertTrue(r.contains("var flag: Bool = true"),
+                      "the base property must revert, not adopt the method's obf:\n\(r)")
+        XCTAssertTrue(r.contains("func flag() -> Int"),
+                      "the subclass method reverts with it (rollback group):\n\(r)")
+        XCTAssertTrue(r.contains(".flag\n"),
+                      "the read must keep its original name:\n\(r)")
+    }
+
     // MARK: - Override chains (OverrideLinker): base + override must share one obf
 
     func testOverride_methodChain_baseAndOverridesShareObf() throws {
