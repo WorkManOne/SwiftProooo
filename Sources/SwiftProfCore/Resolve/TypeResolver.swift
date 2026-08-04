@@ -59,7 +59,19 @@ public final class TypeResolver {
     /// everywhere its frame is live: an `if case` payload binding stops at the end of its statement's
     /// body (B-FIX-42). Passing it is not optional bookkeeping — dropping it re-opens exactly that
     /// wrong rename, so every call site here reads the offset off the `DeclReferenceExpr` it holds.
-    public var localBindingTypeName: ((String, Int?) -> (name: String, scope: Scope)?)?
+    ///
+    /// The third is the COMPETITOR: the scope the same-named declaration our own lexical lookup
+    /// found was written in, or nil when it found none. A binding is lexically nested in the scope
+    /// it was flattened into, so it beats that scope's own declarations and everything above them
+    /// and loses only to a declaration written DEEPER (B-FIX-46). The provider cannot work this out
+    /// on its own — a flat frame stack carries no depth — so the caller that did the lookup must
+    /// say what it found. There is exactly ONE call site (`bareValueTypeInfo`), which is what keeps
+    /// the answer from depending on which path reached it.
+    ///
+    /// The answer is a `LocalBindingType`, not an optional type name, because "no binding owns this
+    /// name" and "a binding owns it but we could not type it" must lead to different behaviour —
+    /// see that type.
+    public var localBindingTypeName: ((String, Int?, Scope?) -> LocalBindingType?)?
 
     public init(table: SymbolTable, preferredModule: String? = nil,
                 indexContext: IndexContext? = nil,
@@ -312,14 +324,35 @@ public final class TypeResolver {
     /// silently disabled subscript results (`rows[0].field`) and stdlib-collection members
     /// (`rows.first?.field`) on any binding.
     ///
-    /// Order matches the three-source list and is load-bearing where sources overlap: a recorded
-    /// `declaredType` is a written fact and outranks both inferences.
+    /// Order is load-bearing where sources overlap, and it is the FLOW-SENSITIVE source that goes
+    /// first (B-FIX-46). It has to: an optional binding is deliberately not a Symbol of any scope
+    /// (B-FIX-12), so `scope.lookup` cannot see it — asking the lookup first and returning its
+    /// `declaredType` meant source 3 was unreachable whenever a same-named declaration existed at
+    /// all. With `var slot: DetailA` in the type and `if let slot = payload { slot.holdB }`, the
+    /// in-body member was typed from the PROPERTY and rewritten to `DetailA.holdB`'s obf on a
+    /// `DetailB` receiver — a wrong rename nothing catches, since no original name survives.
+    ///
+    /// The lexical rule the two sources are ranked by is `outScoping`: the binding is nested in the
+    /// scope it was flattened into, so it wins against `found` unless `found` was written DEEPER
+    /// (a closure's local, a nested `func`'s local, a local of the binding's own body block), in
+    /// which case the provider declines and the lookup below answers. Sources 1 and 2 keep their
+    /// relative order — a recorded `declaredType` is a written fact and outranks HOF inference.
     private func bareValueTypeInfo(named name: String, from ref: DeclReferenceExprSyntax,
                                    in scope: Scope) -> (name: String, scope: Scope)? {
         let refOffset = ref.positionAfterSkippingLeadingTrivia.utf8Offset
         // At the reference's POSITION: a local of a braced block is visible only after its own
         // declaration, so `p2.p3` written above `let p2: Detail = …` is typed from the PARAMETER.
-        if let sym = scope.lookup(name: name, at: refOffset) {
+        let found = scope.lookup(name: name, at: refOffset)
+        // Source 3, and the ONE place it is consulted — the binding either out-scopes `found` or
+        // declines, and no other path may ask again with a different answer. A binding that owns
+        // the name but carries no type ends the search: `found` is the declaration it SHADOWS, so
+        // that type is not merely a weaker guess, it is the wrong one.
+        switch localBindingTypeName?(name, refOffset, found?.scope) {
+        case .typed(let boundName, let boundScope): return (boundName, boundScope)
+        case .untyped: return nil
+        case nil: break
+        }
+        if let sym = found {
             if sym.kind.isTypeLike { return nil }
             if let t = table.declaredType[sym.id] {
                 // The DECLARING scope, not the use-site: a bare nested type (`var p: S3` inside
@@ -329,14 +362,10 @@ public final class TypeResolver {
             }
             // Registered but untyped — a closure parameter or a case-let binding. Registering it for
             // shadow correctness must not disable the typing that ran when the name was absent from
-            // the scope tree, so both remaining sources are tried here too.
+            // the scope tree, so the remaining source is tried here too.
             guard sym.kind == .parameter else { return nil }
-            if let t = inferNamedClosureParamType(name: name, from: ref, in: scope) { return t }
-            return localBindingTypeName?(name, refOffset)
+            return inferNamedClosureParamType(name: name, from: ref, in: scope)
         }
-        // Not a scope Symbol at all — an optional binding (`if let acc = makeFoo()`). Returns nil for
-        // external types (URL, …), leaving external members untouched.
-        if let t = localBindingTypeName?(name, refOffset) { return t }
         return inferNamedClosureParamType(name: name, from: ref, in: scope)
     }
 

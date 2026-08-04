@@ -123,6 +123,28 @@ public final class Scope {
         return sym.kind == .property || sym.kind == .parameter
     }
 
+    /// True when `self` is a STRICT descendant of `other` — `other` encloses it and is not it.
+    ///
+    /// This is the LEXICAL DEPTH a flat frame stack cannot express, and the reason it is needed:
+    /// an optional binding (`if let slot = payload`) is deliberately not a Symbol of any scope
+    /// (B-FIX-12), so it lives only in `ResolutionPass`'s frames — and a frame knows which scope it
+    /// belongs to but nothing about where a competing DECLARATION was written. The binding beats a
+    /// declaration of the scope it was flattened into or of any scope ABOVE it (a property, a
+    /// parameter, a local declared earlier in the same block) and loses to one written in a scope
+    /// NESTED inside its own body (a closure's local, a nested `func`'s local, a local of the body
+    /// block itself). All six shapes verified against swiftc — see `BindingFrames` (B-FIX-46).
+    ///
+    /// Cheap and allocation-free: the chain from a use-site scope to the file scope is a handful of
+    /// links, and the walk stops at the first match.
+    public func isNested(in other: Scope) -> Bool {
+        var probe = parent
+        while let cur = probe {
+            if cur === other { return true }
+            probe = cur.parent
+        }
+        return false
+    }
+
     /// Find direct child symbol by name (used for `Type.member`).
     public func member(named name: String) -> Symbol? {
         for sym in symbols where sym.name == name { return sym }

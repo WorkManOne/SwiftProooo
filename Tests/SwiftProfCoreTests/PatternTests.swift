@@ -5874,4 +5874,191 @@ final class PatternTests: XCTestCase {
         XCTAssertTrue(r.contains("return box.\(holds[1])\n"),
                       "the read below is typed from the still-live guard binding (Detail):\n\(r)")
     }
+
+    // MARK: - B-FIX-46: an optional binding out-scopes an enclosing declaration of its name
+
+    func testOptionalBinding_ifLet_inBodyMemberIsTypedFromTheBindingNotTheProperty() throws {
+        // The reported shape. Both types declare `hold`, so the two obfs differ and typing the
+        // receiver from the PROPERTY writes `DetailA.hold`'s obf onto a `DetailB` value — a wrong
+        // rename nothing catches (nothing of the original name survives, so RollbackPass reports
+        // `0 names desynced` and `--diagnose-overloads` writes no line).
+        let r = try runPipeline("""
+        struct DetailA { let hold: String }
+        struct DetailB { let hold: String }
+        final class Slot {
+            var slot: DetailA = DetailA(hold: "PROP")
+            func f(_ payload: DetailB?) -> String {
+                if let slot = payload { return slot.hold }
+                return slot.hold
+            }
+        }
+        """)
+        let holds = try allGroups(#"let (\w+): String"#, in: r)
+        XCTAssertEqual(holds.count, 2, "both `hold` declarations rename distinctly:\n\(r)")
+        XCTAssertTrue(r.contains("{ return slot.\(holds[1]) }"),
+                      "the in-body member is typed from the BINDING (DetailB):\n\(r)")
+        XCTAssertFalse(r.contains("{ return slot.\(holds[0]) }"),
+                       "the in-body member must not carry DetailA.hold's obf:\n\(r)")
+    }
+
+    func testOptionalBinding_ifLet_inBodyMemberOutScopesAnEnclosingParameter() throws {
+        // Depth form 2. Same race one scope in: the shadowed declaration is the enclosing
+        // function's PARAMETER, which the binding also beats (`func f(slot: DetailA, …)` with
+        // `if let slot = payload` reads the binding in the body — verified against swiftc).
+        let r = try runPipeline("""
+        struct DetailA { let hold: String }
+        struct DetailB { let hold: String }
+        func f(slot: DetailA, payload: DetailB?) -> String {
+            if let slot = payload { return slot.hold }
+            return slot.hold
+        }
+        """)
+        let holds = try allGroups(#"let (\w+): String"#, in: r)
+        XCTAssertEqual(holds.count, 2, "both `hold` declarations rename distinctly:\n\(r)")
+        XCTAssertTrue(r.contains("{ return slot.\(holds[1]) }"),
+                      "the in-body member is typed from the BINDING, not the parameter:\n\(r)")
+    }
+
+    func testOptionalBinding_ifLet_inBodyMemberOutScopesASameScopeLocalAboveTheStatement() throws {
+        // Depth form 5, the equal-depth case: the local sits in the very block the binding was
+        // flattened into. Swift lets the binding shadow it (`let slot = DetailA(); if let slot =
+        // payload { … }` compiles and the body reads the binding), so "wins against its own scope"
+        // has to be part of the rule, not just "wins against scopes above it".
+        let r = try runPipeline("""
+        struct DetailA { let hold: String }
+        struct DetailB { let hold: String }
+        func f(_ payload: DetailB?) -> String {
+            let slot = DetailA(hold: "OUTER")
+            if let slot = payload { return slot.hold }
+            return slot.hold
+        }
+        """)
+        let holds = try allGroups(#"let (\w+): String"#, in: r)
+        XCTAssertEqual(holds.count, 2, "both `hold` declarations rename distinctly:\n\(r)")
+        XCTAssertTrue(r.contains("{ return slot.\(holds[1]) }"),
+                      "the in-body member is typed from the BINDING, not the local above:\n\(r)")
+    }
+
+    func testOptionalBinding_guardLet_belowTheStatementOutScopesTheProperty() throws {
+        // The `guard let` half of the same race: below the statement the binding is still live
+        // (B-FIX-45's deliberate exception), so it must win the TYPE there too.
+        let r = try runPipeline("""
+        struct DetailA { let hold: String }
+        struct DetailB { let hold: String }
+        final class Slot {
+            var slot: DetailA = DetailA(hold: "PROP")
+            func f(_ payload: DetailB?) -> String {
+                guard let slot = payload else { return slot.hold }
+                return slot.hold
+            }
+        }
+        """)
+        let holds = try allGroups(#"struct \w+ \{ let (\w+): String \}"#, in: r)
+        XCTAssertEqual(holds.count, 2, "both `hold` declarations rename distinctly:\n\(r)")
+        let propObf = try firstGroup(#"var (\w+): \w+ = "#, in: r)
+        XCTAssertTrue(r.contains("return slot.\(holds[1])\n"),
+                      "below the guard the member is typed from the BINDING (DetailB):\n\(r)")
+        XCTAssertTrue(r.contains("else { return \(propObf).\(holds[0]) }"),
+                      "inside the guard's else the name is still the PROPERTY (DetailA):\n\(r)")
+    }
+
+    func testOptionalBinding_ifLet_losesToALocalDeclaredInAClosureInsideItsOwnBody() throws {
+        // Depth form 3 — the guard-rail in the OPPOSITE direction, and the reason a flat frame
+        // stack is not enough. The closure's local is nested INSIDE the binding's body, so it owns
+        // the name there: it renames, and leaving its use-site alone (which a depth-blind
+        // `isLocallyShadowed` did) shipped "cannot find 'slot' in scope" — rollback shield 1e
+        // blocks the rescue, so this half is a red build, not a coverage loss.
+        let r = try runPipeline("""
+        struct DetailA { let holdA: String }
+        struct DetailB { let holdB: String }
+        func f(_ payload: DetailB?) -> String {
+            if let slot = payload {
+                let make: () -> String = {
+                    let slot = DetailA(holdA: "NESTED")
+                    return slot.holdA
+                }
+                return make() + slot.holdB
+            }
+            return "none"
+        }
+        """)
+        let holds = try allGroups(#"struct \w+ \{ let (\w+): String \}"#, in: r)
+        let localObf = try firstGroup(#"let (\w+) = \w+\(\w+: "NESTED"\)"#, in: r)
+        XCTAssertTrue(r.contains("return \(localObf).\(holds[0])"),
+                      "the closure's local owns the name and its use-site renames with it:\n\(r)")
+        XCTAssertFalse(r.contains("return slot.\(holds[0])"),
+                       "the outer binding must not claim the name inside the closure:\n\(r)")
+    }
+
+    func testOptionalBinding_ifLet_losesToALocalDeclaredInItsOwnBodyBlock() throws {
+        // Depth form 4: no closure needed — the body block is already a scope nested inside the
+        // one the binding was flattened into, so a local declared there beats the binding from its
+        // own declaration onward while the read ABOVE it is still the binding's.
+        let r = try runPipeline("""
+        struct DetailA { let holdA: String }
+        struct DetailB { let holdB: String }
+        func f(_ payload: DetailB?) -> String {
+            if let slot = payload {
+                let above = slot.holdB
+                let slot = DetailA(holdA: "INNER")
+                return above + slot.holdA
+            }
+            return "none"
+        }
+        """)
+        let holds = try allGroups(#"struct \w+ \{ let (\w+): String \}"#, in: r)
+        let localObf = try firstGroup(#"let (\w+) = \w+\(\w+: "INNER"\)"#, in: r)
+        XCTAssertTrue(r.contains("= slot.\(holds[1])"),
+                      "above the local, the name is still the BINDING:\n\(r)")
+        XCTAssertTrue(r.contains("+ \(localObf).\(holds[0])"),
+                      "below its declaration, the body-block local owns the name:\n\(r)")
+    }
+
+    func testOptionalBinding_ifLet_losesToALocalInANestedFunctionInsideItsOwnBody() throws {
+        // Depth form 8. A nested `func` body is two scopes down, and crossing a `.function`
+        // boundary drops the position offset (the capture rule) — the depth answer must not.
+        let r = try runPipeline("""
+        struct DetailA { let holdA: String }
+        struct DetailB { let holdB: String }
+        func f(_ payload: DetailB?) -> String {
+            if let slot = payload {
+                func inner() -> String {
+                    let slot = DetailA(holdA: "FN")
+                    return slot.holdA
+                }
+                return inner() + slot.holdB
+            }
+            return "none"
+        }
+        """)
+        let holds = try allGroups(#"struct \w+ \{ let (\w+): String \}"#, in: r)
+        let localObf = try firstGroup(#"let (\w+) = \w+\(\w+: "FN"\)"#, in: r)
+        XCTAssertTrue(r.contains("return \(localObf).\(holds[0])"),
+                      "the nested function's local owns the name:\n\(r)")
+    }
+
+    func testOptionalBinding_untypedBinding_doesNotFallBackToTheShadowedProperty() throws {
+        // A live binding OWNS the name whether or not its own type could be inferred. Here the
+        // initializer is an external iterator the resolver cannot type, and falling through to
+        // `scope.lookup` typed the in-body member from the same-named property — the reported
+        // wrong rename again, just with an unreadable initializer. Fail closed instead: the member
+        // is left alone (a missed rewrite RollbackPass reverts), never rewritten to DetailA's obf.
+        let r = try runPipeline("""
+        struct DetailA { let holdA: String }
+        struct DetailB { let holdB: String }
+        final class Slot {
+            var slot: DetailA = DetailA(holdA: "PROP")
+            func f(_ items: [DetailB]) -> String {
+                var it = items.makeIterator()
+                var out = ""
+                while let slot = it.next() { out += slot.holdA }
+                return out
+            }
+        }
+        """)
+        // `holdA` survives on the binding, so RollbackPass reverts it: the member reads original in
+        // the output. What must NOT appear is the member rewritten to DetailA's obf on `slot`.
+        XCTAssertTrue(r.contains("slot.holdA"),
+                      "an untyped binding types nothing — the member stays original:\n\(r)")
+    }
 }

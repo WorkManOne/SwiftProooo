@@ -237,7 +237,11 @@ private final class ResolutionVisitor: SyntaxVisitor {
     /// needs an end: an `if let` condition is visited BEFORE the body's block scope is entered, so
     /// its binding lands in the ENCLOSING frame and would otherwise outlive the statement
     /// (B-FIX-45). See `BindingFrames` for the rule.
-    var shadowFrames = BindingFrames<Void>()
+    ///
+    /// Each frame also carries the SCOPE it was pushed for, so a lookup can tell whether a
+    /// same-named declaration was written deeper than the binding and therefore beats it
+    /// (B-FIX-46) — hence every read names its competitor.
+    var shadowFrames: BindingFrames<Void>
     /// Parallel to `shadowFrames`: the STATIC TYPE of each in-scope binding, keyed by bound name. An
     /// `if let u = makeURL()` binding carries no `declaredType` (it's not a declared symbol), so a
     /// call `c.f(u)` had no way to disambiguate overloads. Recording the binding's type here lets
@@ -257,7 +261,7 @@ private final class ResolutionVisitor: SyntaxVisitor {
     /// frame (the enclosing block's) lives on to the end of the method. It is the type half of the
     /// same bound `Symbol.conditionBinding` carries for the scope half, and both come from
     /// `ConditionBindingExtent`. nil for a `guard`, whose binding genuinely outlives its statement.
-    var shadowBindingTypeFrames = BindingFrames<(name: String, scope: Scope)>()
+    var shadowBindingTypeFrames: BindingFrames<(name: String, scope: Scope)>
     /// Token ids whose rename decision was already made by qualified-type-chain resolution
     /// (`A.B.C`). Set by the outermost MemberType node; consulted by the inner MemberType nodes
     /// and the root IdentifierType so they do NOT independently rename a partial root match
@@ -313,14 +317,21 @@ private final class ResolutionVisitor: SyntaxVisitor {
                                          useSiteFilePath: path,
                                          useSiteConverter: conv)
         self.scopeStack = [fileScope]
+        // The bottom frame is the file scope's, so a binding written at top level is measured at
+        // the same depth every other frame is (B-FIX-46).
+        self.shadowFrames = BindingFrames(root: fileScope)
+        self.shadowBindingTypeFrames = BindingFrames(root: fileScope)
         super.init(viewMode: .sourceAccurate)
         // Let TypeResolver type optional-binding locals (not Symbols) via the flow-sensitive tracker,
         // so member/chain resolution on a binding (`if let acc = makeFoo(); acc.x.y`) works. Safe: the
         // tracker is read at call time (typeSymbol(of:) is uncached), reflecting the current flow.
         // The offset is the reference's own position: a condition binding stops answering at the end
         // of its statement's body, even though the frame holding it lives longer (B-FIX-42).
-        self.typeResolver.localBindingTypeName = { [weak self] name, at in
-            self?.shadowBindingType(name, at: at)
+        // The third argument is the competitor: the scope the same-named declaration the resolver's
+        // own lookup found was written in. A binding loses only to one written DEEPER than its own
+        // frame (B-FIX-46), and the resolver is the side that knows what it found.
+        self.typeResolver.localBindingTypeName = { [weak self] name, at, competitor in
+            self?.localBindingType(name, at: at, outScoping: competitor)
         }
     }
 
@@ -394,8 +405,14 @@ private final class ResolutionVisitor: SyntaxVisitor {
     /// end of its statement's body (B-FIX-45): without it the name stayed "a local" for the rest
     /// of the enclosing block, so the read BELOW the statement — which is the same-named property —
     /// was skipped entirely while that property's declaration renamed.
+    ///
+    /// The competitor is what stops the binding from claiming a name that a DEEPER declaration owns
+    /// (B-FIX-46): `if let slot = payload { … { let slot = DetailA(); slot.holdA } … }` reads the
+    /// closure's local, which renames — so skipping its use-site here left the original name on a
+    /// renamed declaration ("cannot find 'slot' in scope"). The lookup is inside a closure because
+    /// every bare reference reaches this method and almost none of them is bound.
     private func isLocallyShadowed(_ name: String, at offset: Int?) -> Bool {
-        shadowFrames.isBound(name, at: offset)
+        shadowFrames.isBound(name, at: offset) { currentScope.lookup(name: name, at: offset)?.scope }
     }
 
     /// Swift scoping invariant: a `let`/`var` local is NOT in scope within its OWN initializer.
@@ -494,8 +511,8 @@ private final class ResolutionVisitor: SyntaxVisitor {
     private func enterInnerScope(of node: some SyntaxProtocol) {
         if let s = table.innerScope[node.id] {
             scopeStack.append(s)
-            shadowFrames.push()   // new lexical frame for bindings
-            shadowBindingTypeFrames.push()
+            shadowFrames.push(s)   // new lexical frame for bindings, at that scope's depth
+            shadowBindingTypeFrames.push(s)
         }
     }
     private func exitInnerScope(of node: some SyntaxProtocol) {
@@ -518,8 +535,32 @@ private final class ResolutionVisitor: SyntaxVisitor {
     /// that entry at this position, so an earlier still-live binding of the same name is the right
     /// answer (a `guard` binding that an inner `if let` shadowed for the length of its body). Same
     /// rule `Scope.declarations(named:visibleAt:)` applies to the scope chain — see `BindingFrames`.
-    private func shadowBindingType(_ name: String, at offset: Int?) -> (name: String, scope: Scope)? {
-        shadowBindingTypeFrames.newest(name, at: offset)
+    ///
+    /// `competitor` is the scope the same-named DECLARATION visible here was written in, and the
+    /// binding answers only while nothing deeper owns the name (B-FIX-46). It is the type half of
+    /// the same rule `isLocallyShadowed` applies to the name.
+    private func shadowBindingType(_ name: String, at offset: Int?,
+                                   outScoping competitor: () -> Scope?)
+        -> (name: String, scope: Scope)? {
+        shadowBindingTypeFrames.newest(name, at: offset, outScoping: competitor)
+    }
+
+    /// What `name` means at `offset` when a flow-sensitive binding owns it — the whole answer the
+    /// `TypeResolver` provider hands back, read from BOTH stacks in the one place that can keep
+    /// them consistent.
+    ///
+    /// The type stack is asked first because it is the wider one: it also holds `if case` /
+    /// `switch case` PAYLOAD bindings, which are real scope Symbols and never enter `shadowFrames`
+    /// (B-FIX-29/42). Only when it has nothing does the name stack decide whether an OPTIONAL
+    /// binding owns the name untyped — the `while let slot = it.next()` shape, where answering
+    /// `nil` would hand the reference to the property the binding shadows (B-FIX-46).
+    private func localBindingType(_ name: String, at offset: Int?,
+                                  outScoping competitor: Scope?) -> LocalBindingType? {
+        if let t = shadowBindingType(name, at: offset, outScoping: { competitor }) {
+            return .typed(name: t.name, scope: t.scope)
+        }
+        if shadowFrames.isBound(name, at: offset, outScoping: { competitor }) { return .untyped }
+        return nil
     }
 
     /// Type the bindings of an enum-case pattern (`case .run(let m)`, `case let .run(m)`) from the
@@ -1719,16 +1760,24 @@ private final class ResolutionVisitor: SyntaxVisitor {
         // its inferred type when the binding entered scope (B-FIX-11 follow-up). Check it BEFORE the
         // general typeSymbol fallback so a binding that shadows a same-named property uses the
         // binding's own (unwrapped) type. The name is external/stdlib (URL, …) → match by name.
-        if let ref = expr.as(DeclReferenceExprSyntax.self),
-           let bindingType = shadowBindingType(stripBackticks(ref.baseName.text),
-                                               at: ref.positionAfterSkippingLeadingTrivia.utf8Offset) {
-            // Prefer identity when the name resolves in the scope it belongs to; fall back to the
-            // NAME for external/stdlib types (URL, …), which have no Symbol — the original signal.
-            if let sym = typeResolver.typeSymbol(forQualifiedName: bindingType.name,
-                                                 in: bindingType.scope) {
-                return .typeSymbol(sym)
+        // The competitor is the same-named declaration visible here, so a binding that a DEEPER
+        // local out-scopes does not type this argument either (B-FIX-46).
+        if let ref = expr.as(DeclReferenceExprSyntax.self) {
+            let name = stripBackticks(ref.baseName.text)
+            let at = ref.positionAfterSkippingLeadingTrivia.utf8Offset
+            if let bindingType = shadowBindingType(name, at: at,
+                                                   outScoping: {
+                                                       currentScope.lookup(name: name, at: at)?.scope
+                                                   }) {
+                // Prefer identity when the name resolves in the scope it belongs to; fall back to
+                // the NAME for external/stdlib types (URL, …), which have no Symbol — the original
+                // signal.
+                if let sym = typeResolver.typeSymbol(forQualifiedName: bindingType.name,
+                                                     in: bindingType.scope) {
+                    return .typeSymbol(sym)
+                }
+                return .typeName(bareTypeName(bindingType.name))
             }
-            return .typeName(bareTypeName(bindingType.name))
         }
         // General fallback — resolve the expression's static type via TypeResolver. Catches a
         // bare DeclRef to a typed parameter / property / variable, `obj.prop`, etc. We keep the
