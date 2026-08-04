@@ -11,6 +11,11 @@ import SwiftSyntax
 /// would have made three, and a divergence between them is a wrong view of the hierarchy, which is
 /// a wrong rename no safety net catches.
 ///
+/// The CONFORMANCE half of the same question — "which protocols' extension defaults does this type
+/// inherit" — is `ConformanceChain`, kept separate on purpose: it walks a different graph (a set,
+/// not a line), reads both halves of a conformance (primary clause + extensions, which a superclass
+/// never has), and has far wider reach, since nearly every type conforms to something.
+///
 /// Safety rules the walk carries (all three consumers depend on every one of them):
 ///   - **Module-aware and fail-closed** (`SymbolTable.preferredType`): the same-module candidate
 ///     wins; a sole cross-module candidate is accepted; several same-named classes in OTHER modules

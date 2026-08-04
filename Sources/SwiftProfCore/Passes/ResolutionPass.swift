@@ -167,12 +167,13 @@ enum UnresolvedCause: String {
     case mixedKindCandidates = "mixed-kind-candidates"
     /// Several same-kind candidates and no argument signal picks one.
     case ambiguousOverload = "ambiguous-overload"
-    /// The receiver's own scope declares this name at the WRONG kind for the position and an
-    /// ancestor declares it at the right one, but which of the two the compiler picks depends on
-    /// type information we do not have (B-FIX-47) — a closure-typed subclass property really does
-    /// shadow the base method it is called instead of, and a function-typed context really does
-    /// pick the subclass method over the base property. Fail closed: the use-site keeps its
-    /// original name, so RollbackPass sees the survivor and reverts.
+    /// The receiver's own scope declares this name at the WRONG kind for the position and something
+    /// it INHERITS — a superclass (B-FIX-47) or a conformed protocol's extension default
+    /// (B-FIX-48) — declares it at the right one, but which of the two the compiler picks depends on
+    /// type information we do not have: a closure-typed property really does shadow the inherited
+    /// method it is called instead of, and a function-typed context really does pick the local
+    /// method over the inherited property. Fail closed: the use-site keeps its original name, so
+    /// RollbackPass sees the survivor and reverts.
     case inheritedKindConflict = "inherited-kind-conflict"
     /// Resolved to exactly one declaration which is deliberately not renamed (protected or
     /// policy-skipped). Low-signal: the use-site is correct as it stands.
@@ -234,6 +235,10 @@ private final class ResolutionVisitor: SyntaxVisitor {
     /// `class symbol id → its LOCAL ancestors, nearest first`. `SuperclassChain.ancestors` re-parses
     /// the declaring file to read the inheritance clause, and `inheritedMembers` asks per use-site.
     var ancestorCache: [Int: [Symbol]] = [:]
+    /// `type symbol id → the LOCAL protocols it (or an ancestor) conforms to, nearest first`. Same
+    /// reason as `ancestorCache`: `ConformanceChain.protocols` re-parses the declaring file per level
+    /// of the protocol graph, and `inheritedMembers` asks per use-site (B-FIX-48).
+    var conformanceCache: [Int: [Symbol]] = [:]
     var renames: [Rename] = []
     var scopeStack: [Scope]
     /// Names introduced by optional bindings (`guard let x`, `if let x`, `while let x`) that
@@ -1286,15 +1291,17 @@ private final class ResolutionVisitor: SyntaxVisitor {
                     emitRename(for: token, target: sym)
                     return .skipChildren
                 case .parameter, .property:
-                    // A MEMBER property of a class does not shadow an inherited method the way a
-                    // local or a parameter does: Swift unions a class's own members with its
-                    // ancestors', so `tick()` inside `class Sub: Base { var tick: String }` calls
-                    // `Base.tick()` — while the same name as a LOCAL or PARAMETER really does
-                    // shadow it (`func f(tick: String) { tick() }` is "cannot call value of
-                    // non-function type 'String'", checked against swiftc). Same B-FIX-47 rule as
-                    // `lookupMember`, on the other lookup path: this branch used to rename the CALL
-                    // to the property's obf and `return`, never reaching `resolveCall`.
-                    if sym.kind == .property, let owner = memberOwnerClass(of: sym),
+                    // A MEMBER property does not shadow an inherited callable the way a local or a
+                    // parameter does: Swift unions a type's own members with its ancestors' AND
+                    // with its protocols' extension defaults, so `tick()` inside
+                    // `class Sub: Base { var tick: String }` calls `Base.tick()` and `go()` inside
+                    // `struct Impl: Runner { var go: Bool }` calls `Runner`'s default — while the
+                    // same name as a LOCAL or PARAMETER really does shadow it
+                    // (`func f(tick: String) { tick() }` is "cannot call value of non-function type
+                    // 'String'", checked against swiftc). Same B-FIX-47/48 rule as `lookupMember`,
+                    // on the other lookup path: this branch used to rename the CALL to the
+                    // property's obf and `return`, never reaching `resolveCall`.
+                    if sym.kind == .property, let owner = memberOwnerType(of: sym),
                        !inheritedMembers(name, of: owner, admitting: .callee).isEmpty {
                         guard isKnownNonFunctionTyped(sym) else {
                             // Might be closure-typed, in which case the property IS what is called.
@@ -1902,14 +1909,16 @@ private final class ResolutionVisitor: SyntaxVisitor {
         // method's declaration was — and rollback shield 1b (the un-renamed property is a namesake)
         // blocked the rescue, so the desync SHIPPED as "cannot call value of non-function type".
         var candidates = Self.narrowed(declared, to: position)
-        // Position narrowing can only pick from the set it is GIVEN, and a subclass scope is not
-        // that set: `SuperclassVisibility` copies an ancestor's non-callables only, and its
-        // name-keyed shadowing drops even those once the subclass declares the name at any kind.
-        // So `class Sub: Base { var run: Bool }` over `class Base { func run() }` reaches here with
-        // one candidate of the WRONG kind, `narrowed` falls back to it (by contract — a
-        // closure-typed property IS legitimately called), and the `count == 1` exit below rewrites
-        // `s.run()` to the PROPERTY's obf. Complete the set from the superclass chain first
-        // (B-FIX-47).
+        // Position narrowing can only pick from the set it is GIVEN, and a type's own scope is not
+        // that set. Both visibility passes that fill it shadow BY NAME, so a type declaring the name
+        // at ANY kind loses the inherited declaration: `SuperclassVisibility` copies an ancestor's
+        // non-callables only (and drops even those), `ConformanceVisibility` copies a protocol's
+        // defaults only while the name is free. So `class Sub: Base { var run: Bool }` over
+        // `class Base { func run() }` (B-FIX-47) and `final class Impl: Runner { var go: Bool }`
+        // over `extension Runner { func go() }` (B-FIX-48) both reach here with one candidate of the
+        // WRONG kind, `narrowed` falls back to it (by contract — a closure-typed property IS
+        // legitimately called), and the `count == 1` exit below rewrites the call to the PROPERTY's
+        // obf. Complete the set from what the receiver inherits first.
         if !candidates.contains(where: { position.admits($0.kind) }) {
             switch inheritedCompletion(name, of: typeScope.owner, position: position,
                                        local: candidates) {
@@ -1936,9 +1945,10 @@ private final class ResolutionVisitor: SyntaxVisitor {
         return outcome(for: picked)
     }
 
-    /// What the superclass chain adds to a member candidate set that has nothing of the right kind.
+    /// What the inheritance graph adds to a member candidate set that has nothing of the right kind.
     enum InheritedCompletion {
-        /// No ancestor declares the name at the demanded kind — the local set is the whole story.
+        /// Nothing the type inherits declares the name at the demanded kind — the local set is the
+        /// whole story.
         case none
         /// These inherited declarations ARE the candidate set: every local candidate is a
         /// non-callable of a KNOWN, non-function type, so the compiler cannot be reading one of them.
@@ -1947,33 +1957,41 @@ private final class ResolutionVisitor: SyntaxVisitor {
         case unknowable
     }
 
-    /// Complete a member candidate set from the LOCAL superclass chain when the receiver's own scope
-    /// declares the name only at the wrong KIND for this use-site's position (B-FIX-47).
+    /// Complete a member candidate set from what the receiver INHERITS — its LOCAL superclass chain
+    /// (B-FIX-47) and its LOCAL protocols' extension defaults (B-FIX-48) — when the receiver's own
+    /// scope declares the name only at the wrong KIND for this use-site's position.
     ///
-    /// The three shapes, all run through swiftc as programs before this was written:
+    /// The three shapes, all run through swiftc as programs before this was written, in both the
+    /// class form and the protocol form (they behave identically, which is why one decision table
+    /// serves both):
     ///
     ///   1. `class Base { func run() -> String }` / `class Sub: Base { var run: Bool }` — `s.run()`
     ///      prints `BASE-METHOD`: a `Bool` is not callable, so the base METHOD is what is called.
-    ///      Answer `.use([Base.run])`.
+    ///      Answer `.use([Base.run])`. Protocol form: `extension Runner { func go() -> String }` /
+    ///      `final class Impl: Runner { var go: Bool }` — `i.go()` prints `PROTO` (the property does
+    ///      NOT witness the requirement; the extension default does).
     ///   2. Same shape with `var run: () -> String` — `s.run()` prints `PROP`: a closure-typed
     ///      property IS callable and shadows the base method. `WrittenTypeName.of` returns nil for a
     ///      function type, so a property that might be one is exactly a property with no recorded
     ///      `declaredType` — that is the `.unknowable` test, and it also covers `var run = { … }`.
+    ///      Protocol form: `final class Impl: Runner { var go: () -> String }` also prints `PROP`.
     ///   3. Mirror image, `class Base { var flag: Bool }` / `class Sub: Base { func flag() }` —
     ///      `let a = s.flag` reads the base PROPERTY, but `let g: () -> Int = s.flag` picks the
     ///      subclass METHOD. The use-site's contextual type decides, and this tier does not model
     ///      contextual types, so VALUE position is always `.unknowable`. That still fixes the bug it
     ///      is there for: today the local method is rewritten anyway (a wrong rename nothing
     ///      catches), and `.unknowable` turns it into a surviving original name RollbackPass reverts.
+    ///      Protocol form: `extension Flagged { var flag: Bool }` / `final class Impl: Flagged
+    ///      { func flag() -> Int }` prints `true 7` for the same two sites.
     ///
-    /// Deliberately a RESOLVER-side walk, not an injection into the subclass scope: an inherited
+    /// Deliberately a RESOLVER-side walk, not an injection into the conformer's scope: an inherited
     /// method placed in a lexical scope becomes a false unique match in `resolveCall` and shadows the
     /// protocol-extension overload a call actually selects (the regression that keeps
     /// `SuperclassVisibility` non-callable-only — `testOverloadByArgType_…`). Nothing here touches
     /// `resolveCall`.
     private func inheritedCompletion(_ name: String, of owner: Symbol?, position: UsePosition,
                                      local: [Symbol]) -> InheritedCompletion {
-        guard let owner, owner.kind == .class else { return .none }
+        guard let owner, Self.hasInheritedMembers(owner.kind) else { return .none }
         let inherited = inheritedMembers(name, of: owner, admitting: position)
         guard !inherited.isEmpty else { return .none }
         guard position == .callee else { return .unknowable }
@@ -1982,32 +2000,70 @@ private final class ResolutionVisitor: SyntaxVisitor {
         return local.allSatisfy(isKnownNonFunctionTyped) ? .use(inherited) : .unknowable
     }
 
-    /// The CLASS a symbol is a member of, or nil when it is a local, a parameter, or a member of a
-    /// struct/enum/protocol — the kinds that have no superclass chain to complete a set from.
-    private func memberOwnerClass(of sym: Symbol) -> Symbol? {
+    /// Kinds whose member set can be larger than their own scope: a CLASS through its superclass
+    /// chain, and every conformer kind — including a `protocol`, for protocol-to-protocol
+    /// inheritance — through its protocols' extension defaults. `struct`/`enum` are in the set for
+    /// the conformance half ONLY (they have no superclass), and that half is what makes them belong:
+    /// `struct Impl: Runner { var go: Bool }` calls the extension default exactly as the class does.
+    private static func hasInheritedMembers(_ k: SymbolKind) -> Bool {
+        switch k { case .class, .struct, .enum, .protocol: return true; default: return false }
+    }
+
+    /// The TYPE a symbol is a member of, or nil when it is a local or a parameter — the kinds that
+    /// genuinely SHADOW an inherited callable instead of unioning with it (`func f(tick: String)
+    /// { tick() }` is an error in Swift, verified).
+    private func memberOwnerType(of sym: Symbol) -> Symbol? {
         guard let scope = sym.scope, scope.kind == .type,
-              let owner = scope.owner, owner.kind == .class else { return nil }
+              let owner = scope.owner, Self.hasInheritedMembers(owner.kind) else { return nil }
         return owner
     }
 
-    /// Members named `name` that `position` admits, taken from the NEAREST ancestor declaring the
-    /// name at that kind — stopping at the first level is Swift's shadowing rule between levels.
-    /// Memoized per class: the chain walk re-parses the declaring file's inheritance clause.
-    private func inheritedMembers(_ name: String, of cls: Symbol,
+    /// Members named `name` that `position` admits, taken from the NEAREST inherited level declaring
+    /// the name at that kind. Levels in Swift's own precedence order: the superclass chain first
+    /// (nearest ancestor first — a base-class member beats a protocol default), then the protocols
+    /// the type or any of its ancestors conforms to. Memoized per type: both walks re-parse the
+    /// declaring file's inheritance clause.
+    private func inheritedMembers(_ name: String, of type: Symbol,
                                   admitting position: UsePosition) -> [Symbol] {
-        let chain: [Symbol]
-        if let cached = ancestorCache[cls.id] {
-            chain = cached
+        let ancestors: [Symbol]
+        if let cached = ancestorCache[type.id] {
+            ancestors = cached
         } else {
-            chain = SuperclassChain.ancestors(of: cls, in: table)
-            ancestorCache[cls.id] = chain
+            // Harmless and correct on a struct/enum/protocol: `preferredType(kind: .class, …)`
+            // answers nil for every name in their clause, so the chain is empty.
+            ancestors = SuperclassChain.ancestors(of: type, in: table)
+            ancestorCache[type.id] = ancestors
         }
-        for ancestor in chain {
-            guard let scope = innerScope(of: ancestor) else { continue }
-            let found = scope.members(named: name).filter { position.admits($0.kind) }
-            if !found.isEmpty { return found }
+        for ancestor in ancestors {
+            if let found = members(name, in: ancestor, admitting: position) { return found }
+        }
+        let protocols: [Symbol]
+        if let cached = conformanceCache[type.id] {
+            protocols = cached
+        } else {
+            // A class inherits its superclass's CONFORMANCES too: `final class D: B { var ping: Int }`
+            // over `class B: Pinger {}` calls `Pinger`'s default at `D().ping()` (checked against
+            // swiftc). Dedup by id — protocol-to-protocol inheritance is already folded into each
+            // protocol's scope by ConformanceVisibility, so the same protocol is reachable twice.
+            var seen: Set<Int> = []
+            protocols = ([type] + ancestors)
+                .flatMap { ConformanceChain.protocols(of: $0, in: table) }
+                .filter { seen.insert($0.id).inserted }
+            conformanceCache[type.id] = protocols
+        }
+        for proto in protocols {
+            if let found = members(name, in: proto, admitting: position) { return found }
         }
         return []
+    }
+
+    /// The members of `owner`'s canonical inner scope named `name` that `position` admits, or nil
+    /// when it declares none — "nil" is what makes the caller keep walking to the next level.
+    private func members(_ name: String, in owner: Symbol,
+                         admitting position: UsePosition) -> [Symbol]? {
+        guard let scope = innerScope(of: owner) else { return nil }
+        let found = scope.members(named: name).filter { position.admits($0.kind) }
+        return found.isEmpty ? nil : found
     }
 
     /// True when `sym`'s type is KNOWN and is not a function type — the only state in which we can

@@ -1998,6 +1998,151 @@ final class PatternTests: XCTestCase {
                       "the read must keep its original name:\n\(r)")
     }
 
+    // MARK: - Protocol-extension default vs. same-named conformer member of another kind (B-FIX-48)
+
+    /// The reported shape, the conformance mirror of B-FIX-47: the conformer declares a PROPERTY
+    /// named like a requirement whose default lives in the protocol's EXTENSION. Legal Swift — the
+    /// property does not witness the requirement, the default does — and `i.go()` prints `PROTO`
+    /// because a `Bool` is not callable. `ConformanceVisibility` shadows BY NAME, so the default was
+    /// never copied into `Impl`'s scope, the position filter had one wrong-kind candidate, and the
+    /// `count == 1` exit rewrote the CALL to the property's obf: "cannot call value of non-function
+    /// type 'Bool'", with 0 desyncs reported and no Diagnostics.txt.
+    func testProtocolDefault_sameNamedConformerProperty_callResolvesToTheDefault() throws {
+        let r = try runPipeline("""
+        protocol Runner { func go() -> String }
+        extension Runner { func go() -> String { return "PROTO" } }
+        final class Impl: Runner { var go: Bool = false }
+        func demo() -> String {
+            let i = Impl()
+            return i.go() + "/" + String(i.go)
+        }
+        """)
+        let methodObf = try firstGroup(#"protocol \w+ \{ func (\w+)\(\) -> String \}"#, in: r)
+        let propObf = try firstGroup(#"var (\w+): Bool = false"#, in: r)
+        XCTAssertNotEqual(methodObf, "go", "the requirement must be obfuscated:\n\(r)")
+        XCTAssertNotEqual(propObf, "go", "the conformer property must be obfuscated:\n\(r)")
+        XCTAssertNotEqual(methodObf, propObf, "the two are unrelated declarations:\n\(r)")
+        XCTAssertEqual(r.components(separatedBy: "func \(methodObf)() -> String").count - 1, 2,
+                       "the extension default must share the requirement's obf (B-FIX-9):\n\(r)")
+        XCTAssertTrue(r.contains(".\(methodObf)() + "),
+                      "the CALL must take the protocol default's obf \(methodObf):\n\(r)")
+        XCTAssertTrue(r.contains(".\(propObf))"),
+                      "the value READ must take the property's obf \(propObf):\n\(r)")
+        XCTAssertFalse(r.contains(".\(propObf)()"),
+                       "the property must never be called:\n\(r)")
+    }
+
+    /// The same defect on the BARE-call path, and on a STRUCT — a conformer needs no superclass
+    /// chain for this to bite, which is why the owner test is "member of a type", not "member of a
+    /// class". `go()` inside `struct Impl: Runner { var go: Bool }` prints `PROTO` (checked against
+    /// swiftc); before this, `lookupCallee` found the property and renamed the call to its obf.
+    func testProtocolDefault_bareCallInStructUnderSameNamedProperty_resolvesToTheDefault() throws {
+        let r = try runPipeline("""
+        protocol Runner { func go() -> String }
+        extension Runner { func go() -> String { return "PROTO" } }
+        struct Impl: Runner {
+            var go: Bool = false
+            func probe() -> String { return go() + "/" + String(go) }
+        }
+        """)
+        let methodObf = try firstGroup(#"protocol \w+ \{ func (\w+)\(\) -> String \}"#, in: r)
+        let propObf = try firstGroup(#"var (\w+): Bool = false"#, in: r)
+        XCTAssertNotEqual(methodObf, "go", "the requirement must be obfuscated:\n\(r)")
+        XCTAssertTrue(r.contains("return \(methodObf)() + \"/\" + String(\(propObf))"),
+                      "bare `go()` must call the default and bare `go` read the property:\n\(r)")
+    }
+
+    /// The three ways a conformance reaches a type, all of which must complete the set: declared on
+    /// a protocol the conformer inherits (`protocol Mid: Pinger`), declared on an EXTENSION of the
+    /// conformer, and inherited from a SUPERCLASS. `swiftc` prints `PING PING PING`; before this the
+    /// first two were "cannot call value of non-function type 'Int'".
+    func testProtocolDefault_reachedThroughInheritedProtocolExtensionAndSuperclass() throws {
+        let r = try runPipeline("""
+        protocol Pinger { func ping() -> String }
+        extension Pinger { func ping() -> String { return "PING" } }
+        protocol Mid: Pinger { }
+        final class ViaMid: Mid { var ping: Int = 3 }
+        final class ViaExt { var ping: Int = 4 }
+        extension ViaExt: Pinger { }
+        class Holder: Pinger { }
+        final class ViaSuper: Holder { var ping: Int = 5 }
+        func demo() -> String {
+            return ViaMid().ping() + ViaExt().ping() + ViaSuper().ping()
+        }
+        """)
+        let methodObf = try firstGroup(#"protocol \w+ \{ func (\w+)\(\) -> String \}"#, in: r)
+        XCTAssertNotEqual(methodObf, "ping", "the requirement must be obfuscated:\n\(r)")
+        XCTAssertEqual(r.components(separatedBy: "().\(methodObf)()").count - 1, 3,
+                       "all three receivers must call the protocol default \(methodObf):\n\(r)")
+        XCTAssertFalse(r.contains("ping"), "no original name should survive:\n\(r)")
+    }
+
+    /// The one case in which the conformer's property WINS: a closure-typed property is genuinely
+    /// callable and shadows the protocol default (`swiftc` prints `PROP`). Same `declaredType == nil`
+    /// test as B-FIX-47 — fail CLOSED rather than redirect the call, so the use-site keeps its
+    /// original name, RollbackPass sees the survivor and reverts: green, one name lost.
+    func testClosureTypedConformerProperty_callIsNotRedirectedToProtocolDefault() throws {
+        let r = try runPipeline("""
+        protocol Runner { func go() -> String }
+        extension Runner { func go() -> String { return "PROTO" } }
+        final class Impl: Runner { var go: () -> String = { return "PROP" } }
+        func demo() -> String {
+            let i = Impl()
+            return i.go()
+        }
+        """)
+        XCTAssertTrue(r.contains("var go: () -> String"),
+                      "the closure property must be reverted, not renamed:\n\(r)")
+        XCTAssertTrue(r.contains(".go()"),
+                      "the call must keep the ORIGINAL name — the property is what is called:\n\(r)")
+        XCTAssertTrue(r.contains("func go() -> String { return \"PROTO\" }"),
+                      "the protocol default reverts with it (rollback group):\n\(r)")
+    }
+
+    /// The mirror image through a protocol: a default PROPERTY under a same-named conformer METHOD.
+    /// `let a = i.flag` reads the protocol's default (`true`), `let g: () -> Int = i.flag` picks the
+    /// class method (`7`) — the contextual type decides and this tier does not model it. Before
+    /// this, the local method was rewritten regardless, and SILENTLY: the site still compiles, it
+    /// just prints `(Function) 7` where the control prints `true 7`.
+    func testProtocolDefaultProperty_sameNamedConformerMethod_valueReadStaysFailClosed() throws {
+        let r = try runPipeline("""
+        protocol Flagged { var flag: Bool { get } }
+        extension Flagged { var flag: Bool { return true } }
+        final class Impl: Flagged { func flag() -> Int { return 7 } }
+        func demo() -> String {
+            let i = Impl()
+            let a = i.flag
+            return String(describing: a)
+        }
+        """)
+        XCTAssertTrue(r.contains("var flag: Bool { get }"),
+                      "the requirement must revert, not adopt the method's obf:\n\(r)")
+        XCTAssertTrue(r.contains("func flag() -> Int"),
+                      "the conformer method reverts with it (rollback group):\n\(r)")
+        XCTAssertTrue(r.contains(".flag\n"),
+                      "the read must keep its original name:\n\(r)")
+    }
+
+    /// Guard for the reach this traversal adds: nearly every type conforms to something, and the
+    /// ordinary shape — the conformer's own method WITNESSES the requirement — must be untouched.
+    /// The witness and the requirement share one obf (WitnessLinker) and both call sites take it.
+    func testProtocolDefault_overriddenByAWitness_stillResolvesToTheWitnessObf() throws {
+        let r = try runPipeline("""
+        protocol Runner { func go() -> String }
+        extension Runner { func go() -> String { return "PROTO" } }
+        final class Impl: Runner {
+            func go() -> String { return "OWN" }
+            func probe() -> String { return go() }
+        }
+        func demo() -> String { return Impl().go() }
+        """)
+        let obf = try firstGroup(#"protocol \w+ \{ func (\w+)\(\) -> String \}"#, in: r)
+        XCTAssertNotEqual(obf, "go", "the requirement must be obfuscated:\n\(r)")
+        XCTAssertEqual(r.components(separatedBy: "\(obf)(").count - 1, 5,
+                       "requirement, default, witness and both calls must share \(obf):\n\(r)")
+        XCTAssertFalse(r.contains("go"), "no original name should survive:\n\(r)")
+    }
+
     // MARK: - Override chains (OverrideLinker): base + override must share one obf
 
     func testOverride_methodChain_baseAndOverridesShareObf() throws {

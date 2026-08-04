@@ -12,6 +12,15 @@ import SwiftSyntax
 /// If the conformer already declares a member of the same name, we DON'T add the protocol's
 /// version (the conformer's override shadows the default). WitnessLinker handles unifying the
 /// obfuscated names of the override and the requirement.
+///
+/// That shadowing is BY NAME, not by kind, and deliberately stays that way — but it is therefore
+/// only half of "what members does this conformer have". `final class Impl: Runner { var go: Bool }`
+/// over `extension Runner { func go() -> String }` is legal Swift in which the property does NOT
+/// witness the requirement and the extension default does, yet `go` is in `existingNames` so the
+/// default is never copied and `i.go()` faces one wrong-kind candidate. Completing that set is the
+/// RESOLVER's job (`ResolutionVisitor.inheritedMembers` over `ConformanceChain`, B-FIX-48), for the
+/// same reason `SuperclassVisibility` still refuses to copy methods: an inherited callable placed in
+/// a lexical scope becomes a false unique match in `resolveCall`.
 public final class ConformanceVisibility {
     public let table: SymbolTable
     public let logger: Logger
