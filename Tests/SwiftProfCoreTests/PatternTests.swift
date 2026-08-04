@@ -6694,4 +6694,51 @@ final class PatternTests: XCTestCase {
         XCTAssertTrue(r.contains("self.\(obf)"),
                       "inside the else body the name is still the PROPERTY:\n\(r)")
     }
+
+    // MARK: - B-FIX-51: the in-place sibling of a known HOF has the same closure shape
+
+    func testHOF_sortInPlace_closureParamMemberResolves() throws {
+        // `sorted` was in HOFRegistry and `sort` was not, so `$0` in the in-place form had no type
+        // and every member read through it stayed original while its declaration renamed. The
+        // compiler reports it as an overload failure on the WHOLE call ("cannot conform to
+        // 'SortComparator'"), which hides that the real defect is two un-rewritten members.
+        let r = try runPipeline("""
+        struct Grade {
+            var weight: Int
+        }
+        struct Record {
+            var grade: Grade
+        }
+        final class Store {
+            var rows: [Record] = []
+            func sortRows() {
+                self.rows.sort { $0.grade.weight > $1.grade.weight }
+            }
+        }
+        """)
+        let gradeObf = try firstGroup(#"var (\w+): T\d+"#, in: r)
+        XCTAssertNotEqual(gradeObf, "grade", "the property decl must stay obfuscated:\n\(r)")
+        XCTAssertTrue(r.contains("$0.\(gradeObf)") && r.contains("$1.\(gradeObf)"),
+                      "both closure params of sort(by:) must be typed as the Element:\n\(r)")
+    }
+
+    func testHOF_sortInPlace_namedClosureParamsResolve() throws {
+        // The named-parameter spelling goes through inferNamedClosureParamType instead of the
+        // positional `$N` path, and both read the same registry entry.
+        let r = try runPipeline("""
+        struct Record {
+            var weight: Int
+        }
+        final class Store {
+            var rows: [Record] = []
+            func sortRows() {
+                rows.sort { a, b in a.weight > b.weight }
+            }
+        }
+        """)
+        let obf = try firstGroup(#"var (\w+): Int"#, in: r)
+        XCTAssertNotEqual(obf, "weight", "the property decl must stay obfuscated:\n\(r)")
+        XCTAssertTrue(r.contains("a.\(obf) > b.\(obf)"),
+                      "named closure params of sort(by:) must be typed as the Element:\n\(r)")
+    }
 }

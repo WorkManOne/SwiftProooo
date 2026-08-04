@@ -13,6 +13,12 @@ import Foundation
 /// The registry intentionally hard-codes — these APIs have been stable since Swift 3+ and the
 /// list of useful HOFs is small (~30 methods). Auto-generation from `.swiftinterface` is a
 /// future improvement; the registry can be replaced wholesale without changing call sites.
+///
+/// An entry that is MISSING is silent: the closure's parameters simply stay untyped, so every
+/// member read through them keeps its original name while the declaration renames — a desync,
+/// reported only as `UNRES cause=receiver-untyped`. Hence the one standing rule for edits here:
+/// **a method and its in-place sibling go in together** (`sorted`/`sort`), because they hand the
+/// closure the same parameters and a project uses whichever one it happens to need (B-FIX-51).
 public enum HOFRegistry {
     public struct Signature: Sendable {
         public let methodName: String
@@ -56,8 +62,12 @@ public enum HOFRegistry {
         Signature(methodName: "split",        closureArgIndex: 0, closureParamSources: [.element]),
         Signature(methodName: "min",          closureArgIndex: 0, closureParamSources: [.element, .element]),
         Signature(methodName: "max",          closureArgIndex: 0, closureParamSources: [.element, .element]),
-        // Two-element closures
+        // Two-element closures. `sort(by:)` is `sorted(by:)`'s in-place sibling and hands its
+        // closure exactly the same two Elements — registering one without the other left `$0` in
+        // `rows.sort { $0.a > $1.a }` untyped, so every member read through it stayed original
+        // while the declaration renamed (B-FIX-51).
         Signature(methodName: "sorted",       closureArgIndex: 0, closureParamSources: [.element, .element]),
+        Signature(methodName: "sort",         closureArgIndex: 0, closureParamSources: [.element, .element]),
         // Reduce: closure is arg #1, closure params are (accumulator: typeOfArg0, element: Element)
         Signature(methodName: "reduce",       closureArgIndex: 1, closureParamSources: [.argType(0), .element]),
         // Grouping / chunking
