@@ -6741,4 +6741,150 @@ final class PatternTests: XCTestCase {
         XCTAssertTrue(r.contains("a.\(obf) > b.\(obf)"),
                       "named closure params of sort(by:) must be typed as the Element:\n\(r)")
     }
+
+    // MARK: - B-FIX-52: every STORED type name resolves in its DECLARING scope
+
+    // B-FIX-23 established the invariant for `declaredType`; these are the readers that were
+    // still resolving a stored type name against the USE-SITE scope. Each fixture nests the
+    // type deliberately: a nested name is invisible from any other scope, and
+    // `preferredConcreteType` refuses it by contract (top-level only), so the use-site scope
+    // is the one place the name CANNOT resolve. A top-level type hides every one of these.
+
+    func testMethodReturnType_nestedReturn_memberOnTheResultResolves() throws {
+        // `typeSymbol(of:)`'s `receiver.method(args)` branch read `functionReturnType` and
+        // resolved it at the CALL site. `Voucher` is nested in `Ledger`, so the chain died and
+        // `captionText` stayed original while its declaration renamed — a desync, and a red
+        // build wherever a shield blocks the rollback rescue.
+        let r = try runPipeline("""
+        struct Ledger {
+            struct Voucher {
+                let captionText: String
+            }
+            func makeVoucher() -> Voucher {
+                return Voucher(captionText: "ok")
+            }
+        }
+        final class Presenter {
+            func render(_ ledger: Ledger) -> String {
+                return ledger.makeVoucher().captionText
+            }
+        }
+        """)
+        let obf = try firstGroup(#"let (\w+): String"#, in: r)
+        XCTAssertNotEqual(obf, "captionText", "the stored property decl must be renamed:\n\(r)")
+        XCTAssertTrue(r.contains("().\(obf)"),
+                      "a member on a method call's NESTED return type must resolve:\n\(r)")
+    }
+
+    func testKeyPath_nestedComponentType_chainContinuesPastTheNestedType() throws {
+        // The key-path component walk followed `declaredType` in `currentScope`. Both existing
+        // key-path tests have a SINGLE component, so the chain-follow line was never exercised.
+        let r = try runPipeline("""
+        struct Ledger {
+            struct Voucher {
+                var captionText: String = ""
+            }
+            var voucher: Voucher = Voucher()
+        }
+        final class Presenter {
+            func path() -> KeyPath<Ledger, String> {
+                return \\Ledger.voucher.captionText
+            }
+        }
+        """)
+        let obf = try firstGroup(#"var (\w+): String = """#, in: r)
+        XCTAssertNotEqual(obf, "captionText", "the stored property decl must be renamed:\n\(r)")
+        XCTAssertTrue(r.contains(".\(obf)"),
+                      "a key-path component past a NESTED component type must resolve:\n\(r)")
+    }
+
+    func testOverloadByEnumCaseArg_nestedParamEnum_picksTheEnumOverload() throws {
+        // DANGER-class. `disambiguateByArgTypes`'s `.enumCase` branch resolved the candidate's
+        // parameter type at the USE-SITE, where the only visible `Shade` is the unrelated
+        // top-level one. That enum has no `light`, so the CORRECT overload was scored
+        // inconsistent and eliminated, leaving `apply(_: Bool)` as a false unique match: the
+        // call was rewritten to the Bool overload's obf ⇒ "type 'Bool' has no member 'light'".
+        // A wrong rename — RollbackPass sees no surviving original for the callee.
+        let r = try runPipeline("""
+        enum Shade {
+            case bold
+        }
+        struct Palette {
+            enum Shade {
+                case light
+                case dark
+            }
+            func apply(_ shade: Shade) -> String { return "enumOverload" }
+            func apply(_ flag: Bool) -> String { return "boolOverload" }
+        }
+        final class Presenter {
+            func run(_ palette: Palette) -> String {
+                return palette.apply(.light)
+            }
+        }
+        """)
+        let enumOverload = try firstGroup(#"func (\w+)\(_ \w+: \w+\) -> String \{ return "enumOverload""#, in: r)
+        XCTAssertNotEqual(enumOverload, "apply", "the enum overload's decl must be renamed:\n\(r)")
+        XCTAssertTrue(r.contains(".\(enumOverload)(.light)") || r.contains(".\(enumOverload)(."),
+                      "the call must resolve to the ENUM overload, not its Bool sibling:\n\(r)")
+        let boolOverload = try firstGroup(#"func (\w+)\(_ \w+: Bool\) -> String"#, in: r)
+        XCTAssertFalse(r.contains(".\(boolOverload)("),
+                       "the call must NOT be rewritten to the Bool overload's obf:\n\(r)")
+    }
+
+    func testOverloadByArgType_nestedMethodReturnAsArgument_picksTheMatchingOverload() throws {
+        // DANGER-class, and the most invisible of the family: `argConstraint`'s method-return
+        // branch kept its own copy of the same read and resolved `Voucher` at the use-site.
+        // Failing to resolve it downgraded the argument from `.typeSymbol` (identity) to
+        // `.typeName("Voucher")`, which then MISMATCHED the written `Ledger.Voucher` and
+        // eliminated the correct overload. Measured before the fix: `0 names desynced`, 100%
+        // reported coverage, no `Diagnostics.txt` line — and a red build.
+        let r = try runPipeline("""
+        struct Ledger {
+            struct Voucher {
+                var captionText: String = ""
+            }
+            func makeVoucher() -> Voucher {
+                return Voucher()
+            }
+        }
+        struct Collector {
+            func absorb(_ voucher: Ledger.Voucher) -> String { return "voucherOverload" }
+            func absorb(_ count: Int) -> String { return "intOverload" }
+        }
+        final class Presenter {
+            func run(_ ledger: Ledger, _ collector: Collector) -> String {
+                return collector.absorb(ledger.makeVoucher())
+            }
+        }
+        """)
+        let intOverload = try firstGroup(#"func (\w+)\(_ \w+: Int\) -> String"#, in: r)
+        XCTAssertFalse(r.contains(".\(intOverload)("),
+                       "the call must NOT be rewritten to the Int overload's obf:\n\(r)")
+    }
+
+    func testRawValues_qualifiedBaseTypeName_enumIsAbortedNotSilentlyObfuscated() throws {
+        // B-FIX-3's fail-closed rule is keyed on a NAME comparison, and the two sides disagreed
+        // about qualification: `eligibleEnumNames` holds SHORT symbol names while
+        // `baseTypeName(of:)` hands back `declaredType` verbatim, which keeps its qualification
+        // by contract (`WrittenTypeName.of`). `Self.Tone` is the shape that makes the precise
+        // resolution fail too — `typeSymbol(forQualifiedName:)` knows no `Self` segment — so the
+        // enum was NOT recognised as dangerous, its literal WAS obfuscated, and the `.rawValue`
+        // stayed. Green build, and the runtime value changes (measured: "Muted" → "p1tTkJ").
+        let r = try runPipeline("""
+        struct Holder {
+            enum Tone: String {
+                case muted = "Muted"
+            }
+            let tone: Self.Tone = .muted
+            func label() -> String {
+                return tone.rawValue
+            }
+        }
+        """, rawValues: .safe)
+        XCTAssertTrue(r.contains("= \"Muted\""),
+                      "an enum with a .rawValue we cannot redirect must NOT be obfuscated:\n\(r)")
+        XCTAssertFalse(r.contains("displayName"),
+                       "no displayName may be synthesized for the aborted enum:\n\(r)")
+    }
 }

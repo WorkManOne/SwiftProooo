@@ -957,11 +957,18 @@ private final class ResolutionVisitor: SyntaxVisitor {
                 break
             }
             emitRename(for: prop.declName.baseName, target: member)
-            // Chain: follow declared type for next component.
+            // Chain: follow declared type for next component. The stored type name is written in
+            // the MEMBER's own scope, never the key path's (B-FIX-23 / B-FIX-52): `var voucher:
+            // Voucher` on `Ledger` spells a type nested in `Ledger`, which is invisible from the
+            // file the key path is written in, and `preferredConcreteType` refuses a nested name
+            // by contract. Resolving at the use-site therefore broke the walk at the first
+            // nested component — and, where an UNRELATED top-level type shared the name, resolved
+            // the rest of the chain against it, which is a wrong rename.
             if member.kind.isTypeLike {
                 typeSym = member
             } else if let declType = table.declaredType[member.id],
-                      let next = typeResolver.typeSymbol(forQualifiedName: declType, in: currentScope) {
+                      let next = typeResolver.typeSymbol(forQualifiedName: declType,
+                                                         in: member.scope ?? currentScope) {
                 typeSym = next
             } else {
                 break  // can't follow further
@@ -1550,7 +1557,7 @@ private final class ResolutionVisitor: SyntaxVisitor {
             guard pi < pTypes.count, let pType = pTypes[pi] else { continue }
             switch argConstraint(arg) {
             case .enumCase(let caseName):
-                if let t = typeResolver.typeSymbol(forQualifiedName: pType, in: currentScope),
+                if let t = resolveParamType(pType, candidate: cand),
                    t.kind == .enum, !enumHasCase(t, caseName) { return true }
             case .typeSymbol(let argSym):
                 // Protocol-typed params accept any conformer — never a contradiction (mirrors
@@ -1593,7 +1600,7 @@ private final class ResolutionVisitor: SyntaxVisitor {
                 guard pi < pTypes.count, let pType = pTypes[pi] else { continue }
                 switch argConstraint(arg) {
                 case .enumCase(let caseName):
-                    if let t = typeResolver.typeSymbol(forQualifiedName: pType, in: currentScope),
+                    if let t = resolveParamType(pType, candidate: cand),
                        t.kind == .enum {
                         if enumHasCase(t, caseName) { score += 1 } else { consistent = false }
                     }
@@ -1683,7 +1690,7 @@ private final class ResolutionVisitor: SyntaxVisitor {
             guard i < pTypes.count, let pType = pTypes[i] else { perArg.append("?"); continue }
             switch argConstraint(arg) {
             case .enumCase(let c):
-                if let t = typeResolver.typeSymbol(forQualifiedName: pType, in: currentScope),
+                if let t = resolveParamType(pType, candidate: cand),
                    t.kind == .enum {
                     if enumHasCase(t, c) { score += 1; perArg.append(".\(anon(c))→\(anon(pType))✓") }
                     else { perArg.append(".\(anon(c))→\(anon(pType))✗noCase") }
@@ -1737,27 +1744,18 @@ private final class ResolutionVisitor: SyntaxVisitor {
            let raw = table.enumRawType[baseSym.id] {
             return .typeName(raw)
         }
-        // Method-call return type: `obj.method(args)` as an argument carries its method's return
-        // type. Without this, anything past a method call has unknown type and disambiguation
-        // falls to coarse same-module tiebreaks (a common source of wrong-overload renames).
-        if let call = expr.as(FunctionCallExprSyntax.self),
-           let m = call.calledExpression.as(MemberAccessExprSyntax.self),
-           let recv = m.base,
-           let recvType = typeResolver.typeSymbol(of: recv, in: currentScope),
-           let recvScope = innerScope(of: recvType) {
-            let methodName = stripBackticks(m.declName.baseName.text)
-            let labels = Self.argumentLabels(of: call)
-            let matches = recvScope.members(named: methodName)
-                .filter { Self.isCallable($0.kind) && labelsMatch($0, labels, trailingStart: ArgumentLabelMatch.trailingStart(of: call)) }
-            if matches.count == 1, let ret = table.functionReturnType[matches[0].id] {
-                // Try to resolve the return-type name to a Symbol so disambiguation uses identity;
-                // fall back to the raw string when it's a primitive / external (stdlib) type.
-                if let retSym = typeResolver.typeSymbol(forQualifiedName: ret, in: currentScope) {
-                    return .typeSymbol(retSym)
-                }
-                return .typeName(ret)
-            }
-        }
+        // A method call's return type used to be read HERE, by a third private copy of the
+        // receiver-typing + label-matching + `functionReturnType` walk (after `calleeCallable` and
+        // `TypeResolver.typeSymbol(of:)`'s own), resolving the return-type string against the
+        // use-site scope. Deleted in B-FIX-52: the two general fallbacks at the bottom of this
+        // function already answer it and answer it correctly — `typeSymbol(of:)` for the identity
+        // half (it funnels a call through `receiverTypeInfo`, which carries the CALLEE's scope)
+        // and `declaredTypeName(of:)` for the external/stdlib half. The copy resolved a nested
+        // return type (`-> Voucher` inside `Ledger`) to nil, silently DOWNGRADING the argument
+        // from `.typeSymbol` (identity) to `.typeName("Voucher")`, which then mismatched the
+        // written `Ledger.Voucher` and eliminated the only correct overload. Measured on the
+        // reproduction: 0 desyncs, 100% reported coverage, no diagnostics — and a red build.
+        //
         // Optional-binding local: `if let u = makeURL()` carries no declared Symbol, but we recorded
         // its inferred type when the binding entered scope (B-FIX-11 follow-up). Check it BEFORE the
         // general typeSymbol fallback so a binding that shadows a same-named property uses the
@@ -1829,6 +1827,16 @@ private final class ResolutionVisitor: SyntaxVisitor {
     /// Resolve a candidate's parameter-type string (as written in source) to a Symbol in the
     /// CANDIDATE's lexical context. Returns nil for primitives / external types (`String`, `Int`,
     /// SwiftUI / Foundation) that aren't in our SymbolTable — those are matched by name instead.
+    ///
+    /// THE one way to turn a `functionParamTypes` entry into a Symbol. The `.enumCase` branches of
+    /// `argTypesContradict` / `disambiguateByArgTypes` used to read the same side table through the
+    /// use-site scope and resolver instead, so one `switch` answered one question two ways
+    /// (B-FIX-52). A parameter type spelled unqualified in the callee's scope (`_ shade: Shade` for
+    /// a `Shade` nested in `Palette`) does not resolve at the call site at all — and where an
+    /// UNRELATED top-level namesake exists it resolves to THAT, which is worse than nil: a
+    /// same-named enum without the case scores the CORRECT overload inconsistent and eliminates it,
+    /// leaving a sibling as a false unique match. That is a wrong rename, and RollbackPass cannot
+    /// see it (the callee renamed cleanly, no original name survives).
     private func resolveParamType(_ paramTypeName: String, candidate: Symbol) -> Symbol? {
         let candScope = candidate.scope ?? currentScope
         return resolver(forModule: candidate.module.name)

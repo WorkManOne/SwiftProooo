@@ -149,32 +149,23 @@ public final class TypeResolver {
                     .contains(where: { $0.kind == .enumCase }) {
                 return baseSym
             }
-            // `receiver.method(args)` → method's return-type Symbol (when we tracked it). Without
-            // this, chains like `obj.foo().bar` couldn't resolve `.bar` against `foo()`'s return
-            // type, so use-sites past a method call were left un-renamed. Picks the method by
-            // label match; falls back to nil on ambiguity.
-            if let memberCall = call.calledExpression.as(MemberAccessExprSyntax.self),
-               memberCall.declName.baseName.text != "init",
-               let base = memberCall.base,
-               let recvType = typeSymbol(of: base, in: scope),
-               let recvScope = canonicalInnerScope(of: recvType) {
-                let methodName = Self.stripBackticks(memberCall.declName.baseName.text)
-                let methods = recvScope.members(named: methodName)
-                    .filter { $0.kind == .method || $0.kind == .function }
-                // Label matching goes through the ONE shared rule (B-FIX-36): a private
-                // count-equality copy lived here and rejected `recv.build(from: x) { … }.member`,
-                // because the trailing closure contributes a nil label that never equals the
-                // declared `transform:`. The call's return type then stayed unknown and every
-                // member reached through it was left original while its decl renamed.
-                let matching = methods.filter { ArgumentLabelMatch.matches($0, call: call, in: table) }
-                if matching.count == 1, let ret = table.functionReturnType[matching[0].id] {
-                    return typeSymbol(forQualifiedName: ret, in: scope)
-                }
-            }
-            // `items.sorted()` / `items.first(where:)` — a stdlib collection member in call form.
-            // The receiver names no declaration, so none of the cases above can reach it; the
-            // registry's result shape does (B-FIX-30). Resolving `[Element]` still yields nil (a
-            // collection names no declaration) — only an ELEMENT result produces a Symbol here.
+            // Everything else a CALL can be — `receiver.method(args)` typed by the method's return
+            // type (so `obj.foo().bar` resolves), a free call's return type, and the stdlib
+            // collection members in call form (`items.sorted()`, `items.first(where:)`, B-FIX-30) —
+            // is ONE question: "what is the written type name of this expression", which
+            // `receiverTypeInfo` is the single answer to. It reads `functionReturnType` through
+            // `calleeCallable` and hands back the CALLEE's scope with it.
+            //
+            // The method-return case used to be answered a second time right here, by a private
+            // copy of `calleeCallable`'s member branch — byte-for-byte the same receiver typing,
+            // kind filter, `ArgumentLabelMatch` call and `count == 1` test, differing only in
+            // resolving the return-type string at the CALL SITE. That is the B-FIX-23 defect
+            // (B-FIX-52): a return type spelled unqualified in the callee's scope (`-> Voucher`
+            // for a `Voucher` nested in `Ledger`) is invisible from the caller, and
+            // `preferredConcreteType` refuses it by contract, so the copy answered nil AND
+            // returned early — making this fallback, which had the scope right all along,
+            // unreachable for exactly the shapes that needed it. Deleted rather than repaired:
+            // a second copy is how the bug comes back.
             if let info = receiverTypeInfo(of: expr, in: scope) {
                 return typeSymbol(forQualifiedName: info.name, in: info.declScope)
             }

@@ -373,7 +373,23 @@ private final class RawValueUseVisitor: SyntaxVisitor {
         } else if let typeName = baseTypeName(of: base) {
             // Type name known but no precise Symbol. Dangerous only if it names an eligible enum:
             // its literals changed but this site won't be rewritten.
-            if eligibleEnumNames.contains(typeName) { dangerousNames.insert(typeName) }
+            //
+            // Compared LEAF to LEAF (B-FIX-52). `eligibleEnumNames` holds SHORT symbol names while
+            // this string is a written type name, which keeps its qualification by contract
+            // (`WrittenTypeName.of` preserves `Foo.Bar`; `TypeInferencePass.qualifiedName(of:)`
+            // deliberately writes the qualified form). Comparing the whole string missed every
+            // qualified spelling, and the miss runs in the DANGEROUS direction: not recognised as
+            // dangerous ⇒ the enum is not aborted ⇒ its literals are obfuscated while this
+            // `.rawValue` is left alone ⇒ it returns the opaque token at runtime. A green build
+            // that changed behaviour, which is precisely what B-FIX-3 exists to prevent (measured:
+            // `let tone: Self.Tone` printed "Muted" before and "p1tTkJ" after).
+            //
+            // Leaf comparison can only ABORT MORE enums, never fewer, which is the correct
+            // direction for a fail-closed pass: the cost of a false match is a lost rename, the
+            // cost of a false miss is a silent runtime change.
+            if eligibleEnumNames.contains(Self.leafTypeName(typeName)) {
+                dangerousNames.insert(Self.leafTypeName(typeName))
+            }
             // else external/other type → safe.
         } else {
             // Wholly unresolvable base — could be any eligible enum.
@@ -424,6 +440,19 @@ private final class RawValueUseVisitor: SyntaxVisitor {
             return nil
         }
         return nil
+    }
+
+    /// The last segment of a written type name, which is the only part comparable against a
+    /// Symbol's own (short) name: `Ledger.Voucher` → `Voucher`, `Self.Tone` → `Tone`,
+    /// `Box<Tone>?` → `Box`. Optionals are stripped first because a written annotation may carry
+    /// them (`WrittenTypeName.of` peels them, but `Symbol.name` and the member-access path here
+    /// do not go through it).
+    private static func leafTypeName(_ s: String) -> String {
+        var n = s
+        while n.hasSuffix("?") || n.hasSuffix("!") { n = String(n.dropLast()) }
+        if let dot = n.lastIndex(of: ".") { n = String(n[n.index(after: dot)...]) }
+        if let lt = n.firstIndex(of: "<") { n = String(n[..<lt]) }
+        return n
     }
 
     private func bareTypeSymbol(of expr: ExprSyntax) -> Symbol? {
