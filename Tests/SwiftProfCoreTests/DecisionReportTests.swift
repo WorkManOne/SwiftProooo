@@ -341,11 +341,12 @@ extension DecisionReportTests {
 extension DecisionReportTests {
 
     /// The lines of one `--- <TITLE> … ---` section, excluding the header line itself.
+    /// Terminates at the next `---` section header or the per-file trace header (`=====`).
     func section(_ text: String, titled title: String) -> [String] {
         let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
         guard let start = lines.firstIndex(where: { $0.contains(title) }) else { return [] }
         let rest = lines[(start + 1)...]
-        let end = rest.firstIndex(where: { $0.hasPrefix("---") }) ?? rest.endIndex
+        let end = rest.firstIndex(where: { $0.hasPrefix("---") || $0.hasPrefix("=====") }) ?? rest.endIndex
         return Array(rest[..<end])
     }
 
@@ -388,6 +389,11 @@ extension DecisionReportTests {
                        "section must exist and be non-empty:\n\(text)")
         XCTAssertTrue(sectionLines.contains { $0.contains("receiver-untyped") },
                       "section must contain 'receiver-untyped':\n\(sectionLines.joined(separator: "\n"))")
+        // Structural assertion: section must be properly bounded, not leaking into per-file trace
+        XCTAssertFalse(sectionLines.contains { $0.contains("=====") },
+                       "section must not contain per-file trace header (=====):\n\(sectionLines.joined(separator: "\n"))")
+        XCTAssertFalse(sectionLines.contains { $0.contains("KEPT:") },
+                       "section must not contain per-file trace details (KEPT:):\n\(sectionLines.joined(separator: "\n"))")
         guard let topLine = sectionLines.first(where: { $0.trimmingCharacters(in: .whitespaces).starts(with: "top:") }) else {
             XCTFail("section must have a 'top:' line:\n\(sectionLines.joined(separator: "\n"))")
             return
