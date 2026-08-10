@@ -258,3 +258,47 @@ extension DecisionReportTests {
                        "expected exactly one record at \(first.line):\(first.column), got \(atSamePosition.count): \(atSamePosition)")
     }
 }
+
+extension DecisionReportTests {
+
+    func decisionsText(_ outputDir: URL) throws -> String {
+        try String(contentsOf: outputDir.appendingPathComponent("Decisions.txt"), encoding: .utf8)
+    }
+
+    func testDecisionsText_groupsByFileAndShowsResolvedTarget() throws {
+        let (_, outputDir) = try runExplain("""
+        struct Card { var badge: Int = 0 }
+        func read(_ c: Card) -> Int { c.badge }
+        """)
+        let text = try decisionsText(outputDir)
+        XCTAssertTrue(text.contains("===== "), "expected a file header:\n\(text)")
+        XCTAssertTrue(text.contains("Sample.swift"), "expected the real file name:\n\(text)")
+        let line = text.split(separator: "\n").first { $0.contains("use") && $0.contains("badge") }
+        XCTAssertNotNil(line, "expected a use-site line for badge:\n\(text)")
+        XCTAssertTrue(line?.contains("resolved: Sample.swift:1 Card.badge") == true,
+                      "use-site must name its target: \(line ?? "")")
+    }
+
+    func testDecisionsText_keptUseSiteCarriesTheCauseGloss() throws {
+        let (_, outputDir) = try runExplain("""
+        struct Box { var payloadTag: Int = 0 }
+        func take(_ x: SomeExternalThing) -> Int { return x.payloadTag }
+        """)
+        let text = try decisionsText(outputDir)
+        XCTAssertTrue(text.contains("KEPT: receiver-untyped"), "\n\(text)")
+        XCTAssertTrue(text.contains(UnresolvedCause.receiverUntyped.gloss),
+                      "the gloss must be rendered inline:\n\(text)")
+    }
+
+    func testDecisionsText_lowSignalEntriesArePrefixed() throws {
+        let (_, outputDir) = try runExplain("""
+        struct Vec {
+            let x: Int
+            static func == (a: Vec, b: Vec) -> Bool { a.x == b.x }
+        }
+        """)
+        let text = try decisionsText(outputDir)
+        XCTAssertTrue(text.split(separator: "\n").contains { $0.hasPrefix("v ") },
+                      "a use-site resolved to a protected target is the low-signal tier:\n\(text)")
+    }
+}
