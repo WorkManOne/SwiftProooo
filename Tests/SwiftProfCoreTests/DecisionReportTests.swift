@@ -470,3 +470,76 @@ extension DecisionReportTests {
                       "expected the hashed token to stand in for it:\n\(anon)")
     }
 }
+
+extension DecisionReportTests {
+
+    /// The residual left by Task 8: a bare `@Name` attribute token sitting OUTSIDE any quote/paren
+    /// delimiter is not caught by the delimited-segment scrub. `Protector.runPropertyWrapperProtection`
+    /// builds exactly this shape for a CUSTOM local `@propertyWrapper` type: `"@Wrapped property
+    /// wrapper (creates _x/$x synonyms)"` — `Wrapped` is a project type name declared in the
+    /// client's own module, and `@Wrapped` is bare text before the parenthesized (whitespace-only,
+    /// already-safe) prose.
+    func testAnonTwin_scrubsABareAtNameAttributeToken_customPropertyWrapper() throws {
+        let (_, outputDir) = try runExplain("""
+        @propertyWrapper
+        struct Wrapped {
+            var wrappedValue: Int
+            var projectedValue: Bool { wrappedValue > 0 }
+        }
+        struct Holder {
+            @Wrapped var counter: Int = 0
+        }
+        """)
+
+        let real = try decisionsText(outputDir)
+        XCTAssertTrue(real.contains("Wrapped"),
+                      "sanity check: the real report must name the wrapper type:\n\(real)")
+
+        let anon = try String(contentsOf: outputDir.appendingPathComponent("Decisions-anon.txt"),
+                              encoding: .utf8)
+        if let leaked = anon.split(separator: "\n").first(where: { $0.contains("Wrapped") }) {
+            XCTFail("real identifier survived into the anonymized report on this line:\n\(leaked)")
+        }
+        XCTAssertTrue(anon.contains("@" + Anon.of("Wrapped")),
+                      "expected the bare @Name token to be hashed but still keep its '@':\n\(anon)")
+    }
+
+    /// Allowlist passthrough: `class Thing: NSObject { var value: Int = 0 }` taints `Thing` via
+    /// `objcRootClassNames` (default `--objc-protection strict`), which the Protector reports as the
+    /// STATIC reason string `"@objc / transitive objc-class"` for the type and
+    /// `"@objc class member (transitive)"` for its members — both a bare `@objc` token with no
+    /// project data behind it. `objc` is Apple/Swift vocabulary (`knownAttributeNames`), so it must
+    /// print unhashed on the anonymized path too, exactly as it does on `.real`.
+    func testAnonTwin_bareAtNameAllowlist_objcPassesThroughUnhashed() throws {
+        let (_, outputDir) = try runExplain("""
+        import Foundation
+        class Thing: NSObject {
+            var value: Int = 0
+        }
+        """)
+
+        let real = try decisionsText(outputDir)
+        XCTAssertTrue(real.contains("@objc / transitive objc-class"),
+                      "sanity check: expected the transitive-objc-class reason:\n\(real)")
+
+        let anon = try String(contentsOf: outputDir.appendingPathComponent("Decisions-anon.txt"),
+                              encoding: .utf8)
+        // The type-level reason has no parens at all ("@objc / transitive objc-class"), so it is
+        // pure bare-token prose end to end and must survive byte-for-byte.
+        XCTAssertTrue(anon.contains("@objc / transitive objc-class"),
+                      "an allowlisted Apple attribute must pass through unhashed on the anon path:\n\(anon)")
+        // The member-level reason is "@objc class member (transitive)": the bare "@objc" token is
+        // the allowlist case under test; the single-word parenthetical "(transitive)" that follows
+        // goes through the PRE-EXISTING delimited-segment scrubber (`scrubIdentifierSegment`, not
+        // touched by this fix), which hashes any whitespace-free parenthesized word regardless of
+        // whether it is a real identifier — a separate, already-conservative-not-leaky quirk this
+        // task does not touch. Assert only the allowlisted token itself stays literal.
+        XCTAssertTrue(anon.contains("@objc class member ("),
+                      "the allowlisted @objc token must pass through unhashed here too:\n\(anon)")
+        // And the type/member NAMES around it must still be hashed — the allowlist covers the
+        // attribute vocabulary only, never project identifiers.
+        if let leaked = anon.split(separator: "\n").first(where: { $0.contains("Thing") || $0.contains(" value ") }) {
+            XCTFail("real identifier survived into the anonymized report on this line:\n\(leaked)")
+        }
+    }
+}

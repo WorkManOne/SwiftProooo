@@ -60,11 +60,15 @@ public enum DecisionRenderer {
     /// the assembler built by string interpolation (a Protector/Planner/RollbackPass reason such as
     /// `Codable stored key (Ticket)` or `original name 'badge' still appeared in rewritten output`) —
     /// while leaving the surrounding prose intact. Every such string in the project embeds its real
-    /// identifier one of two ways: a `'quoted name'` or a `(Parenthesized name)`. A segment is only
-    /// scrubbed when it "looks like" an identifier — no whitespace — so static prose delimited the
-    /// same way (`(or skip-overloaded-callables)`, `(local, not a rename target)`) is left readable
-    /// rather than turned into a single unreadable hash. `.real` never calls this: `Decisions.txt`
-    /// must stay byte-identical to today.
+    /// identifier one of three ways: a `'quoted name'`, a `(Parenthesized name)`, or a bare `@Name`
+    /// attribute token sitting outside any delimiter (a `Protector` property-wrapper/objc reason,
+    /// e.g. `@Foo property wrapper (creates _x/$x synonyms)` — `@Foo` names a LOCAL client type and
+    /// is not inside quotes or parens at all). A delimited segment is only scrubbed when it "looks
+    /// like" an identifier — no whitespace — so static prose delimited the same way
+    /// (`(or skip-overloaded-callables)`, `(local, not a rename target)`) is left readable rather
+    /// than turned into a single unreadable hash. Bare `@Name` tokens are scrubbed through
+    /// `scrubBareAttributes`, which passes known Apple/Swift attribute names through unhashed.
+    /// `.real` never calls this: `Decisions.txt` must stay byte-identical to today.
     private static func scrubFreeText(_ s: String) -> String {
         var out = ""
         var rest = Substring(s)
@@ -74,7 +78,7 @@ public enum DecisionRenderer {
             let openIdx: Substring.Index
             switch (quoteIdx, parenIdx) {
             case (nil, nil):
-                out += rest
+                out += scrubBareAttributes(rest)
                 return out
             case (let q?, nil):
                 openIdx = q
@@ -85,12 +89,12 @@ public enum DecisionRenderer {
             }
             let open = rest[openIdx]
             let close: Character = open == "'" ? "'" : ")"
-            out += rest[rest.startIndex..<openIdx]
+            out += scrubBareAttributes(rest[rest.startIndex..<openIdx])
             let afterOpen = rest.index(after: openIdx)
             guard let closeIdx = rest[afterOpen...].firstIndex(of: close) else {
                 // No matching closing delimiter — the rest is not a well-formed quote/paren pair;
-                // copy it verbatim rather than guess.
-                out += rest[openIdx...]
+                // copy it verbatim (bare `@Name` tokens in it still get scrubbed) rather than guess.
+                out += scrubBareAttributes(rest[openIdx...])
                 return out
             }
             let inner = rest[afterOpen..<closeIdx]
@@ -99,6 +103,53 @@ public enum DecisionRenderer {
             out.append(close)
             rest = rest[rest.index(after: closeIdx)...]
         }
+    }
+
+    /// Attribute names that are Apple/Swift vocabulary, not project identifiers — safe to print
+    /// unhashed because they carry no client information (they're the same finite set on every
+    /// project). Anything NOT in this list is a project type name until proven otherwise — e.g. a
+    /// LOCAL `@propertyWrapper`/`@resultBuilder` type the client declared — so the default is to
+    /// hash it, never to pass it through.
+    private static let knownAttributeNames: Set<String> = [
+        "objc", "objcMembers", "IBOutlet", "IBAction", "IBInspectable", "IBDesignable", "IBSegueAction",
+        "NSManaged", "State", "Binding", "Published", "ObservedObject", "StateObject", "EnvironmentObject",
+        "Environment", "AppStorage", "SceneStorage", "FocusState", "GestureState", "Namespace",
+        "escaping", "autoclosure", "main", "available", "discardableResult", "propertyWrapper", "resultBuilder",
+    ]
+
+    /// Hashes the name half of an `@Name` attribute token (the `@` is kept so the sentence stays
+    /// readable), passing known Apple/Swift attribute names through via `knownAttributeNames`.
+    private static func scrubAttribute(_ name: String) -> String {
+        knownAttributeNames.contains(name) ? "@" + name : "@" + Anon.of(name)
+    }
+
+    /// Hashes every bare `@Name` attribute token in `s` — one that sits OUTSIDE any quote/paren
+    /// delimiter, so `scrubIdentifierSegment` (the delimited-segment scrubber) never sees it —
+    /// while copying everything else verbatim. The counterpart to `scrubIdentifierSegment`'s own
+    /// `@`-prefixed-token branch, which handles the same shape when it DOES land inside a
+    /// delimiter; both route through `scrubAttribute` so the allowlist can't drift between them.
+    private static func scrubBareAttributes<S: StringProtocol>(_ s: S) -> String where S.SubSequence == Substring {
+        var out = ""
+        var chars = Substring(s)
+        while let atIdx = chars.firstIndex(of: "@") {
+            out += chars[chars.startIndex..<atIdx]
+            var idx = chars.index(after: atIdx)
+            var name = ""
+            while idx < chars.endIndex, chars[idx].isLetter || chars[idx].isNumber || chars[idx] == "_" {
+                name.append(chars[idx])
+                idx = chars.index(after: idx)
+            }
+            if name.isEmpty {
+                // A bare "@" with no identifier following it — copy verbatim, nothing to hash.
+                out.append("@")
+                chars = chars[chars.index(after: atIdx)...]
+            } else {
+                out += scrubAttribute(name)
+                chars = chars[idx...]
+            }
+        }
+        out += chars
+        return out
     }
 
     /// Hashes `inner` component-by-component (split on `.`/`,`, the two separators real reason
@@ -112,7 +163,7 @@ public enum DecisionRenderer {
         func flush() {
             guard !token.isEmpty else { return }
             if token.hasPrefix("@") {
-                out += "@" + Anon.of(String(token.dropFirst()))
+                out += scrubAttribute(String(token.dropFirst()))
             } else if token.hasPrefix("`") && token.hasSuffix("`") && token.count >= 2 {
                 out += "`" + Anon.of(String(token.dropFirst().dropLast())) + "`"
             } else {
