@@ -447,11 +447,11 @@ public final class Pipeline {
                                            rollback: rollbackResult,
                                            files: project.files)
             try decisions.writeJSON(to: options.outputDirectory.appendingPathComponent("decisions.json"))
-            logger.log("wrote decisions for \(decisions.byFile.count) files (--explain)")
 
             let text = DecisionRenderer.render(decisions, rollback: rollbackResult, identity: .real)
             try text.write(to: options.outputDirectory.appendingPathComponent("Decisions.txt"),
                            atomically: true, encoding: .utf8)
+            logger.log("wrote decisions for \(decisions.byFile.count) files (--explain)")
         }
 
         return PipelineResult(project: project, table: table, renameMap: map,

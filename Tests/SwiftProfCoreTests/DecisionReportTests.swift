@@ -301,4 +301,39 @@ extension DecisionReportTests {
         XCTAssertTrue(text.split(separator: "\n").contains { $0.hasPrefix("v ") },
                       "a use-site resolved to a protected target is the low-signal tier:\n\(text)")
     }
+
+    func testDecisionsText_revertedUsesite_showsRevertedAndTarget() throws {
+        // Same fixture as testDecisionReport_useSiteTargetRevertedAfterResolution:
+        // `widgetPayload` renames, its only use-site is missed, RollbackPass reverts the property
+        // AFTER the edit was emitted. The text must show both the revert marker and the target.
+        let (_, outputDir) = try runExplain("""
+        struct Box { var widgetPayload: Int = 0 }
+        func use(_ b: Box) -> Int { b.widgetPayload }
+        func take(_ x: SomeExternalThing) -> Int { return x.widgetPayload }
+        """)
+        let text = try decisionsText(outputDir)
+        let lines = text.split(separator: "\n").map(String.init)
+        let revertedLine = lines.first { $0.contains("→ REVERTED") && $0.contains("resolved:") }
+        XCTAssertNotNil(revertedLine, "expected a line with both '→ REVERTED' and 'resolved:' on the same line:\n\(text)")
+    }
+
+    func testDecisionsText_protectedDeclaration_showsProtectedVerdict() throws {
+        // Operator-named callables are never renamed (they resolve as operator expressions,
+        // never by declaration name). Verify the PROTECTED verdict is rendered in text.
+        let (_, outputDir) = try runExplain("""
+        struct Vec {
+            let x: Int
+            static func == (a: Vec, b: Vec) -> Bool { a.x == b.x }
+        }
+        """)
+        let text = try decisionsText(outputDir)
+        let lines = text.split(separator: "\n").map(String.init)
+        let protectedLine = lines.first { !$0.hasPrefix("#") && $0.contains("decl") && $0.contains("PROTECTED:") }
+        guard let line = protectedLine else {
+            let declLines = lines.filter { !$0.hasPrefix("#") && $0.contains("decl") }
+            XCTFail("expected a declaration line with 'PROTECTED:', found: \(declLines.joined(separator: "\n"))\n\nFull text:\n\(text)")
+            return
+        }
+        XCTAssertTrue(line.contains("=="), "operator == should be the protected declaration: \(line)")
+    }
 }
