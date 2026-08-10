@@ -81,3 +81,38 @@ extension DecisionReportTests {
                       "`count` is declared by no writable symbol and must not be recorded")
     }
 }
+
+extension DecisionReportTests {
+
+    func cause(of record: UseSiteRecord) -> UnresolvedCause? {
+        if case .kept(let c, _, _) = record.outcome { return c }
+        return nil
+    }
+
+    func testUseSite_unresolvedReceiver_recordsTheCause() throws {
+        // `SomeExternalThing` is undeclared, so the receiver cannot be typed and the member access
+        // resolves to nothing while `payloadTag`'s declaration is renamed.
+        let (result, _) = try runExplain("""
+        struct Box { var payloadTag: Int = 0 }
+        func take(_ x: SomeExternalThing) -> Int { return x.payloadTag }
+        """)
+        let kept = useSites(result, named: "payloadTag").compactMap { cause(of: $0) }
+        XCTAssertTrue(kept.contains(.receiverUntyped),
+                      "expected a receiver-untyped record, got \(kept.map(\.rawValue))")
+    }
+
+    func testUseSite_everyProjectNameOccurrenceIsRecorded() throws {
+        // The guarantee: no use-site of a project name reaches the output without a record. If the
+        // resolver has an uninstrumented path, the sweep turns it into `.noDecision` rather than
+        // silence, so this assertion holds either way and the CAUSE tells which happened.
+        let source = """
+        struct Card { var badge: Int = 0; func show() -> Int { badge } }
+        func read(_ c: Card) -> Int { c.badge + c.show() }
+        """
+        let (result, _) = try runExplain(source)
+        // `badge` is written 3 times as a use-site (body of show, c.badge, and none else).
+        XCTAssertEqual(useSites(result, named: "badge").count, 2,
+                       "records: \(useSites(result, named: "badge").map { ($0.offset, $0.outcome) })")
+        XCTAssertEqual(useSites(result, named: "show").count, 1)
+    }
+}

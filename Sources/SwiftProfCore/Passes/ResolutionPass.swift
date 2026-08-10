@@ -122,6 +122,19 @@ public final class ResolutionPass {
                                             projectNames: projectNames)
             visitor.walk(file.syntax)
             renames.append(contentsOf: visitor.renames)
+            // Prove the instrumentation's own coverage: any use-site position the resolver made no
+            // decision about becomes a `no-decision` record rather than silence.
+            if let log = useSiteLog {
+                let sweep = UseSiteSweep()
+                sweep.walk(file.syntax)
+                for site in sweep.sites
+                where !visitor.recordedOffsets.contains(site.offset)
+                   && projectNames.contains(site.name) {
+                    log.record(UseSiteRecord(
+                        filePath: file.url.path, offset: site.offset, name: site.name,
+                        outcome: .kept(cause: .noDecision, receiver: nil, candidateIds: [])))
+                }
+            }
             // Merge per-file hits so the reported occurrence counts are PROJECT-wide: the same
             // unresolved member name typically recurs across dozens of files, and a per-file report
             // would hide exactly the "362 occurrences" signal that makes one name worth chasing.
@@ -427,7 +440,12 @@ private final class ResolutionVisitor: SyntaxVisitor {
     ///
     /// Costs nothing on the default path: `diagnose` is false and `renamedNames` is empty.
     private func reportUnresolved(_ cause: UnresolvedCause, name: String, token: TokenSyntax,
-                                  receiver: String? = nil, candidates: Int = 0) {
+                                  receiver: String? = nil, candidates: Int = 0,
+                                  candidateIds: [Int] = []) {
+        recordUseSite(name: name,
+                      offset: token.positionAfterSkippingLeadingTrivia.utf8Offset,
+                      outcome: .kept(cause: cause, receiver: receiver, candidateIds: candidateIds))
+
         guard diagnose, renamedNames.contains(name) else { return }
         let key = UnresolvedKey(cause: cause, member: name, receiver: receiver)
         if unresolved[key] != nil {
