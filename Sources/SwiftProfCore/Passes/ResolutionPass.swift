@@ -156,7 +156,7 @@ public final class ResolutionPass {
 /// says why a given use-site was skipped. On a run where ~119 method names had surviving use-sites,
 /// `OVLD` produced a single line, because it fires only when >1 candidate matched the labels AND
 /// argument types could not pick one. Everything else resolved to nothing, silently.
-enum UnresolvedCause: String {
+enum UnresolvedCause: String, CaseIterable {
     /// The receiver expression could not be typed at all, so no member scope was ever searched.
     case receiverUntyped = "receiver-untyped"
     /// The receiver typed fine, but its scope declares no member of that name (a member inherited
@@ -181,9 +181,40 @@ enum UnresolvedCause: String {
     /// A base-less `.member` shorthand whose contextual type could not be determined.
     case noContextualType = "no-contextual-type"
 
+    /// The resolver walked past this use-site without recording any outcome. Emitted by the
+    /// post-walk sweep (`UseSiteSweep`), never by the resolver itself: it is the residue that
+    /// proves the instrumentation's own coverage, so it is high-signal by construction.
+    case noDecision = "no-decision"
+
     /// Low-signal causes go to the `v ` tier, mirroring `SURV blocked-explained`: a use-site we
     /// resolved and deliberately left alone is not a lead, it is the answer.
     var isExplained: Bool { self == .candidateHasNoObf }
+
+    /// One-line plain-English statement of the cause, rendered into the report next to the
+    /// use-site. The enum is the ONE source: `Diagnostics.txt` used to carry a hand-maintained
+    /// header listing the causes, which is how `inherited-kind-conflict` shipped undocumented in
+    /// that header.
+    var gloss: String {
+        switch self {
+        case .receiverUntyped:
+            return "the receiver expression could not be typed, so no member scope was searched"
+        case .noCandidateInScope:
+            return "the receiver typed fine, but declares no member of that name"
+        case .mixedKindCandidates:
+            return "the name is declared at several kinds here and the position rule could not narrow it"
+        case .ambiguousOverload:
+            return "several same-kind candidates and no argument type picks one"
+        case .inheritedKindConflict:
+            return "the type declares this name at the wrong kind and inherits it at the right one; "
+                 + "which one Swift picks needs type information we do not have"
+        case .candidateHasNoObf:
+            return "resolved to one declaration that is deliberately not renamed; this line is correct as it stands"
+        case .noContextualType:
+            return "a base-less `.member` whose contextual type could not be determined"
+        case .noDecision:
+            return "the resolver walked past this use-site without recording an outcome; a reporter gap, please file it"
+        }
+    }
 }
 
 /// Outcome of resolving one use-site: the rewrite target (if any) and, when the resolver declined,
