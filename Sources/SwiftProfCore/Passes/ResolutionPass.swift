@@ -782,12 +782,18 @@ private final class ResolutionVisitor: SyntaxVisitor {
     }
 
     private func emitRename(for token: TokenSyntax, target: Symbol) {
-        let offset = token.positionAfterSkippingLeadingTrivia.utf8Offset
         let obf = map.obf(for: target)
-        recordUseSite(name: stripBackticks(token.text), offset: offset,
-                      outcome: obf != nil ? .rewritten(targetSymbolId: target.id)
-                                          : .resolvedNotRenamed(targetSymbolId: target.id))
+        // Guarded at the caller, not inside `recordUseSite`: Swift evaluates arguments eagerly, so
+        // an inner nil-check would still pay for the position lookup and the `stripBackticks` scan
+        // on every call of the default path.
+        if useSiteLog != nil {
+            recordUseSite(name: stripBackticks(token.text),
+                          offset: token.positionAfterSkippingLeadingTrivia.utf8Offset,
+                          outcome: obf != nil ? .rewritten(targetSymbolId: target.id)
+                                              : .resolvedNotRenamed(targetSymbolId: target.id))
+        }
         guard let obf else { return }
+        let offset = token.positionAfterSkippingLeadingTrivia.utf8Offset
         let length = token.trimmedLength.utf8Length
         // Wrap as backticked identifier only when bare token already is the identifier (not `Foo`).
         renames.append(Rename(
