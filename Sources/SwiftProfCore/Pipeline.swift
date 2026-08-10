@@ -183,6 +183,8 @@ public struct PipelineResult {
     public let renameMap: RenameMap
     public let renames: [Rename]
     public let coverage: CoverageReport
+    /// Per-use-site decision records. Empty unless `--explain` was on.
+    public let useSites: [UseSiteRecord]
 }
 
 public enum PipelineError: Error, CustomStringConvertible {
@@ -380,11 +382,13 @@ public final class Pipeline {
         // Diagnostics go to a FILE, not the console: they are grepped after the run and can be
         // thousands of lines, which would bury the progress output they are mixed into.
         let diagnostics: DiagnosticsLog? = options.diagnoseOverloads ? DiagnosticsLog() : nil
+        let useSiteLog: UseSiteLog? = options.explain ? UseSiteLog() : nil
         var renames = ResolutionPass(table: table, map: map, logger: logger,
                                      diagnoseOverloads: options.diagnoseOverloads,
                                      diagnostics: diagnostics,
                                      indexContext: indexContext,
-                                     uniqueExternalMembers: options.uniqueExternalMembers).run(on: project.files)
+                                     uniqueExternalMembers: options.uniqueExternalMembers,
+                                     useSiteLog: useSiteLog).run(on: project.files)
         logger.log("rename edits: \(renames.count)")
 
         // A6: validate every edit against the compiler's occurrence set; drop renames the index
@@ -442,6 +446,7 @@ public final class Pipeline {
         }
 
         return PipelineResult(project: project, table: table, renameMap: map,
-                              renames: renames, coverage: coverage)
+                              renames: renames, coverage: coverage,
+                              useSites: useSiteLog?.records ?? [])
     }
 }

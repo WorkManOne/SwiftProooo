@@ -18,10 +18,12 @@ public final class ResolutionPass {
     /// external-type extension and the receiver cannot be typed (`--no-unique-external-members`
     /// disables it). See `uniqueExternalExtensionMembers`.
     public let uniqueExternalMembers: Bool
+    /// Per-use-site decision records for `--explain`. nil ⇒ no recording work at all.
+    public let useSiteLog: UseSiteLog?
 
     public init(table: SymbolTable, map: RenameMap, logger: Logger, diagnoseOverloads: Bool = false,
                 diagnostics: Logger? = nil, indexContext: IndexContext? = nil,
-                uniqueExternalMembers: Bool = true) {
+                uniqueExternalMembers: Bool = true, useSiteLog: UseSiteLog? = nil) {
         self.table = table
         self.map = map
         self.logger = logger
@@ -29,6 +31,7 @@ public final class ResolutionPass {
         self.diagnostics = diagnostics
         self.indexContext = indexContext
         self.uniqueExternalMembers = uniqueExternalMembers
+        self.useSiteLog = useSiteLog
     }
 
     /// name → the single declaration that owns it, for members of external-type extensions whose
@@ -99,6 +102,14 @@ public final class ResolutionPass {
         if diagnoseOverloads {
             for sym in table.symbols where map.obf(for: sym) != nil { renamedNames.insert(sym.name) }
         }
+        // Layer 2 filter: a use-site is worth describing when its name is declared by at least one
+        // symbol of a WRITABLE module. Wider than `renamedNames` on purpose (a protected or
+        // policy-skipped project symbol is exactly what explains a name that stayed original), and
+        // narrow enough to drop the SDK bulk (`padding`, `leading`, `font`).
+        var projectNames: Set<String> = []
+        if useSiteLog != nil {
+            for sym in table.symbols where sym.module.writable { projectNames.insert(sym.name) }
+        }
         var unresolved: [UnresolvedKey: UnresolvedHit] = [:]
         for file in files where file.module.writable {
             guard let fileScope = table.fileScopes[ObjectIdentifier(file)] else { continue }
@@ -106,7 +117,9 @@ public final class ResolutionPass {
                                             diagLog: diagnostics ?? logger, diagnose: diagnoseOverloads,
                                             indexContext: indexContext,
                                             uniqueExternalMembers: uniqueExternal,
-                                            renamedNames: renamedNames)
+                                            renamedNames: renamedNames,
+                                            useSiteLog: useSiteLog,
+                                            projectNames: projectNames)
             visitor.walk(file.syntax)
             renames.append(contentsOf: visitor.renames)
             // Merge per-file hits so the reported occurrence counts are PROJECT-wide: the same
@@ -156,7 +169,7 @@ public final class ResolutionPass {
 /// says why a given use-site was skipped. On a run where ~119 method names had surviving use-sites,
 /// `OVLD` produced a single line, because it fires only when >1 candidate matched the labels AND
 /// argument types could not pick one. Everything else resolved to nothing, silently.
-enum UnresolvedCause: String, CaseIterable {
+public enum UnresolvedCause: String, CaseIterable {
     /// The receiver expression could not be typed at all, so no member scope was ever searched.
     case receiverUntyped = "receiver-untyped"
     /// The receiver typed fine, but its scope declares no member of that name (a member inherited
@@ -188,13 +201,13 @@ enum UnresolvedCause: String, CaseIterable {
 
     /// Low-signal causes go to the `v ` tier, mirroring `SURV blocked-explained`: a use-site we
     /// resolved and deliberately left alone is not a lead, it is the answer.
-    var isExplained: Bool { self == .candidateHasNoObf }
+    public var isExplained: Bool { self == .candidateHasNoObf }
 
     /// One-line plain-English statement of the cause, rendered into the report next to the
     /// use-site. The enum is the ONE source: `Diagnostics.txt` used to carry a hand-maintained
     /// header listing the causes, which is how `inherited-kind-conflict` shipped undocumented in
     /// that header.
-    var gloss: String {
+    public var gloss: String {
         switch self {
         case .receiverUntyped:
             return "the receiver expression could not be typed, so no member scope was searched"
@@ -328,6 +341,14 @@ private final class ResolutionVisitor: SyntaxVisitor {
     /// `String.append`, every SwiftUI modifier) would bury the signal under thousands of lines.
     /// Empty when `--diagnose-overloads` is off, so the filter also switches the feature off.
     private let renamedNames: Set<String>
+    /// Where use-site records go (`--explain`). nil ⇒ recording off.
+    private let useSiteLog: UseSiteLog?
+    /// Names declared by a writable-module symbol. The layer 2 filter.
+    private let projectNames: Set<String>
+    /// Every use-site offset this visitor made a decision about, filtered or not. `UseSiteSweep`
+    /// (Task 3) diffs against it, so an offset deliberately dropped by `projectNames` must still be
+    /// inserted here or the sweep would re-report it as a reporter gap.
+    var recordedOffsets: Set<Int> = []
     /// Aggregated `UNRES` hits for this file, merged by `ResolutionPass` across all files so the
     /// occurrence counts are project-wide.
     var unresolved: [UnresolvedKey: UnresolvedHit] = [:]
@@ -337,7 +358,9 @@ private final class ResolutionVisitor: SyntaxVisitor {
     init(file: SourceFile, table: SymbolTable, map: RenameMap, fileScope: Scope, diagLog: Logger,
          diagnose: Bool = false, indexContext: IndexContext? = nil,
          uniqueExternalMembers: [String: [String: Symbol]] = [:],
-         renamedNames: Set<String> = []) {
+         renamedNames: Set<String> = [],
+         useSiteLog: UseSiteLog? = nil,
+         projectNames: Set<String> = []) {
         self.file = file
         self.table = table
         self.map = map
@@ -346,6 +369,8 @@ private final class ResolutionVisitor: SyntaxVisitor {
         self.indexContext = indexContext
         self.uniqueExternalMembers = uniqueExternalMembers
         self.renamedNames = renamedNames
+        self.useSiteLog = useSiteLog
+        self.projectNames = projectNames
         // Build the converter only when the index is engaged (it parses positions; skip the cost
         // on the syntactic baseline). Use locals to avoid reading self before super.init.
         let path: String?
@@ -415,6 +440,15 @@ private final class ResolutionVisitor: SyntaxVisitor {
                                         path: file.url.path,
                                         line: diagConverter.location(for: pos).line,
                                         candidates: candidates)
+    }
+
+    /// The ONE place a use-site becomes a record. Costs nothing when `useSiteLog` is nil.
+    func recordUseSite(name: String, offset: Int, outcome: UseSiteRecord.Outcome) {
+        guard let log = useSiteLog else { return }
+        recordedOffsets.insert(offset)
+        guard projectNames.contains(name) else { return }
+        log.record(UseSiteRecord(filePath: file.url.path, offset: offset,
+                                 name: name, outcome: outcome))
     }
 
     /// Report a `LookupOutcome` that carries a cause. Returns the outcome's symbol so call sites
@@ -748,8 +782,12 @@ private final class ResolutionVisitor: SyntaxVisitor {
     }
 
     private func emitRename(for token: TokenSyntax, target: Symbol) {
-        guard let obf = map.obf(for: target) else { return }
         let offset = token.positionAfterSkippingLeadingTrivia.utf8Offset
+        let obf = map.obf(for: target)
+        recordUseSite(name: stripBackticks(token.text), offset: offset,
+                      outcome: obf != nil ? .rewritten(targetSymbolId: target.id)
+                                          : .resolvedNotRenamed(targetSymbolId: target.id))
+        guard let obf else { return }
         let length = token.trimmedLength.utf8Length
         // Wrap as backticked identifier only when bare token already is the identifier (not `Foo`).
         renames.append(Rename(
