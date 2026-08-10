@@ -442,9 +442,20 @@ private final class ResolutionVisitor: SyntaxVisitor {
     private func reportUnresolved(_ cause: UnresolvedCause, name: String, token: TokenSyntax,
                                   receiver: String? = nil, candidates: Int = 0,
                                   candidateIds: [Int] = []) {
-        recordUseSite(name: name,
-                      offset: token.positionAfterSkippingLeadingTrivia.utf8Offset,
-                      outcome: .kept(cause: cause, receiver: receiver, candidateIds: candidateIds))
+        // Guarded at the caller, not inside `recordUseSite`: Swift evaluates arguments eagerly, so
+        // an inner nil-check would still pay for the position lookup and the `.kept(...)`
+        // construction on every declined use-site of the default path (see `emitRename`). The
+        // position itself is hoisted to one `let`, shared by the record below and the aggregation
+        // further down, computed only once at least one of the two features that need it is on —
+        // so it still costs nothing when both are off.
+        guard useSiteLog != nil || diagnose else { return }
+        let pos = token.positionAfterSkippingLeadingTrivia
+
+        if useSiteLog != nil {
+            recordUseSite(name: name,
+                          offset: pos.utf8Offset,
+                          outcome: .kept(cause: cause, receiver: receiver, candidateIds: candidateIds))
+        }
 
         guard diagnose, renamedNames.contains(name) else { return }
         let key = UnresolvedKey(cause: cause, member: name, receiver: receiver)
@@ -452,7 +463,6 @@ private final class ResolutionVisitor: SyntaxVisitor {
             unresolved[key]!.occurrences += 1
             return
         }
-        let pos = token.positionAfterSkippingLeadingTrivia
         unresolved[key] = UnresolvedHit(occurrences: 1,
                                         file: file.url.lastPathComponent,
                                         path: file.url.path,

@@ -110,9 +110,28 @@ extension DecisionReportTests {
         func read(_ c: Card) -> Int { c.badge + c.show() }
         """
         let (result, _) = try runExplain(source)
-        // `badge` is written 3 times as a use-site (body of show, c.badge, and none else).
+        // `badge` is written as a use-site twice: the bare reference in show's body, and `c.badge`.
         XCTAssertEqual(useSites(result, named: "badge").count, 2,
                        "records: \(useSites(result, named: "badge").map { ($0.offset, $0.outcome) })")
         XCTAssertEqual(useSites(result, named: "show").count, 1)
+    }
+}
+
+extension DecisionReportTests {
+
+    func testUseSite_uninstrumentedPosition_isRecordedAsNoDecision() throws {
+        let (result, _) = try runExplain("""
+        struct Box { var value: Int = 0 }
+        func read(_ o: Int?) -> Int {
+            if let value = o { return value }
+            return 0
+        }
+        """)
+        let causes = useSites(result, named: "value").compactMap { rec -> UnresolvedCause? in
+            if case .kept(let c, _, _) = rec.outcome { return c }
+            return nil
+        }
+        XCTAssertTrue(causes.contains(.noDecision),
+                      "the sweep must surface a position the resolver never decided about: \(causes)")
     }
 }
