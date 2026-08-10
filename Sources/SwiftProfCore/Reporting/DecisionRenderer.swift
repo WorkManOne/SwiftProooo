@@ -48,8 +48,61 @@ public enum DecisionRenderer {
     public static func render(_ report: DecisionReport, rollback: RollbackResult,
                               identity: Identity) -> String {
         var out = header(identity)
+        out += summary(report, rollback: rollback, identity: identity)
         out += perFile(report, identity: identity)
         return out
+    }
+
+    /// The layer-1 summary: tens of lines read FIRST, answering "where is the damage". Three
+    /// sections — the red-build set (a shielded survivor, revert blocked, desync ships), the
+    /// coverage losses (a revert that DID happen, green but under-obfuscated), and a histogram of
+    /// unresolved use-sites by cause with the top names per cause. This is what the separate
+    /// `Diagnostics.txt` aggregates today.
+    private static func summary(_ report: DecisionReport, rollback: RollbackResult,
+                                identity: Identity) -> String {
+        let all = report.byFile.values.flatMap { $0 }
+        let decls = all.filter { $0.role == "declaration" }
+        let uses = all.filter { $0.role == "use-site" }
+        let rewritten = uses.filter { $0.decision == "rewritten" }.count
+
+        var lines = ["=== SwiftProf decisions: summary ==="]
+        lines.append("files \(report.byFile.count) · declarations \(decls.count) "
+                   + "· use-sites recorded \(uses.count) · rewritten \(rewritten)")
+        lines.append("")
+
+        lines.append("--- RED BUILD RISK: original name survived, revert was blocked "
+                   + "(\(rollback.blockedNames.count) names) ---")
+        for (name, hit) in rollback.blockedNames.sorted(by: { $0.value.occurrences > $1.value.occurrences }) {
+            let shields = (rollback.shieldReasons[name] ?? []).sorted().joined(separator: "+")
+            lines.append("  \(pad(ident(name, identity), 24)) occ=\(hit.occurrences)  shield \(shields)")
+            lines.append("  \(String(repeating: " ", count: 24)) first at \(path(hit.filePath, identity))")
+        }
+        lines.append("")
+
+        lines.append("--- COVERAGE LOSS: rename reverted because a use-site survived "
+                   + "(\(rollback.revertedNames.count) names) ---")
+        for (name, hit) in rollback.revertedNames.sorted(by: { $0.value.occurrences > $1.value.occurrences }) {
+            lines.append("  \(pad(ident(name, identity), 24)) occ=\(hit.occurrences)")
+            lines.append("  \(String(repeating: " ", count: 24)) first at \(path(hit.filePath, identity))")
+        }
+        lines.append("")
+
+        var byCause: [String: Int] = [:]
+        var topName: [String: [String: Int]] = [:]
+        for u in uses where u.decision == "kept" {
+            byCause[u.reason, default: 0] += 1
+            topName[u.reason, default: [:]][u.name, default: 0] += 1
+        }
+        lines.append("--- UNRESOLVED USE-SITES by cause ---")
+        for (cause, count) in byCause.sorted(by: { $0.value > $1.value }) {
+            let gloss = UnresolvedCause(rawValue: cause)?.gloss ?? ""
+            lines.append("  \(pad(String(count), 6)) \(pad(cause, 24)) \(gloss)")
+            let top = (topName[cause] ?? [:]).sorted { $0.value > $1.value }.prefix(3)
+                .map { "\(ident($0.key, identity)) \($0.value)" }.joined(separator: " · ")
+            if !top.isEmpty { lines.append("         top: \(top)") }
+        }
+        lines.append("")
+        return lines.joined(separator: "\n") + "\n"
     }
 
     private static func header(_ identity: Identity) -> String {

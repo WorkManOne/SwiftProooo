@@ -337,3 +337,53 @@ extension DecisionReportTests {
         XCTAssertTrue(line.contains("=="), "operator == should be the protected declaration: \(line)")
     }
 }
+
+extension DecisionReportTests {
+
+    /// The lines of one `--- <TITLE> … ---` section, excluding the header line itself.
+    func section(_ text: String, titled title: String) -> [String] {
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        guard let start = lines.firstIndex(where: { $0.contains(title) }) else { return [] }
+        let rest = lines[(start + 1)...]
+        let end = rest.firstIndex(where: { $0.hasPrefix("---") }) ?? rest.endIndex
+        return Array(rest[..<end])
+    }
+
+    func testSummary_namesTheRedBuildSet() throws {
+        let (_, outputDir) = try runExplain("""
+        struct Box { var camera: Int = 0 }
+        func take(_ x: SomeExternalThing) -> Int { return x.camera }
+        """)
+        let text = try decisionsText(outputDir)
+        XCTAssertTrue(text.contains("RED BUILD RISK"), "\n\(text)")
+        let sectionLines = section(text, titled: "RED BUILD RISK")
+        XCTAssertTrue(sectionLines.contains { $0.contains("camera") },
+                      "the shielded survivor must be named:\n\(sectionLines.joined(separator: "\n"))")
+        XCTAssertTrue(sectionLines.contains { $0.contains("1c") },
+                      "the shield must be named:\n\(sectionLines.joined(separator: "\n"))")
+    }
+
+    func testSummary_namesTheCoverageLoss() throws {
+        let (_, outputDir) = try runExplain("""
+        struct Box { var widgetPayload: Int = 0 }
+        func take(_ x: SomeExternalThing) -> Int { return x.widgetPayload }
+        """)
+        let text = try decisionsText(outputDir)
+        XCTAssertTrue(text.contains("COVERAGE LOSS"), "\n\(text)")
+        let sectionLines = section(text, titled: "COVERAGE LOSS")
+        XCTAssertTrue(sectionLines.contains { $0.contains("widgetPayload") },
+                      "\n\(sectionLines.joined(separator: "\n"))")
+    }
+
+    func testSummary_ranksCausesByOccurrence() throws {
+        let (_, outputDir) = try runExplain("""
+        struct Box { var payloadTag: Int = 0; var otherTag: Int = 0 }
+        func a(_ x: SomeExternalThing) -> Int { return x.payloadTag }
+        func b(_ x: SomeExternalThing) -> Int { return x.payloadTag }
+        func c(_ x: SomeExternalThing) -> Int { return x.otherTag }
+        """)
+        let text = try decisionsText(outputDir)
+        XCTAssertTrue(text.contains("UNRESOLVED USE-SITES by cause"), "\n\(text)")
+        XCTAssertTrue(text.contains("receiver-untyped"), "\n\(text)")
+    }
+}
