@@ -1,44 +1,63 @@
 import Foundation
 import SwiftSyntax
 
-/// Per-symbol provenance: for EVERY writable declaration, exactly why it was obfuscated, protected,
-/// skipped, or reverted. Lets you open any file and look up the decision for a specific object.
+/// Per-position provenance: for every writable DECLARATION, exactly why it was obfuscated,
+/// protected, skipped or reverted; and for every USE-SITE of a project name, what the resolver
+/// bound it to or why it declined.
 ///
-/// Precedence (a symbol has exactly one outcome):
-///   1. obf assigned        → `obfuscated`  (reason = the obfuscated name)
-///   2. revert reason set    → `reverted`   (planned, then rolled back — witness/ambiguity/rollback/A6)
-///   3. Protector reason set → `protected`  (never planned — runtime/API/contract)
-///   4. Planner skip reason  → `skipped`    (policy: parameter/init/ext-of-external/kind/ignore/A5)
-/// Steps 2–4 are mutually exclusive in practice: Protector-protected symbols are never planned (so
-/// no revert reason), and reverted symbols were planned (so not Protector-protected).
+/// Declaration precedence (a symbol has exactly one outcome):
+///   1. obf assigned         → `obfuscated`  (reason = the obfuscated name)
+///   2. revert reason set    → `reverted`    (planned, then rolled back)
+///   3. Protector reason set → `protected`
+///   4. Planner skip reason  → `skipped`
+///
+/// Use-site outcomes are read against the FINAL `RenameMap`: `RollbackPass` and the A6 validator run
+/// after `ResolutionPass`, so a rewrite recorded during resolution may have been undone since.
 public struct DecisionReport {
     public struct Entry: Codable {
         public let line: Int
         public let column: Int
         public let name: String
         public let kind: String
-        public let decision: String   // obfuscated | protected | skipped | reverted
-        public let reason: String     // the obfuscated name (when obfuscated) or the human reason
+        /// "declaration" or "use-site".
+        public let role: String
+        /// declaration: obfuscated | protected | skipped | reverted
+        /// use-site:    rewritten | kept
+        public let decision: String
+        /// The obfuscated name, the human reason, or (for a rewritten use-site whose target was
+        /// later reverted) the literal "reverted".
+        public let reason: String
+        /// use-site only: "File.swift:12 Owner.member", the declaration the resolver chose.
+        public let target: String?
+        /// Extra lines rendered under the entry (cause gloss, effect, candidate list).
+        public let detail: [String]?
     }
 
-    /// Absolute file path → entries, sorted by source position.
     public let byFile: [String: [Entry]]
 
-    public init(table: SymbolTable, map: RenameMap, protector: Protector, plannerSkip: [Int: String]) {
+    public init(table: SymbolTable, map: RenameMap, protector: Protector,
+                plannerSkip: [Int: String], useSites: [UseSiteRecord],
+                rollback: RollbackResult, files: [SourceFile]) {
         var grouped: [String: [Entry]] = [:]
-        var convertersByFile: [ObjectIdentifier: SourceLocationConverter] = [:]
+        var convertersByPath: [String: SourceLocationConverter] = [:]
 
+        func converter(forPath path: String, syntax: SourceFileSyntax) -> SourceLocationConverter {
+            if let c = convertersByPath[path] { return c }
+            let c = SourceLocationConverter(fileName: path, tree: syntax)
+            convertersByPath[path] = c
+            return c
+        }
+
+        var syntaxByPath: [String: SourceFileSyntax] = [:]
+        for f in files where f.module.writable { syntaxByPath[f.url.path] = f.syntax }
+
+        var symbolById: [Int: Symbol] = [:]
+        for sym in table.symbols { symbolById[sym.id] = sym }
+
+        // 1. Declarations.
         for sym in table.symbols where sym.module.writable {
-            let fileKey = ObjectIdentifier(sym.file)
-            let converter: SourceLocationConverter
-            if let cached = convertersByFile[fileKey] {
-                converter = cached
-            } else {
-                converter = SourceLocationConverter(fileName: sym.file.url.path, tree: sym.file.syntax)
-                convertersByFile[fileKey] = converter
-            }
-            let loc = converter.location(for: AbsolutePosition(utf8Offset: sym.declOffset))
-
+            let conv = converter(forPath: sym.file.url.path, syntax: sym.file.syntax)
+            let loc = conv.location(for: AbsolutePosition(utf8Offset: sym.declOffset))
             let decision: String
             let reason: String
             if let obf = map.obf(for: sym) {
@@ -52,47 +71,98 @@ public struct DecisionReport {
             } else {
                 decision = "skipped"; reason = "no rename planned (no specific reason recorded)"
             }
-
             grouped[sym.file.url.path, default: []].append(
-                Entry(line: loc.line, column: loc.column, name: sym.name,
-                      kind: sym.kind.rawValue, decision: decision, reason: reason))
+                Entry(line: loc.line, column: loc.column, name: sym.name, kind: sym.kind.rawValue,
+                      role: "declaration", decision: decision, reason: reason,
+                      target: nil, detail: nil))
         }
 
+        // 2. Use-sites.
+        for rec in useSites {
+            guard let syntax = syntaxByPath[rec.filePath] else { continue }
+            let conv = converter(forPath: rec.filePath, syntax: syntax)
+            let loc = conv.location(for: AbsolutePosition(utf8Offset: rec.offset))
+
+            let kind: String
+            let decision: String
+            let reason: String
+            var target: String? = nil
+            var detail: [String] = []
+
+            switch rec.outcome {
+            case .rewritten(let id), .resolvedNotRenamed(let id):
+                let sym = symbolById[id]
+                kind = sym?.kind.rawValue ?? "unknown"
+                target = sym.map { Self.describe($0, converter: converter(forPath: $0.file.url.path,
+                                                                          syntax: $0.file.syntax)) }
+                if let sym, let obf = map.obf(for: sym) {
+                    decision = "rewritten"; reason = obf
+                } else if let sym, let r = map.revertReason(sym.id) {
+                    decision = "rewritten"; reason = "reverted"
+                    detail.append("resolution was correct; the rename was undone afterwards")
+                    detail.append("reverted: \(r)")
+                } else if let sym, let r = protector.reason(for: sym) {
+                    decision = "kept"; reason = "candidate-has-no-obf"
+                    detail.append("target is PROTECTED: \(r)")
+                } else if let sym, let r = plannerSkip[sym.id] {
+                    decision = "kept"; reason = "candidate-has-no-obf"
+                    detail.append("target is SKIPPED: \(r)")
+                } else {
+                    decision = "kept"; reason = "candidate-has-no-obf"
+                    detail.append("target is not renamed (no specific reason recorded)")
+                }
+
+            case .kept(let cause, let receiver, let candidateIds):
+                kind = "unknown"
+                decision = "kept"
+                reason = cause.rawValue
+                detail.append(cause.gloss)
+                if let receiver { detail.append("receiver type: \(receiver)") }
+                for id in candidateIds {
+                    guard let c = symbolById[id] else { continue }
+                    detail.append("candidate: " + Self.describe(
+                        c, converter: converter(forPath: c.file.url.path, syntax: c.file.syntax)))
+                }
+                if let effect = Self.effect(for: rec.name, rollback: rollback) {
+                    detail.append(effect)
+                }
+            }
+
+            grouped[rec.filePath, default: []].append(
+                Entry(line: loc.line, column: loc.column, name: rec.name, kind: kind,
+                      role: "use-site", decision: decision, reason: reason,
+                      target: target, detail: detail.isEmpty ? nil : detail))
+        }
+
+        // Declarations first, then use-sites; each block in source order.
         for (path, entries) in grouped {
             grouped[path] = entries.sorted {
-                $0.line != $1.line ? $0.line < $1.line : $0.column < $1.column
+                if $0.role != $1.role { return $0.role == "declaration" }
+                if $0.line != $1.line { return $0.line < $1.line }
+                return $0.column < $1.column
             }
         }
         self.byFile = grouped
     }
 
-    private func pad(_ s: String, _ width: Int) -> String {
-        s.count >= width ? s : s + String(repeating: " ", count: width - s.count)
+    /// "File.swift:12 Owner.member", or "File.swift:12 member" for a top-level declaration.
+    static func describe(_ sym: Symbol, converter: SourceLocationConverter) -> String {
+        let loc = converter.location(for: AbsolutePosition(utf8Offset: sym.declOffset))
+        let owner = sym.scope?.owner?.name
+        let qualified = owner.map { "\($0).\(sym.name)" } ?? sym.name
+        return "\(sym.file.url.lastPathComponent):\(loc.line) \(qualified)"
     }
 
-    public func formattedText() -> String {
-        var lines: [String] = [
-            "=== SwiftProf per-symbol decisions ===",
-            "OBFUSCATED → <obf>  |  PROTECTED: <reason>  |  SKIPPED: <reason>  |  REVERTED: <reason>",
-            "",
-        ]
-        for path in byFile.keys.sorted() {
-            lines.append("===== \(path) =====")
-            for e in byFile[path]! {
-                let loc = pad("\(e.line):\(e.column)", 9)
-                let head = "\(loc)\(pad(e.kind, 13))\(pad(e.name, 30))"
-                let verdict = e.decision == "obfuscated"
-                    ? "OBFUSCATED → \(e.reason)"
-                    : "\(e.decision.uppercased()): \(e.reason)"
-                lines.append("  \(head) \(verdict)")
-            }
-            lines.append("")
+    /// What a missed use-site cost, when the rollback pass has an opinion about the name.
+    static func effect(for name: String, rollback: RollbackResult) -> String? {
+        if rollback.blockedNames[name] != nil {
+            let shields = (rollback.shieldReasons[name] ?? []).sorted().joined(separator: "+")
+            return "effect: DESYNC SHIPS. rollback blocked by shield \(shields)"
         }
-        return lines.joined(separator: "\n")
-    }
-
-    public func writeText(to url: URL) throws {
-        try formattedText().write(to: url, atomically: true, encoding: .utf8)
+        if rollback.revertedNames[name] != nil {
+            return "effect: reverted, the name stays readable"
+        }
+        return nil
     }
 
     public func writeJSON(to url: URL) throws {

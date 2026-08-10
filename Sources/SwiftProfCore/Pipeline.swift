@@ -442,10 +442,12 @@ public final class Pipeline {
 
         if options.explain {
             let decisions = DecisionReport(table: table, map: map, protector: protector,
-                                           plannerSkip: planner.skipReason)
-            try decisions.writeText(to: options.outputDirectory.appendingPathComponent("Decisions.txt"))
+                                           plannerSkip: planner.skipReason,
+                                           useSites: useSiteLog?.records ?? [],
+                                           rollback: rollbackResult,
+                                           files: project.files)
             try decisions.writeJSON(to: options.outputDirectory.appendingPathComponent("decisions.json"))
-            logger.log("wrote per-symbol decisions for \(decisions.byFile.count) files (--explain)")
+            logger.log("wrote decisions for \(decisions.byFile.count) files (--explain)")
         }
 
         return PipelineResult(project: project, table: table, renameMap: map,

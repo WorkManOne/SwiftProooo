@@ -160,3 +160,55 @@ extension DecisionReportTests {
         XCTAssertEqual(result.rollback.shieldReasons["camera"], ["1c"])
     }
 }
+
+extension DecisionReportTests {
+
+    func entries(_ outputDir: URL) throws -> [DecisionReport.Entry] {
+        let data = try Data(contentsOf: outputDir.appendingPathComponent("decisions.json"))
+        return try JSONDecoder().decode([String: [DecisionReport.Entry]].self, from: data)
+            .values.flatMap { $0 }
+    }
+
+    func testDecisionReport_useSiteEntryNamesItsTarget() throws {
+        let (_, outputDir) = try runExplain("""
+        struct Card { var badge: Int = 0 }
+        func read(_ c: Card) -> Int { c.badge }
+        """)
+        let all = try entries(outputDir)
+        let use = all.first { $0.role == "use-site" && $0.name == "badge" }
+        XCTAssertNotNil(use, "roles present: \(Set(all.map(\.role)))")
+        XCTAssertEqual(use?.decision, "rewritten")
+        XCTAssertEqual(use?.target, "Sample.swift:1 Card.badge")
+        XCTAssertTrue(use?.line ?? 0 > 0)
+    }
+
+    func testDecisionReport_useSiteTargetRevertedAfterResolution() throws {
+        // `widgetPayload` renames, its only use-site is missed, RollbackPass reverts the property
+        // AFTER the edit was emitted. The entry must report the final state, not the resolution-time
+        // one, which is why the report reads the final map instead of storing obf names.
+        let (_, outputDir) = try runExplain("""
+        struct Box { var widgetPayload: Int = 0 }
+        func use(_ b: Box) -> Int { b.widgetPayload }
+        func take(_ x: SomeExternalThing) -> Int { return x.widgetPayload }
+        """)
+        let all = try entries(outputDir)
+        let use = all.first { $0.role == "use-site" && $0.name == "widgetPayload"
+                              && $0.decision == "rewritten" }
+        XCTAssertEqual(use?.reason, "reverted",
+                       "a rewrite undone by rollback must read as reverted: \(String(describing: use))")
+    }
+
+    func testDecisionReport_declarationEntriesStillCarryTheirVerdict() throws {
+        let (_, outputDir) = try runExplain("""
+        struct Vec {
+            let x: Int
+            init(x: Int) { self.x = x }
+            static func == (a: Vec, b: Vec) -> Bool { a.x == b.x }
+            func magnitude() -> Int { x }
+        }
+        """)
+        let decls = try entries(outputDir).filter { $0.role == "declaration" }
+        XCTAssertEqual(decls.first { $0.name == "magnitude" }?.decision, "obfuscated")
+        XCTAssertEqual(decls.first { $0.name == "==" }?.decision, "protected")
+    }
+}

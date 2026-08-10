@@ -2376,7 +2376,7 @@ final class PatternTests: XCTestCase {
     }
 
     private func decision(_ entries: [DecisionReport.Entry], name: String) -> DecisionReport.Entry? {
-        entries.first { $0.name == name }
+        entries.first { $0.name == name && $0.role == "declaration" }
     }
 
     func testDecisionReport_obfuscatedProtectedSkipped() throws {
@@ -2410,7 +2410,7 @@ final class PatternTests: XCTestCase {
             _ = b
         }
         """)
-        let shared = entries.filter { $0.name == "shared" }
+        let shared = entries.filter { $0.name == "shared" && $0.role == "declaration" }
         XCTAssertFalse(shared.isEmpty, "expected `shared` enum cases in the report")
         XCTAssertTrue(shared.allSatisfy { $0.decision == "reverted" },
                       "shared cases must be reverted: \(shared.map { $0.decision })")
