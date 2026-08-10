@@ -90,7 +90,9 @@ public struct DecisionReport {
             var detail: [String] = []
 
             switch rec.outcome {
-            case .rewritten(let id), .resolvedNotRenamed(let id):
+            case .rewritten(let id):
+                // An edit WAS emitted here. Read the FINAL map state: `RollbackPass` and the A6
+                // validator run after `ResolutionPass` and may have undone it since.
                 let sym = symbolById[id]
                 kind = sym?.kind.rawValue ?? "unknown"
                 target = sym.map { Self.describe($0, converter: converter(forPath: $0.file.url.path,
@@ -102,13 +104,34 @@ public struct DecisionReport {
                     detail.append("resolution was correct; the rename was undone afterwards")
                     detail.append("reverted: \(r)")
                 } else if let sym, let r = protector.reason(for: sym) {
-                    decision = "kept"; reason = "candidate-has-no-obf"
+                    decision = "kept"; reason = UnresolvedCause.candidateHasNoObf.rawValue
                     detail.append("target is PROTECTED: \(r)")
                 } else if let sym, let r = plannerSkip[sym.id] {
-                    decision = "kept"; reason = "candidate-has-no-obf"
+                    decision = "kept"; reason = UnresolvedCause.candidateHasNoObf.rawValue
                     detail.append("target is SKIPPED: \(r)")
                 } else {
-                    decision = "kept"; reason = "candidate-has-no-obf"
+                    decision = "kept"; reason = UnresolvedCause.candidateHasNoObf.rawValue
+                    detail.append("target is not renamed (no specific reason recorded)")
+                }
+
+            case .resolvedNotRenamed(let id):
+                // No edit was EVER emitted here — resolution was correct but the target was never
+                // renameable in the first place (protected, policy-skipped, or already reverted by
+                // an earlier pass such as `AmbiguityRollback`/`WitnessLinker`/`OverrideLinker`).
+                // Never "rewritten": nothing at this position was ever written, let alone undone.
+                let sym = symbolById[id]
+                kind = sym?.kind.rawValue ?? "unknown"
+                target = sym.map { Self.describe($0, converter: converter(forPath: $0.file.url.path,
+                                                                          syntax: $0.file.syntax)) }
+                decision = "kept"
+                reason = UnresolvedCause.candidateHasNoObf.rawValue
+                if let sym, let r = protector.reason(for: sym) {
+                    detail.append("target is PROTECTED: \(r)")
+                } else if let sym, let r = plannerSkip[sym.id] {
+                    detail.append("target is SKIPPED: \(r)")
+                } else if let sym, let r = map.revertReason(sym.id) {
+                    detail.append("target is REVERTED: \(r)")
+                } else {
                     detail.append("target is not renamed (no specific reason recorded)")
                 }
 

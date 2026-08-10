@@ -451,7 +451,11 @@ private final class ResolutionVisitor: SyntaxVisitor {
         guard useSiteLog != nil || diagnose else { return }
         let pos = token.positionAfterSkippingLeadingTrivia
 
-        if useSiteLog != nil {
+        // `.candidateHasNoObf` fires exactly where the caller is about to call `emitRename` on this
+        // same token — the resolved-but-not-renamed target IS the record for this position, and it's
+        // strictly more informative (it names the target). Recording a `.kept` here too would leave
+        // two contradicting records at one source position.
+        if useSiteLog != nil, cause != .candidateHasNoObf {
             recordUseSite(name: name,
                           offset: pos.utf8Offset,
                           outcome: .kept(cause: cause, receiver: receiver, candidateIds: candidateIds))

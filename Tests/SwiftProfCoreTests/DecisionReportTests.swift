@@ -212,3 +212,49 @@ extension DecisionReportTests {
         XCTAssertEqual(decls.first { $0.name == "==" }?.decision, "protected")
     }
 }
+
+extension DecisionReportTests {
+
+    /// `.shared` resolves to `B.shared`, but `AmbiguityRollback` reverts the whole same-named
+    /// group (used at a shorthand `.shared` site) BEFORE `ResolutionPass` ever runs — so no edit is
+    /// ever emitted at this position. The use-site entry must read as "kept", never "rewritten":
+    /// nothing here was written, let alone undone.
+    func testDecisionReport_useSiteNeverEdited_reportsKeptNotRewritten() throws {
+        let (_, outputDir) = try runExplain("""
+        enum A { case shared }
+        enum B { case shared }
+        func use() {
+            let b: B = .shared
+            _ = b
+        }
+        """)
+        let all = try entries(outputDir)
+        let use = all.first { $0.role == "use-site" && $0.name == "shared" }
+        XCTAssertEqual(use?.decision, "kept",
+                       "no edit was ever emitted here, so this must never read as rewritten: \(String(describing: use))")
+        XCTAssertTrue(use?.detail?.contains { $0.contains("REVERTED") } ?? false,
+                      "detail should name the target as reverted: \(String(describing: use?.detail))")
+    }
+
+    /// The same position must produce exactly ONE use-site record, not two contradicting ones (the
+    /// `.kept` from `reportUnresolved`'s `.candidateHasNoObf` and the `.resolvedNotRenamed` from the
+    /// immediately following `emitRename`).
+    func testDecisionReport_useSiteNeverEdited_recordsExactlyOneEntry() throws {
+        let (_, outputDir) = try runExplain("""
+        enum A { case shared }
+        enum B { case shared }
+        func use() {
+            let b: B = .shared
+            _ = b
+        }
+        """)
+        let all = try entries(outputDir)
+        let uses = all.filter { $0.role == "use-site" && $0.name == "shared" }
+        guard let first = uses.first else {
+            return XCTFail("expected at least one `shared` use-site entry")
+        }
+        let atSamePosition = uses.filter { $0.line == first.line && $0.column == first.column }
+        XCTAssertEqual(atSamePosition.count, 1,
+                       "expected exactly one record at \(first.line):\(first.column), got \(atSamePosition.count): \(atSamePosition)")
+    }
+}
