@@ -383,7 +383,22 @@ extension DecisionReportTests {
         func c(_ x: SomeExternalThing) -> Int { return x.otherTag }
         """)
         let text = try decisionsText(outputDir)
-        XCTAssertTrue(text.contains("UNRESOLVED USE-SITES by cause"), "\n\(text)")
-        XCTAssertTrue(text.contains("receiver-untyped"), "\n\(text)")
+        let sectionLines = section(text, titled: "UNRESOLVED USE-SITES by cause")
+        XCTAssertFalse(sectionLines.isEmpty,
+                       "section must exist and be non-empty:\n\(text)")
+        XCTAssertTrue(sectionLines.contains { $0.contains("receiver-untyped") },
+                      "section must contain 'receiver-untyped':\n\(sectionLines.joined(separator: "\n"))")
+        guard let topLine = sectionLines.first(where: { $0.trimmingCharacters(in: .whitespaces).starts(with: "top:") }) else {
+            XCTFail("section must have a 'top:' line:\n\(sectionLines.joined(separator: "\n"))")
+            return
+        }
+        let payloadTagIndex = topLine.range(of: "payloadTag")
+        let otherTagIndex = topLine.range(of: "otherTag")
+        guard let p = payloadTagIndex, let o = otherTagIndex else {
+            XCTFail("'top:' line must name both members:\n\(topLine)")
+            return
+        }
+        XCTAssertTrue(p.lowerBound < o.lowerBound,
+                      "payloadTag (2 occurrences) must rank before otherTag (1 occurrence) in top: line:\n\(topLine)")
     }
 }
