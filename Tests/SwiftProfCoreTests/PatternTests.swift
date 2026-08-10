@@ -3591,7 +3591,14 @@ final class PatternTests: XCTestCase {
                        "member on a var typed via a qualified constructor must resolve + rename:\n\(rewritten)")
     }
 
-    // MARK: - Diagnostics report (SURV lines)
+    // MARK: - Diagnostics report helper (used by the UNRES tests below)
+    //
+    // The two SURV-line tests that used to live here (`testDiagnostics_unshieldedSurvivor_reportedAsReverted`,
+    // `testDiagnostics_shieldedSurvivor_reportedAsBlockedRedBuildRisk`) moved to
+    // `DecisionReportTests.testRollback_unshieldedSurvivor_isReported` /
+    // `testRollback_shieldedSurvivor_namesTheShield`, which assert the same two facts against
+    // `RollbackPass`'s returned `RollbackResult` instead of `Diagnostics.txt` — `RollbackPass` no
+    // longer emits `SURV` lines at all (see `RollbackResult` in `RollbackPass.swift`).
 
     /// Runs the pipeline with `--diagnose-overloads` and returns the contents of `Diagnostics.txt`.
     private func runPipelineDiagnostics(_ source: String, moduleName: String = "M",
@@ -3611,32 +3618,6 @@ final class PatternTests: XCTestCase {
         )
         _ = try Pipeline(options: options, logger: StderrLogger(verbose: false)).run()
         return try String(contentsOf: outputDir.appendingPathComponent("Diagnostics.txt"), encoding: .utf8)
-    }
-
-    /// A missed use-site whose name is NOT shielded: rollback reverts the group, the build stays
-    /// green, and the diagnostics name the coverage loss.
-    func testDiagnostics_unshieldedSurvivor_reportedAsReverted() throws {
-        let source = """
-        struct Box { var widgetPayload: Int = 0 }
-        func take(_ x: SomeExternalThing) -> Int { return x.widgetPayload }
-        """
-        let diag = try runPipelineDiagnostics(source)
-        XCTAssertTrue(diag.contains("SURV reverted name=\(Anon.of("widgetPayload"))"),
-                      "unshielded survivor must be reported as reverted:\n\(diag)")
-    }
-
-    /// The case `--diagnose-overloads` alone cannot see: the use-site was missed AND a shield stops
-    /// the rollback, so the desync ships. `camera` is an Apple API name (shield 1c), so the renamed
-    /// local property is NOT reverted while the surviving use-site keeps the original name.
-    func testDiagnostics_shieldedSurvivor_reportedAsBlockedRedBuildRisk() throws {
-        let source = """
-        struct Box { var camera: Int = 0 }
-        func take(_ x: SomeExternalThing) -> Int { return x.camera }
-        """
-        let diag = try runPipelineDiagnostics(source)
-        let line = diag.split(separator: "\n").first { $0.contains("SURV blocked name=\(Anon.of("camera"))") }
-        XCTAssertNotNil(line, "shielded survivor must be reported in the high-signal tier:\n\(diag)")
-        XCTAssertTrue(line?.contains("shield=1c") == true, "shield must be named: \(line ?? "")")
     }
 
     // MARK: - Composite parameter types in signature matching (B-FIX-27)
@@ -4971,10 +4952,12 @@ final class PatternTests: XCTestCase {
 
     // MARK: - UNRES diagnostics (why a use-site was not rewritten)
 
-    /// `OVLD` fires only for an ambiguous overload SET and `SURV` names a survivor without a cause,
-    /// so a use-site that silently resolved to nothing produced no line at all. `UNRES` closes that:
-    /// one line per (cause, member, receiver), hashed through the SAME `Anon.of` so the `member=`
-    /// token matches the `SURV` `name=` token for the same symbol.
+    /// `OVLD` fires only for an ambiguous overload SET, so a use-site that silently resolved to
+    /// nothing produced no line at all. `UNRES` closes that: one line per (cause, member,
+    /// receiver), hashed through the SAME `Anon.of` used elsewhere so the `member=` token can be
+    /// correlated against `RollbackResult.revertedNames` for the same symbol (see
+    /// `DecisionReportTests.testRollback_unshieldedSurvivor_isReported`, which covers that half —
+    /// `RollbackPass` itself no longer writes to `Diagnostics.txt`).
     func testDiagnostics_untypeableReceiver_reportedAsUnresolved() throws {
         let source = """
         struct Box { var widgetPayload: Int = 0 }
@@ -4983,8 +4966,6 @@ final class PatternTests: XCTestCase {
         let diag = try runPipelineDiagnostics(source)
         XCTAssertTrue(diag.contains("UNRES cause=receiver-untyped member=\(Anon.of("widgetPayload"))"),
                       "an un-typeable receiver must be reported with its cause:\n\(diag)")
-        XCTAssertTrue(diag.contains("SURV reverted name=\(Anon.of("widgetPayload"))"),
-                      "and correlate with the SURV line for the same symbol:\n\(diag)")
     }
 
     /// A receiver we typed fine whose type declares no such member is a DIFFERENT failure from one

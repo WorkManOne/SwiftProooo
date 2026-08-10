@@ -185,6 +185,9 @@ public struct PipelineResult {
     public let coverage: CoverageReport
     /// Per-use-site decision records. Empty unless `--explain` was on.
     public let useSites: [UseSiteRecord]
+    /// What `RollbackPass` observed: reverted vs. shield-blocked survivors and which shields
+    /// claimed them. `.empty` when `--no-rollback` disabled the pass.
+    public let rollback: RollbackResult
 }
 
 public enum PipelineError: Error, CustomStringConvertible {
@@ -408,14 +411,14 @@ public final class Pipeline {
         rewriter.apply(renames)
 
         // Safety net: revert any rename whose original name still appears in writable output.
+        var rollbackResult = RollbackResult.empty
         if options.rollbackEnabled {
-            let rolledBack = RollbackPass(
+            rollbackResult = RollbackPass(
                 table: table, map: map, stdlibRegistry: registry, logger: logger,
-                aggressive: options.aggressiveRollback, diagnose: options.diagnoseOverloads,
-                diagnostics: diagnostics
+                aggressive: options.aggressiveRollback
             ).run(on: project.files)
-            if rolledBack > 0 {
-                logger.log("rollback: \(rolledBack) names reverted")
+            if rollbackResult.revertedCount > 0 {
+                logger.log("rollback: \(rollbackResult.revertedCount) names reverted")
             }
         }
 
@@ -447,6 +450,7 @@ public final class Pipeline {
 
         return PipelineResult(project: project, table: table, renameMap: map,
                               renames: renames, coverage: coverage,
-                              useSites: useSiteLog?.records ?? [])
+                              useSites: useSiteLog?.records ?? [],
+                              rollback: rollbackResult)
     }
 }

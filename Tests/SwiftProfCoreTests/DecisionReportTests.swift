@@ -135,3 +135,28 @@ extension DecisionReportTests {
                       "the sweep must surface a position the resolver never decided about: \(causes)")
     }
 }
+
+extension DecisionReportTests {
+
+    /// Runs the pipeline and returns the rollback result, by running the passes the way the
+    /// pipeline does. Uses the public API only.
+    func testRollback_unshieldedSurvivor_isReported() throws {
+        let (result, _) = try runExplain("""
+        struct Box { var widgetPayload: Int = 0 }
+        func take(_ x: SomeExternalThing) -> Int { return x.widgetPayload }
+        """)
+        XCTAssertNotNil(result.rollback.revertedNames["widgetPayload"],
+                        "unshielded survivor must be reported: \(result.rollback.revertedNames.keys)")
+    }
+
+    func testRollback_shieldedSurvivor_namesTheShield() throws {
+        // `camera` is an Apple API name, so shield 1c blocks the revert and the desync ships.
+        let (result, _) = try runExplain("""
+        struct Box { var camera: Int = 0 }
+        func take(_ x: SomeExternalThing) -> Int { return x.camera }
+        """)
+        XCTAssertNotNil(result.rollback.blockedNames["camera"],
+                        "shielded survivor must be reported: \(result.rollback.blockedNames.keys)")
+        XCTAssertEqual(result.rollback.shieldReasons["camera"], ["1c"])
+    }
+}

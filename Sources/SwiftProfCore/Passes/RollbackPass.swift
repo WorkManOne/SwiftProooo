@@ -17,6 +17,30 @@ final class OptionalBindingNameCollector: SyntaxVisitor {
     }
 }
 
+/// What `RollbackPass` observed. Returned always, not gated on a diagnostics flag: the data is two
+/// name-keyed dictionaries, and gating it is what let the rollback report and the decision report
+/// drift into two mechanisms.
+public struct RollbackResult: Sendable {
+    public struct Survivor: Sendable {
+        public let occurrences: Int
+        public let filePath: String
+        public let offset: Int
+    }
+    /// Names whose surviving occurrence was NOT shielded: the group was reverted. Green build,
+    /// coverage lost.
+    public let revertedNames: [String: Survivor]
+    /// Names whose surviving occurrence WAS shielded: the revert did not happen and the desync
+    /// ships. This is the red-build set.
+    public let blockedNames: [String: Survivor]
+    /// name → the shields that claimed it (`1b` / `1c` / `1d` / `1e`).
+    public let shieldReasons: [String: Set<String>]
+    /// How many names were actually reverted (the old `run` return value).
+    public let revertedCount: Int
+
+    public static let empty = RollbackResult(revertedNames: [:], blockedNames: [:],
+                                             shieldReasons: [:], revertedCount: 0)
+}
+
 /// Safety net pass — scans already-rewritten writable files for surviving original names.
 ///
 /// If a name `X` was supposed to be renamed (decl + all use-sites) but `X` still appears as a
@@ -43,43 +67,37 @@ public final class RollbackPass {
     /// such a name triggers a revert of the whole group. More coverage loss, stronger green-build
     /// guarantee. The default exception (callable un-renamed + callable renamed) remains active.
     public let aggressive: Bool
-    /// Emit anonymized `SURV` diagnostics (see `reportSurvivors`). Off by default: the scan data is
-    /// free, the reporting is not, and on a big project the explained tier is noisy.
-    public let diagnose: Bool
-    /// Where `SURV` lines go (`Diagnostics.txt`). nil ⇒ fall back to `logger`.
-    public let diagnostics: Logger?
 
     public init(table: SymbolTable, map: RenameMap, stdlibRegistry: StdlibRegistry, logger: Logger,
-                aggressive: Bool = false, diagnose: Bool = false, diagnostics: Logger? = nil) {
+                aggressive: Bool = false) {
         self.table = table
         self.map = map
         self.stdlibRegistry = stdlibRegistry
         self.logger = logger
         self.aggressive = aggressive
-        self.diagnose = diagnose
-        self.diagnostics = diagnostics
     }
 
     /// One surviving original name, as observed in the rewritten output.
-    private struct Survivor {
+    private struct Hit {
         var occurrences = 0
-        var fileIndex = 0        // index into the writable file list, for the first occurrence
+        var filePath = ""        // path of the writable file, for the first occurrence
         var offset = 0           // UTF-16 offset of the first occurrence
     }
 
-    /// Returns the number of names rolled back. Updates `map` (removes reverted entries) and
+    /// Returns what was observed: which names were reverted, which survived behind a shield (the
+    /// red-build set), and which shield claimed each. Updates `map` (removes reverted entries) and
     /// rewrites `file.contents` in place — the next writeToDisk picks up the changes.
     @discardableResult
-    public func run(on files: [SourceFile]) -> Int {
+    public func run(on files: [SourceFile]) -> RollbackResult {
         let writable = files.filter { $0.module.writable }
-        guard !writable.isEmpty else { return 0 }
+        guard !writable.isEmpty else { return .empty }
 
         // 1. Collect all renamed names → list of symbols with that name.
         var symbolsByName: [String: [Symbol]] = [:]
         for sym in table.symbols where map.obf(for: sym) != nil {
             symbolsByName[sym.name, default: []].append(sym)
         }
-        guard !symbolsByName.isEmpty else { return 0 }
+        guard !symbolsByName.isEmpty else { return .empty }
         let renamedNames = Set(symbolsByName.keys)
 
         // 1b. Names that ALSO exist as un-renamed symbols (protected / policy-skipped /
@@ -94,17 +112,11 @@ public final class RollbackPass {
         for sym in table.symbols where Self.isCallable(sym.kind) && map.obf(for: sym) != nil {
             renamedCallableNames.insert(sym.name)
         }
-        // Which shield claimed each name, and the kinds on both sides of the rename boundary.
-        // Diagnostics only: a shield is what turns "coverage loss" into "red build", so naming the
-        // shield is the difference between a usable report and another bisect session.
+        // Which shield claimed each name, and the kinds on both sides of the rename boundary —
+        // a shield is what turns "coverage loss" into "red build", so naming it is what lets the
+        // `--explain` report distinguish the two.
         var shieldReasons: [String: Set<String>] = [:]
-        var unrenamedCallableNames: Set<String> = []
         var shieldedNames: Set<String> = []
-        for sym in table.symbols where map.obf(for: sym) == nil {
-            if Self.isCallable(sym.kind), renamedNames.contains(sym.name) {
-                unrenamedCallableNames.insert(sym.name)
-            }
-        }
         for sym in table.symbols where map.obf(for: sym) == nil {
             guard renamedNames.contains(sym.name) else { continue }
             // Aggressive rollback: if the name has ANY renamed callable namesake — regardless of
@@ -159,10 +171,11 @@ public final class RollbackPass {
         // 2. Scan each writable file's stripped content for any surviving original name.
         let identRegex = try! NSRegularExpression(pattern: #"\b[A-Za-z_][A-Za-z0-9_]*\b"#)
         var survivors: Set<String> = []
-        // Diagnostics: first location + occurrence count per name, on both sides of the shield.
-        var revertedHits: [String: Survivor] = [:]
-        var blockedHits: [String: Survivor] = [:]
-        for (fileIndex, file) in writable.enumerated() {
+        // First location + occurrence count per name, on both sides of the shield. Collected
+        // always — this is what feeds the `--explain` report, not gated on a diagnostics flag.
+        var revertedHits: [String: Hit] = [:]
+        var blockedHits: [String: Hit] = [:]
+        for file in writable {
             autoreleasepool {
                 let stripped = Self.strip(file.contents)
                 let nsString = stripped as NSString
@@ -173,21 +186,29 @@ public final class RollbackPass {
                     guard renamedNames.contains(word) else { return }
                     if !shieldedNames.contains(word) {
                         survivors.insert(word)
-                        if diagnose { Self.record(word, at: match.range.location, fileIndex, into: &revertedHits) }
-                    } else if diagnose {
-                        Self.record(word, at: match.range.location, fileIndex, into: &blockedHits)
+                        Self.record(word, at: match.range.location, file.url.path, into: &revertedHits)
+                    } else {
+                        Self.record(word, at: match.range.location, file.url.path, into: &blockedHits)
                     }
                 }
             }
         }
-        if diagnose {
-            reportSurvivors(reverted: revertedHits, blocked: blockedHits, files: writable,
-                            shieldReasons: shieldReasons, symbolsByName: symbolsByName,
-                            unrenamedCallableNames: unrenamedCallableNames)
+
+        func result(_ revertedCount: Int) -> RollbackResult {
+            RollbackResult(
+                revertedNames: revertedHits.mapValues {
+                    RollbackResult.Survivor(occurrences: $0.occurrences, filePath: $0.filePath, offset: $0.offset)
+                },
+                blockedNames: blockedHits.mapValues {
+                    RollbackResult.Survivor(occurrences: $0.occurrences, filePath: $0.filePath, offset: $0.offset)
+                },
+                shieldReasons: shieldReasons,
+                revertedCount: revertedCount)
         }
+
         guard !survivors.isEmpty else {
             logger.log("Rollback: 0 names desynced (\(shieldedNames.count) names shielded by un-renamed namesakes)")
-            return 0
+            return result(0)
         }
         logger.log("Rollback: \(survivors.count) names desynced — reverting")
         if survivors.count <= 30 {
@@ -232,92 +253,20 @@ public final class RollbackPass {
                 if changed { file.updateContents(content) }
             }
         }
-        return survivors.count
+        return result(survivors.count)
     }
 
     static func isCallable(_ k: SymbolKind) -> Bool {
         k == .method || k == .function
     }
 
-    private static func record(_ name: String, at offset: Int, _ fileIndex: Int,
-                               into dict: inout [String: Survivor]) {
+    private static func record(_ name: String, at offset: Int, _ filePath: String,
+                               into dict: inout [String: Hit]) {
         if dict[name] != nil {
             dict[name]!.occurrences += 1
         } else {
-            dict[name] = Survivor(occurrences: 1, fileIndex: fileIndex, offset: offset)
+            dict[name] = Hit(occurrences: 1, filePath: filePath, offset: offset)
         }
-    }
-
-    /// Anonymized report of every original name that SURVIVED into the rewritten output while a
-    /// symbol of that name was renamed. That is the desync class: the declaration moved, some
-    /// use-site did not. Two outcomes, and the difference is what a shield did:
-    ///
-    /// * `SURV reverted` — nothing shielded the name, so this pass reverts the whole group. Cost is
-    ///   coverage, the build stays green. Listed so the coverage loss is attributable.
-    /// * `SURV blocked` — a shield stopped the revert, so the desync SHIPS. This is the red-build
-    ///   set, and it is the reason this report exists: `--diagnose-overloads` alone cannot see it
-    ///   (the resolver reports only ambiguous overload sets, so a use-site that silently resolved to
-    ///   nothing, or to a symbol with no obf, produces no line at all).
-    ///
-    /// A blocked name is reported at full volume only when the surviving occurrence cannot be
-    /// explained by a declaration we deliberately left alone: shielded purely as an Apple API name
-    /// (1c), or shielded by a NON-callable namesake while a callable of that name was renamed (a
-    /// surviving call cannot be that namesake). Everything else is the benign `self.name = name`
-    /// shape and goes to verbose.
-    private func reportSurvivors(reverted: [String: Survivor], blocked: [String: Survivor],
-                                 files: [SourceFile], shieldReasons: [String: Set<String>],
-                                 symbolsByName: [String: [Symbol]],
-                                 unrenamedCallableNames: Set<String>) {
-        let out = diagnostics ?? logger
-        var lineStarts: [Int: [Int]] = [:]
-        func place(_ s: Survivor) -> String {
-            let starts: [Int]
-            if let cached = lineStarts[s.fileIndex] {
-                starts = cached
-            } else {
-                starts = Self.lineStarts(of: files[s.fileIndex].contents)
-                lineStarts[s.fileIndex] = starts
-            }
-            var lo = 0, hi = starts.count - 1
-            while lo < hi {                       // last line start <= offset
-                let mid = (lo + hi + 1) / 2
-                if starts[mid] <= s.offset { lo = mid } else { hi = mid - 1 }
-            }
-            return "file=\(Anon.of(files[s.fileIndex].url.lastPathComponent)) line=\(lo + 1)"
-        }
-        func kinds(_ name: String) -> String {
-            let ks = Set((symbolsByName[name] ?? []).map { String(describing: $0.kind) }).sorted()
-            return "[" + ks.joined(separator: ",") + "]"
-        }
-
-        for (name, hit) in reverted.sorted(by: { $0.value.occurrences > $1.value.occurrences }) {
-            out.log("SURV reverted name=\(Anon.of(name)) renamedKinds=\(kinds(name)) "
-                       + "occ=\(hit.occurrences) \(place(hit))")
-        }
-        for (name, hit) in blocked.sorted(by: { $0.value.occurrences > $1.value.occurrences }) {
-            let reasons = (shieldReasons[name] ?? []).sorted().joined(separator: "+")
-            let renamedCallable = (symbolsByName[name] ?? []).contains { Self.isCallable($0.kind) }
-            let unexplained = reasons == "1c"
-                || (reasons.contains("1b") && renamedCallable && !unrenamedCallableNames.contains(name))
-            let line = "SURV blocked\(unexplained ? "" : "-explained") name=\(Anon.of(name)) "
-                + "shield=\(reasons) renamedKinds=\(kinds(name)) occ=\(hit.occurrences) \(place(hit))"
-            out.log(line, verbose: !unexplained)
-        }
-        // Local-only legend: resolving a file hash needs the real path, so it is verbose-gated and
-        // stays out of anything the user pastes by default.
-        for (idx, f) in files.enumerated()
-        where lineStarts[idx] != nil {
-            out.log("SURV-FILE \(Anon.of(f.url.lastPathComponent)) \(f.url.path)", verbose: true)
-        }
-    }
-
-    /// UTF-16 offsets at which each line begins. Paired with the length-preserving `strip`, an
-    /// offset found in the stripped text names the same line in the real file.
-    private static func lineStarts(of s: String) -> [Int] {
-        let ns = s as NSString
-        var out: [Int] = [0]
-        for i in 0..<ns.length where ns.character(at: i) == 10 { out.append(i + 1) }
-        return out
     }
 
     /// Strip string literals (triple-quoted FIRST, then single-quoted excluding newlines) and
@@ -326,7 +275,7 @@ public final class RollbackPass {
     /// LENGTH-PRESERVING: every stripped character becomes a space (newlines kept), so an offset in
     /// the result names the same position in the input. The scan only looks for free identifiers
     /// and a run of spaces bounds a word exactly like the removed text did, so the scan is
-    /// unaffected — but the diagnostics can now report a real `line=`.
+    /// unaffected — and a caller can turn `RollbackResult.Survivor.offset` into a real line number.
     static func strip(_ s: String) -> String {
         var out = s
         out = Self.blankMatches(out, pattern: #""""[\s\S]*?""""#)
