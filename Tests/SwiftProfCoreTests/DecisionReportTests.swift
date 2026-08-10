@@ -408,3 +408,65 @@ extension DecisionReportTests {
                       "payloadTag (2 occurrences) must rank before otherTag (1 occurrence) in top: line:\n\(topLine)")
     }
 }
+
+extension DecisionReportTests {
+
+    func testAnonTwin_isWrittenAndHashesConsistently() throws {
+        let (_, outputDir) = try runExplain("""
+        struct Card { var badge: Int = 0 }
+        func read(_ c: Card) -> Int { c.badge }
+        """)
+        let anon = try String(contentsOf: outputDir.appendingPathComponent("Decisions-anon.txt"),
+                              encoding: .utf8)
+        XCTAssertFalse(anon.contains("badge"), "the anon twin must not carry real identifiers:\n\(anon)")
+        XCTAssertTrue(anon.contains(Anon.of("badge")), "expected the hashed token:\n\(anon)")
+        XCTAssertFalse(anon.contains("Sample.swift"), "paths must be hashed too:\n\(anon)")
+
+        let legend = try String(contentsOf: outputDir.appendingPathComponent("Decisions-files.txt"),
+                                encoding: .utf8)
+        XCTAssertTrue(legend.contains(Anon.of("Sample.swift")), "\n\(legend)")
+        XCTAssertTrue(legend.contains("Sample.swift"), "the legend maps back to the real path:\n\(legend)")
+    }
+
+    func testAnonTwin_hasTheSameStructureAsTheRealOne() throws {
+        let (_, outputDir) = try runExplain("""
+        struct Card { var badge: Int = 0 }
+        func read(_ c: Card) -> Int { c.badge }
+        """)
+        let real = try decisionsText(outputDir)
+        let anon = try String(contentsOf: outputDir.appendingPathComponent("Decisions-anon.txt"),
+                              encoding: .utf8)
+        // The anon header carries two extra explanation lines; everything below must match 1:1.
+        let realBody = real.components(separatedBy: "=== SwiftProf decisions: summary ===")[1]
+        let anonBody = anon.components(separatedBy: "=== SwiftProf decisions: summary ===")[1]
+        XCTAssertEqual(realBody.split(separator: "\n").count,
+                       anonBody.split(separator: "\n").count,
+                       "the two renderings must describe the same records")
+    }
+
+    /// The brief's fixture is too simple to exercise the free-text leak: a `reason` string the
+    /// assembler built by interpolating a real name (`RollbackPass`'s
+    /// "original name '<name>' still appeared in rewritten output"). This fixture reliably reverts
+    /// `widgetPayload` (its only use-site is behind an untyped receiver, so RollbackPass finds the
+    /// original name surviving in the rewritten output and reverts it) — the revert reason is printed
+    /// BOTH on the declaration's verdict line and on the "reverted: …" detail line under the use-site
+    /// that was undone, so this exercises both call sites the task asked to fix.
+    func testAnonTwin_scrubsAnIdentifierEmbeddedInAFreeTextRevertReason() throws {
+        let (_, outputDir) = try runExplain("""
+        struct Box { var widgetPayload: Int = 0 }
+        func use(_ b: Box) -> Int { b.widgetPayload }
+        func take(_ x: SomeExternalThing) -> Int { return x.widgetPayload }
+        """)
+        let real = try decisionsText(outputDir)
+        XCTAssertTrue(real.contains("widgetPayload"),
+                      "sanity check: the real report must name the property:\n\(real)")
+
+        let anon = try String(contentsOf: outputDir.appendingPathComponent("Decisions-anon.txt"),
+                              encoding: .utf8)
+        if let leaked = anon.split(separator: "\n").first(where: { $0.contains("widgetPayload") }) {
+            XCTFail("real identifier survived into the anonymized report on this line:\n\(leaked)")
+        }
+        XCTAssertTrue(anon.contains(Anon.of("widgetPayload")),
+                      "expected the hashed token to stand in for it:\n\(anon)")
+    }
+}

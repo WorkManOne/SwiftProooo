@@ -451,6 +451,13 @@ public final class Pipeline {
             let text = DecisionRenderer.render(decisions, rollback: rollbackResult, identity: .real)
             try text.write(to: options.outputDirectory.appendingPathComponent("Decisions.txt"),
                            atomically: true, encoding: .utf8)
+
+            let anon = DecisionRenderer.render(decisions, rollback: rollbackResult, identity: .anonymized)
+            try anon.write(to: options.outputDirectory.appendingPathComponent("Decisions-anon.txt"),
+                           atomically: true, encoding: .utf8)
+            try DecisionRenderer.fileLegend(decisions)
+                .write(to: options.outputDirectory.appendingPathComponent("Decisions-files.txt"),
+                       atomically: true, encoding: .utf8)
             logger.log("wrote decisions for \(decisions.byFile.count) files (--explain)")
         }
 

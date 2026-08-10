@@ -45,6 +45,93 @@ public enum DecisionRenderer {
         s.count >= width ? s : s + String(repeating: " ", count: width - s.count)
     }
 
+    /// hash → real path, for the anonymized rendering. Written to its OWN file: one accidental paste
+    /// of a client path is worse than one extra artifact, which is why `Decisions-anon.txt` never
+    /// contains a real path itself.
+    public static func fileLegend(_ report: DecisionReport) -> String {
+        var lines = ["# file-hash legend for Decisions-anon.txt. CONTAINS REAL PATHS — local use only."]
+        for p in report.byFile.keys.sorted() {
+            lines.append("\(Anon.of(URL(fileURLWithPath: p).lastPathComponent)) \(p)")
+        }
+        return lines.joined(separator: "\n") + "\n"
+    }
+
+    /// Hashes identifier-looking segments embedded in FREE-TEXT reason/detail sentences — the ones
+    /// the assembler built by string interpolation (a Protector/Planner/RollbackPass reason such as
+    /// `Codable stored key (Ticket)` or `original name 'badge' still appeared in rewritten output`) —
+    /// while leaving the surrounding prose intact. Every such string in the project embeds its real
+    /// identifier one of two ways: a `'quoted name'` or a `(Parenthesized name)`. A segment is only
+    /// scrubbed when it "looks like" an identifier — no whitespace — so static prose delimited the
+    /// same way (`(or skip-overloaded-callables)`, `(local, not a rename target)`) is left readable
+    /// rather than turned into a single unreadable hash. `.real` never calls this: `Decisions.txt`
+    /// must stay byte-identical to today.
+    private static func scrubFreeText(_ s: String) -> String {
+        var out = ""
+        var rest = Substring(s)
+        while true {
+            let quoteIdx = rest.firstIndex(of: "'")
+            let parenIdx = rest.firstIndex(of: "(")
+            let openIdx: Substring.Index
+            switch (quoteIdx, parenIdx) {
+            case (nil, nil):
+                out += rest
+                return out
+            case (let q?, nil):
+                openIdx = q
+            case (nil, let p?):
+                openIdx = p
+            case (let q?, let p?):
+                openIdx = min(q, p)
+            }
+            let open = rest[openIdx]
+            let close: Character = open == "'" ? "'" : ")"
+            out += rest[rest.startIndex..<openIdx]
+            let afterOpen = rest.index(after: openIdx)
+            guard let closeIdx = rest[afterOpen...].firstIndex(of: close) else {
+                // No matching closing delimiter — the rest is not a well-formed quote/paren pair;
+                // copy it verbatim rather than guess.
+                out += rest[openIdx...]
+                return out
+            }
+            let inner = rest[afterOpen..<closeIdx]
+            out.append(open)
+            out += scrubIdentifierSegment(String(inner))
+            out.append(close)
+            rest = rest[rest.index(after: closeIdx)...]
+        }
+    }
+
+    /// Hashes `inner` component-by-component (split on `.`/`,`, the two separators real reason
+    /// strings use for qualified/multi names) so a leaf name still correlates with its hash
+    /// elsewhere in the report. Left untouched when it contains whitespace — that is prose, not an
+    /// identifier, and hashing it would just produce noise (e.g. `(or skip-overloaded-callables)`).
+    private static func scrubIdentifierSegment(_ inner: String) -> String {
+        guard !inner.isEmpty, !inner.contains(where: { $0.isWhitespace }) else { return inner }
+        var out = ""
+        var token = ""
+        func flush() {
+            guard !token.isEmpty else { return }
+            if token.hasPrefix("@") {
+                out += "@" + Anon.of(String(token.dropFirst()))
+            } else if token.hasPrefix("`") && token.hasSuffix("`") && token.count >= 2 {
+                out += "`" + Anon.of(String(token.dropFirst().dropLast())) + "`"
+            } else {
+                out += Anon.of(token)
+            }
+            token = ""
+        }
+        for c in inner {
+            if c == "." || c == "," {
+                flush()
+                out.append(c)
+            } else {
+                token.append(c)
+            }
+        }
+        flush()
+        return out
+    }
+
     public static func render(_ report: DecisionReport, rollback: RollbackResult,
                               identity: Identity) -> String {
         var out = header(identity)
@@ -156,9 +243,15 @@ public enum DecisionRenderer {
     private static func verdict(_ e: DecisionReport.Entry, identity: Identity) -> String {
         switch (e.role, e.decision) {
         case ("declaration", "obfuscated"):
+            // `e.reason` here is the obf token itself (e.g. "T0"), never the original name — safe
+            // as-is under both identities, nothing to scrub.
             return "OBFUSCATED → \(e.reason)"
         case ("declaration", _):
-            return "\(e.decision.uppercased()): \(e.reason)"
+            // protected/skipped/reverted: `e.reason` is a free-text sentence the assembler built by
+            // interpolating a real name (a Codable key, a protocol name, the surviving original in
+            // a rollback revert) — must be scrubbed on the anonymized path.
+            let reason = identity == .anonymized ? scrubFreeText(e.reason) : e.reason
+            return "\(e.decision.uppercased()): \(reason)"
         case (_, "rewritten") where e.reason == "reverted":
             return "→ REVERTED   resolved: \(target(e.target ?? "?", identity))"
         case (_, "rewritten"):
@@ -169,8 +262,11 @@ public enum DecisionRenderer {
         }
     }
 
-    /// Detail lines are free text produced by the assembler. Only the two that embed an identifier
-    /// need the identity policy applied.
+    /// Detail lines are free text produced by the assembler. Two shapes get structured rewrites
+    /// (`candidate: ` renders a "File:line Owner.member" target, `receiver type: ` is a bare type
+    /// name); everything else — including `target is PROTECTED/SKIPPED/REVERTED: <reason>`, whose
+    /// `<reason>` is the same free text `verdict` scrubs for declarations — falls through to the
+    /// same identifier scrub so a name embedded in quotes or parens cannot leak through this path.
     private static func detailLine(_ d: String, identity: Identity) -> String {
         guard identity == .anonymized else { return d }
         if let r = d.range(of: "candidate: ") {
@@ -179,6 +275,6 @@ public enum DecisionRenderer {
         if let r = d.range(of: "receiver type: ") {
             return "receiver type: " + Anon.of(String(d[r.upperBound...]))
         }
-        return d
+        return scrubFreeText(d)
     }
 }
