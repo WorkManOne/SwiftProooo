@@ -424,8 +424,28 @@ extension DecisionReportTests {
 
         let legend = try String(contentsOf: outputDir.appendingPathComponent("Decisions-files.txt"),
                                 encoding: .utf8)
-        XCTAssertTrue(legend.contains(Anon.of("Sample.swift")), "\n\(legend)")
-        XCTAssertTrue(legend.contains("Sample.swift"), "the legend maps back to the real path:\n\(legend)")
+        // A legend DATA line is `<hash> <real path>`, and `Anon.of` prefixes its token with `#`, so
+        // a leading `#` does NOT mark a comment here — only the header's `"# "` (hash, space) does.
+        let dataLines = Self.legendDataLines(legend)
+        guard let entry = dataLines.first(where: { $0.path.hasSuffix("Sample.swift") }) else {
+            return XCTFail("the legend must map a hash back to the real path:\n\(legend)")
+        }
+        // Exact, not "looks like a hash": the token must be the hash OF THAT PATH, which is what
+        // makes the legend usable to resolve a token seen in Decisions-anon.txt.
+        XCTAssertEqual(entry.token, Anon.of(entry.path),
+                       "legend token must be Anon.of(the real path):\n\(legend)")
+        XCTAssertTrue(anon.contains(entry.token),
+                      "the token the legend resolves must appear in the anon report:\n\(anon)")
+    }
+
+    /// The `<hash> <real path>` rows of a `Decisions-files.txt`, header excluded.
+    static func legendDataLines(_ legend: String) -> [(token: String, path: String)] {
+        legend.split(separator: "\n").compactMap { line -> (token: String, path: String)? in
+            guard !line.hasPrefix("# ") else { return nil }   // the header, not a row
+            let parts = line.split(separator: " ", maxSplits: 1).map(String.init)
+            guard parts.count == 2 else { return nil }
+            return (token: parts[0], path: parts[1])
+        }
     }
 
     func testAnonTwin_hasTheSameStructureAsTheRealOne() throws {
@@ -615,6 +635,73 @@ extension DecisionReportTests {
                            "both the quoted and the backticked occurrence must be hashed: \(reason)")
             XCTAssertFalse(words(reason).contains("shared"),
                            "the real name survived on this line: \(reason)")
+        }
+    }
+}
+
+extension DecisionReportTests {
+
+    /// Runs the pipeline with `--explain` on two files with the same basename in different modules
+    /// and returns the output directory.
+    func runExplainTwoModules(module1Source: String, module1FileName: String = "Helper.swift",
+                              module2Source: String, module2FileName: String = "Helper.swift") throws -> URL {
+        let tempRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SwiftProf-\(UUID().uuidString)")
+        let module1Root = tempRoot.appendingPathComponent("M1")
+        let module2Root = tempRoot.appendingPathComponent("M2")
+        try FileManager.default.createDirectory(at: module1Root, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: module2Root, withIntermediateDirectories: true)
+        try module1Source.write(to: module1Root.appendingPathComponent(module1FileName),
+                                atomically: true, encoding: .utf8)
+        try module2Source.write(to: module2Root.appendingPathComponent(module2FileName),
+                                atomically: true, encoding: .utf8)
+        let outputDir = tempRoot.appendingPathComponent("out")
+        let options = PipelineOptions(
+            modules: [
+                ModuleSpec(name: "M1", root: module1Root, writable: true),
+                ModuleSpec(name: "M2", root: module2Root, writable: true)
+            ],
+            outputDirectory: outputDir, dryRun: false,
+            nameStyle: .debug, introspectSDK: false, explain: true)
+        _ = try Pipeline(options: options,
+                        logger: StderrLogger(verbose: false)).run()
+        return outputDir
+    }
+
+    func testAnonFileLegend_sameFilenameDifferentModules_usesFullPathHash() throws {
+        let outputDir = try runExplainTwoModules(
+            module1Source: "struct M1Helper { var field1: Int = 0 }",
+            module1FileName: "Helper.swift",
+            module2Source: "struct M2Helper { var field2: String = \"x\" }",
+            module2FileName: "Helper.swift")
+
+        let legend = try String(contentsOf: outputDir.appendingPathComponent("Decisions-files.txt"),
+                                encoding: .utf8)
+        let anon = try String(contentsOf: outputDir.appendingPathComponent("Decisions-anon.txt"),
+                              encoding: .utf8)
+
+        let hashTokensAndPaths = Self.legendDataLines(legend)
+
+        // Assert exactly two entries (one per module)
+        XCTAssertEqual(hashTokensAndPaths.count, 2,
+                      "expected exactly 2 legend data lines (one per module), got \(hashTokensAndPaths.count)")
+
+        let hashTokens = hashTokensAndPaths.map { $0.token }
+        let paths = hashTokensAndPaths.map { $0.path }
+
+        // Assert two distinct hash tokens
+        XCTAssertEqual(Set(hashTokens).count, 2, "expected two DISTINCT hash tokens, got \(Set(hashTokens).count). "
+                      + "This indicates files with the same basename hashed to the same token: \(hashTokens)")
+
+        // Assert real paths are distinct
+        XCTAssertEqual(Set(paths).count, 2, "legend must list two different real paths")
+        XCTAssertTrue(paths[0].hasSuffix("M1/Helper.swift"), "first path should end with M1/Helper.swift: \(paths[0])")
+        XCTAssertTrue(paths[1].hasSuffix("M2/Helper.swift"), "second path should end with M2/Helper.swift: \(paths[1])")
+
+        // Assert both hash tokens appear in the anonymized report
+        for token in hashTokens {
+            XCTAssertTrue(anon.contains(token),
+                         "hash token '\(token)' from legend must appear in Decisions-anon.txt")
         }
     }
 }

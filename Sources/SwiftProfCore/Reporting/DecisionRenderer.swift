@@ -20,11 +20,11 @@ public enum DecisionRenderer {
         }
     }
 
-    /// A path is anonymized by its LAST COMPONENT only; the legend file maps it back.
+    /// A path is anonymized by its FULL path; the legend file maps it back.
     private static func path(_ p: String, _ identity: Identity) -> String {
         switch identity {
         case .real: return p
-        case .anonymized: return Anon.of(URL(fileURLWithPath: p).lastPathComponent)
+        case .anonymized: return Anon.of(p)
         }
     }
 
@@ -51,7 +51,7 @@ public enum DecisionRenderer {
     public static func fileLegend(_ report: DecisionReport) -> String {
         var lines = ["# file-hash legend for Decisions-anon.txt. CONTAINS REAL PATHS — local use only."]
         for p in report.byFile.keys.sorted() {
-            lines.append("\(Anon.of(URL(fileURLWithPath: p).lastPathComponent)) \(p)")
+            lines.append("\(Anon.of(p)) \(p)")
         }
         return lines.joined(separator: "\n") + "\n"
     }
