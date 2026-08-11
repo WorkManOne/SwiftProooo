@@ -82,8 +82,6 @@ struct Obfuscate: ParsableCommand {
     @Option(name: .long, help: "Raw-value obfuscation mode: off (default) / safe (skip Codable, explicit literals only) / all (every String enum, materializes implicit raw values). Obfuscates String-enum raw values, adds a `displayName` with the originals, rewrites resolvable .rawValue use-sites to .displayName.")
     var rawValues: String?
 
-    @Flag(name: .long, inversion: .prefixedNo, help: "Emit anonymized OVLD diagnostics for overloaded-call resolution (identifiers hashed; safe to share). For debugging why a call did/didn't resolve to the expected overload.")
-    var diagnoseOverloads: Bool?
 
     @Flag(name: .long, inversion: .prefixedNo, help: "Green-build-first: pre-emptively skip renaming any function/method whose name has >1 callable in the project. Eliminates overload-desync risk entirely (no rename → no possible miss). Use when guaranteed-green build matters more than obfuscation coverage.")
     var skipOverloadedCallables: Bool?
@@ -103,7 +101,7 @@ struct Obfuscate: ParsableCommand {
     @Option(name: .long, help: "Objective-C protection level: strict (default) / relaxed / off. strict keeps every member of every class descending from an ObjC root (NSObject, UIView, …). relaxed keeps protection only where the exposure is DECLARED — @objc/@objcMembers/@IBDesignable classes, exposing attributes (@objc, @IBOutlet, @IBAction, @NSManaged), #selector names, @objc extensions and NSManagedObject descendants — while an ancestry-only class keeps its NAME (storyboard customClass) and gives up its members. off drops all ObjC-motivated protection; do not use it with Core Data or storyboards.")
     var objcProtection: String?
 
-    @Flag(name: .long, inversion: .prefixedNo, help: "Emit a per-symbol decision report (Decisions.txt + decisions.json in --output): for every writable declaration, exactly why it was obfuscated / protected / skipped / reverted.")
+    @Flag(name: .long, inversion: .prefixedNo, help: "Emit the decision report into --output: Decisions.txt (a summary of red-build risks and coverage losses, then a per-file trace of every declaration and every use-site of a project name, each rewritten use-site naming the declaration it resolved to), decisions.json (the same data, machine-readable), plus Decisions-anon.txt and its Decisions-files.txt legend — the same document with identifiers hashed, safe to share.")
     var explain: Bool?
 
     @Flag(name: .long, inversion: .prefixedNo, help: "Verbose logging.")
@@ -142,7 +140,6 @@ struct Obfuscate: ParsableCommand {
         cli.noRollback = rollback.map { !$0 }
         cli.kinds = kinds.map(splitCSV)
         cli.rawValues = rawValues
-        cli.diagnoseOverloads = diagnoseOverloads
         cli.skipOverloadedCallables = skipOverloadedCallables
         cli.indexStorePath = indexStorePath
         cli.indexStoreGate = indexStoreGate
@@ -190,7 +187,6 @@ struct Obfuscate: ParsableCommand {
             rollbackEnabled: !(merged.noRollback ?? false),
             obfuscatableKinds: Set((merged.kinds ?? []).compactMap { SymbolKind(rawValue: $0) }),
             rawValueMode: try parseRawValueMode(merged.rawValues ?? "off"),
-            diagnoseOverloads: merged.diagnoseOverloads ?? false,
             skipOverloadedCallables: merged.skipOverloadedCallables ?? false,
             aggressiveRollback: merged.aggressiveRollback ?? false,
             indexStorePath: merged.indexStorePath,

@@ -8,10 +8,6 @@ public final class ResolutionPass {
     public let table: SymbolTable
     public let map: RenameMap
     public let logger: Logger
-    public let diagnoseOverloads: Bool
-    /// Where `OVLD` lines go. Separate from `logger` on purpose: diagnostics are a grepped artifact
-    /// (`Diagnostics.txt`), progress output is read live. nil ⇒ fall back to `logger`.
-    public let diagnostics: Logger?
     /// A4 USR ground-truth, when `indexStorePath` is set. nil ⇒ syntactic resolution only.
     public let indexContext: IndexContext?
     /// Rewrite a member access by NAME when the name belongs to a project-unique member of an
@@ -21,14 +17,12 @@ public final class ResolutionPass {
     /// Per-use-site decision records for `--explain`. nil ⇒ no recording work at all.
     public let useSiteLog: UseSiteLog?
 
-    public init(table: SymbolTable, map: RenameMap, logger: Logger, diagnoseOverloads: Bool = false,
-                diagnostics: Logger? = nil, indexContext: IndexContext? = nil,
+    public init(table: SymbolTable, map: RenameMap, logger: Logger,
+                indexContext: IndexContext? = nil,
                 uniqueExternalMembers: Bool = true, useSiteLog: UseSiteLog? = nil) {
         self.table = table
         self.map = map
         self.logger = logger
-        self.diagnoseOverloads = diagnoseOverloads
-        self.diagnostics = diagnostics
         self.indexContext = indexContext
         self.uniqueExternalMembers = uniqueExternalMembers
         self.useSiteLog = useSiteLog
@@ -96,12 +90,6 @@ public final class ResolutionPass {
         // 2) Use-site renames — walk each writable file's syntax tree.
         let uniqueExternal = uniqueExternalMembers
             ? Self.uniqueExternalExtensionMembers(in: table, map: map) : [:]
-        // Volume filter for `UNRES` (see `reportUnresolved`). Built only under --diagnose-overloads
-        // so the default path pays nothing.
-        var renamedNames: Set<String> = []
-        if diagnoseOverloads {
-            for sym in table.symbols where map.obf(for: sym) != nil { renamedNames.insert(sym.name) }
-        }
         // Layer 2 filter: a use-site is worth describing when its name is declared by at least one
         // symbol of a WRITABLE module. Wider than `renamedNames` on purpose (a protected or
         // policy-skipped project symbol is exactly what explains a name that stayed original), and
@@ -110,14 +98,11 @@ public final class ResolutionPass {
         if useSiteLog != nil {
             for sym in table.symbols where sym.module.writable { projectNames.insert(sym.name) }
         }
-        var unresolved: [UnresolvedKey: UnresolvedHit] = [:]
         for file in files where file.module.writable {
             guard let fileScope = table.fileScopes[ObjectIdentifier(file)] else { continue }
             let visitor = ResolutionVisitor(file: file, table: table, map: map, fileScope: fileScope,
-                                            diagLog: diagnostics ?? logger, diagnose: diagnoseOverloads,
                                             indexContext: indexContext,
                                             uniqueExternalMembers: uniqueExternal,
-                                            renamedNames: renamedNames,
                                             useSiteLog: useSiteLog,
                                             projectNames: projectNames)
             visitor.walk(file.syntax)
@@ -135,53 +120,20 @@ public final class ResolutionPass {
                         outcome: .kept(cause: .noDecision, receiver: nil, candidateIds: [])))
                 }
             }
-            // Merge per-file hits so the reported occurrence counts are PROJECT-wide: the same
-            // unresolved member name typically recurs across dozens of files, and a per-file report
-            // would hide exactly the "362 occurrences" signal that makes one name worth chasing.
-            for (key, hit) in visitor.unresolved {
-                if unresolved[key] != nil {
-                    unresolved[key]!.occurrences += hit.occurrences
-                } else {
-                    unresolved[key] = hit
-                }
-            }
         }
-        if diagnoseOverloads { reportUnresolved(unresolved) }
 
         return renames
-    }
-
-    /// Emit the aggregated `UNRES` lines, most-frequent first, plus the local-only file legend.
-    ///
-    /// High-signal causes go at full volume; `candidate-has-no-obf` is the low-signal tier (`v `)
-    /// because it says the use-site is already correct — the same split `SURV blocked-explained`
-    /// makes, for the same reason.
-    private func reportUnresolved(_ hits: [UnresolvedKey: UnresolvedHit]) {
-        let out = diagnostics ?? logger
-        for (key, hit) in hits.sorted(by: { $0.value.occurrences > $1.value.occurrences }) {
-            var line = "UNRES cause=\(key.cause.rawValue) member=\(Anon.of(key.member))"
-            if let recv = key.receiver { line += " recv=\(Anon.of(recv))" }
-            if hit.candidates > 0 { line += " cands=\(hit.candidates)" }
-            line += " occ=\(hit.occurrences) file=\(Anon.of(hit.file)) line=\(hit.line)"
-            out.log(line, verbose: key.cause.isExplained)
-        }
-        // Same legend line kind as RollbackPass — one hash → path table for the whole report, split
-        // into `Diagnostics-files.txt` so a pasted `Diagnostics.txt` can never carry a real path.
-        for path in Set(hits.values.map(\.path)).sorted() {
-            out.log("SURV-FILE \(Anon.of(URL(fileURLWithPath: path).lastPathComponent)) \(path)",
-                    verbose: true)
-        }
     }
 }
 
 /// Why the resolver left a use-site un-rewritten. A CLOSED set: every `UNRES` diagnostic line
 /// carries exactly one of these, so the report can be grepped and counted by cause.
 ///
-/// `--diagnose-overloads` previously answered only two questions — "which overload sets were
-/// ambiguous" (`OVLD`) and "which original names survived into the output" (`SURV`) — and neither
-/// says why a given use-site was skipped. On a run where ~119 method names had surviving use-sites,
-/// `OVLD` produced a single line, because it fires only when >1 candidate matched the labels AND
-/// argument types could not pick one. Everything else resolved to nothing, silently.
+/// The reporting this replaced answered only two questions — "which overload sets were ambiguous"
+/// and "which original names survived into the output" — and neither says why a given use-site was
+/// skipped. On a run where ~119 method names had surviving use-sites, the overload report produced a
+/// SINGLE line, because it fired only when >1 candidate matched the labels AND argument types could
+/// not pick one. Everything else resolved to nothing, silently.
 public enum UnresolvedCause: String, CaseIterable {
     /// The receiver expression could not be typed at all, so no member scope was ever searched.
     case receiverUntyped = "receiver-untyped"
@@ -250,47 +202,23 @@ public enum UnresolvedCause: String, CaseIterable {
 struct LookupOutcome {
     let symbol: Symbol?
     let cause: UnresolvedCause?
-    let candidates: Int
     /// Symbol ids of the candidates that made this ambiguous, so the report can NAME them
     /// (`candidate: File.swift:12 Owner.member`) instead of printing a bare count. Empty when the
     /// cause is not about a candidate SET (`receiver-untyped`, `no-contextual-type`).
     let candidateIds: [Int]
 
     static func resolved(_ s: Symbol) -> LookupOutcome {
-        .init(symbol: s, cause: nil, candidates: 1, candidateIds: [])
+        .init(symbol: s, cause: nil, candidateIds: [])
     }
-    static func failed(_ c: UnresolvedCause, candidates: Int = 0,
-                       candidateIds: [Int] = []) -> LookupOutcome {
-        .init(symbol: nil, cause: c, candidates: candidates, candidateIds: candidateIds)
+    static func failed(_ c: UnresolvedCause, candidateIds: [Int] = []) -> LookupOutcome {
+        .init(symbol: nil, cause: c, candidateIds: candidateIds)
     }
-}
-
-/// Identity of one `UNRES` line. Use-sites AGGREGATE by this triple, exactly as `SURV` aggregates by
-/// name: a project with 362 occurrences of one unresolved name must not produce 362 lines.
-struct UnresolvedKey: Hashable {
-    let cause: UnresolvedCause
-    let member: String
-    let receiver: String?
-}
-
-/// First location + occurrence count for one `UnresolvedKey`. `file` is the file NAME (hashed into
-/// the report, matching `SURV`); `path` is the real path and only ever reaches the separate,
-/// local-only `Diagnostics-files.txt` legend.
-struct UnresolvedHit {
-    var occurrences: Int
-    var file: String
-    var path: String
-    var line: Int
-    var candidates: Int
 }
 
 private final class ResolutionVisitor: SyntaxVisitor {
     let file: SourceFile
     let table: SymbolTable
     let map: RenameMap
-    /// Diagnostics sink (`Diagnostics.txt` when set by the pipeline), NOT the progress logger.
-    let diagLog: Logger
-    let diagnose: Bool
     let typeResolver: TypeResolver
     /// Cache of module-scoped resolvers (`resolveParamType` / `typealiasUnwrap` need a resolver in
     /// a candidate's OWN module). Reused so we don't allocate a fresh TypeResolver — and discard its
@@ -356,11 +284,6 @@ private final class ResolutionVisitor: SyntaxVisitor {
     /// Project-unique members of external-type extensions (see
     /// `ResolutionPass.uniqueExternalExtensionMembers`); empty when the feature is off.
     private let uniqueExternalMembers: [String: [String: Symbol]]
-    /// Every name a symbol somewhere was renamed under. `UNRES` reporting is filtered to these: a
-    /// use-site of a name nothing renamed cannot desync, and reporting the rest (every
-    /// `String.append`, every SwiftUI modifier) would bury the signal under thousands of lines.
-    /// Empty when `--diagnose-overloads` is off, so the filter also switches the feature off.
-    private let renamedNames: Set<String>
     /// Where use-site records go (`--explain`). nil ⇒ recording off.
     private let useSiteLog: UseSiteLog?
     /// Names declared by a writable-module symbol. The layer 2 filter.
@@ -369,26 +292,17 @@ private final class ResolutionVisitor: SyntaxVisitor {
     /// (Task 3) diffs against it, so an offset deliberately dropped by `projectNames` must still be
     /// inserted here or the sweep would re-report it as a reporter gap.
     var recordedOffsets: Set<Int> = []
-    /// Aggregated `UNRES` hits for this file, merged by `ResolutionPass` across all files so the
-    /// occurrence counts are project-wide.
-    var unresolved: [UnresolvedKey: UnresolvedHit] = [:]
-    /// Lazily built (diagnostics only) so `UNRES` can report a real `line=`.
-    private lazy var diagConverter = SourceLocationConverter(fileName: file.url.path, tree: file.syntax)
 
-    init(file: SourceFile, table: SymbolTable, map: RenameMap, fileScope: Scope, diagLog: Logger,
-         diagnose: Bool = false, indexContext: IndexContext? = nil,
+    init(file: SourceFile, table: SymbolTable, map: RenameMap, fileScope: Scope,
+         indexContext: IndexContext? = nil,
          uniqueExternalMembers: [String: [String: Symbol]] = [:],
-         renamedNames: Set<String> = [],
          useSiteLog: UseSiteLog? = nil,
          projectNames: Set<String> = []) {
         self.file = file
         self.table = table
         self.map = map
-        self.diagLog = diagLog
-        self.diagnose = diagnose
         self.indexContext = indexContext
         self.uniqueExternalMembers = uniqueExternalMembers
-        self.renamedNames = renamedNames
         self.useSiteLog = useSiteLog
         self.projectNames = projectNames
         // Build the converter only when the index is engaged (it parses positions; skip the cost
@@ -427,58 +341,26 @@ private final class ResolutionVisitor: SyntaxVisitor {
         }
     }
 
-    /// Deterministic anonymizing hash for a source identifier — keeps NDA logs leak-free while
-    /// staying stable across log lines so the same symbol reads as the same `#token`. Common
-    /// stdlib type names pass through unchanged (not sensitive, useful signal).
-    /// Shared with every other diagnostic emitter (see `Anon`) so the same identifier hashes to the
-    /// same token in `OVLD` and `SURV` lines and the two can be correlated without real names.
-    private func anon(_ s: String) -> String { Anon.of(s) }
-    private func anonLabels(_ labels: [String?]) -> String {
-        "[" + labels.map { $0.map { anon($0) } ?? "_" }.joined(separator: ",") + "]"
-    }
-    private func diag(_ msg: @autoclosure () -> String) {
-        if diagnose { diagLog.log("OVLD \(msg())") }
-    }
-
-    /// The ONE place a declined use-site becomes an `UNRES` record. Every branch that gives up
-    /// routes here rather than logging inline, so the volume filter, the aggregation key, the
-    /// anonymization and the location lookup stay in a single spot — spraying `diagLog.log` across
-    /// the member-access branches is how the OVLD line kind ended up covering one case in twelve.
+    /// The ONE place a declined use-site becomes a record. Every branch that gives up routes here
+    /// rather than recording inline, so the filter, the position lookup and the cause classification
+    /// stay in a single spot — instrumenting per resolver BRANCH is how the previous reporting ended
+    /// up covering one case in twelve.
     ///
-    /// Costs nothing on the default path: `diagnose` is false and `renamedNames` is empty.
+    /// Costs nothing on the default path: `useSiteLog` is nil and the guard fires first.
     private func reportUnresolved(_ cause: UnresolvedCause, name: String, token: TokenSyntax,
-                                  receiver: String? = nil, candidates: Int = 0,
-                                  candidateIds: [Int] = []) {
+                                  receiver: String? = nil, candidateIds: [Int] = []) {
         // Guarded at the caller, not inside `recordUseSite`: Swift evaluates arguments eagerly, so
         // an inner nil-check would still pay for the position lookup and the `.kept(...)`
-        // construction on every declined use-site of the default path (see `emitRename`). The
-        // position itself is hoisted to one `let`, shared by the record below and the aggregation
-        // further down, computed only once at least one of the two features that need it is on —
-        // so it still costs nothing when both are off.
-        guard useSiteLog != nil || diagnose else { return }
-        let pos = token.positionAfterSkippingLeadingTrivia
-
+        // construction on every declined use-site of the default path (see `emitRename`).
+        //
         // `.candidateHasNoObf` fires exactly where the caller is about to call `emitRename` on this
         // same token — the resolved-but-not-renamed target IS the record for this position, and it's
         // strictly more informative (it names the target). Recording a `.kept` here too would leave
         // two contradicting records at one source position.
-        if useSiteLog != nil, cause != .candidateHasNoObf {
-            recordUseSite(name: name,
-                          offset: pos.utf8Offset,
-                          outcome: .kept(cause: cause, receiver: receiver, candidateIds: candidateIds))
-        }
-
-        guard diagnose, renamedNames.contains(name) else { return }
-        let key = UnresolvedKey(cause: cause, member: name, receiver: receiver)
-        if unresolved[key] != nil {
-            unresolved[key]!.occurrences += 1
-            return
-        }
-        unresolved[key] = UnresolvedHit(occurrences: 1,
-                                        file: file.url.lastPathComponent,
-                                        path: file.url.path,
-                                        line: diagConverter.location(for: pos).line,
-                                        candidates: candidates)
+        guard useSiteLog != nil, cause != .candidateHasNoObf else { return }
+        recordUseSite(name: name,
+                      offset: token.positionAfterSkippingLeadingTrivia.utf8Offset,
+                      outcome: .kept(cause: cause, receiver: receiver, candidateIds: candidateIds))
     }
 
     /// The ONE place a use-site becomes a record. Costs nothing when `useSiteLog` is nil.
@@ -497,7 +379,7 @@ private final class ResolutionVisitor: SyntaxVisitor {
                         receiver: Symbol?) -> Symbol? {
         if let cause = outcome.cause {
             reportUnresolved(cause, name: name, token: token, receiver: receiver?.name,
-                             candidates: outcome.candidates, candidateIds: outcome.candidateIds)
+                             candidateIds: outcome.candidateIds)
         }
         return outcome.symbol
     }
@@ -1523,9 +1405,7 @@ private final class ResolutionVisitor: SyntaxVisitor {
         if scopeMatches.count == 1 { return scopeMatches[0] }
         if scopeMatches.count > 1 {
             if let shared = unambiguousSharedObfTarget(scopeMatches) { return shared }
-            let r = disambiguateByArgTypes(scopeMatches, call: call)
-            reportOverloadProblem(name: name, call: call, candidates: scopeMatches, result: r)
-            return r
+            return disambiguateByArgTypes(scopeMatches, call: call)
         }
 
         // Nothing matched lexically — search globally, but a bare `f(args)` can only reach a
@@ -1553,9 +1433,7 @@ private final class ResolutionVisitor: SyntaxVisitor {
         }
         if globalMatches.count > 1 {
             if let shared = unambiguousSharedObfTarget(globalMatches) { return shared }
-            let r = disambiguateByArgTypes(globalMatches, call: call)
-            reportOverloadProblem(name: name, call: call, candidates: globalMatches, result: r)
-            return r
+            return disambiguateByArgTypes(globalMatches, call: call)
         }
         return nil
     }
@@ -1775,67 +1653,6 @@ private final class ResolutionVisitor: SyntaxVisitor {
         return sameModule.count == 1 ? sameModule[0] : nil
     }
 
-    /// Emits one compact, anonymized diagnostic per PROBLEMATIC overloaded call — defined as: at
-    /// least one label-matching candidate is a renamed overload, but the resolver did NOT pick a
-    /// renamed one (either left the call un-renamed, or picked a non-renamed sibling). These are
-    /// exactly the calls that risk a `Type X has no member Y` desync; everything else is silent.
-    private func reportOverloadProblem(name: String, call: FunctionCallExprSyntax, candidates: [Symbol], result: Symbol?) {
-        guard diagnose else { return }
-        // Only flag UNRESOLVED calls where at least one renamed overload was a label-match — that's
-        // the desync-risk shape (use stays original while a sibling decl was renamed). A result
-        // that picked an un-renamed overload is left silent: with the type-aware argConstraint,
-        // that's almost always the genuine read-only/protocol target (e.g. a forwarder calling
-        // `self.f(par.rawValue)` correctly resolving to the String overload, not its own enum one).
-        guard result == nil else { return }
-        let renamed = candidates.filter { map.obf(for: $0) != nil }
-        guard !renamed.isEmpty else { return }
-
-        let off = call.calledExpression.positionAfterSkippingLeadingTrivia.utf8Offset
-        let renamedDetails = renamed.map { describeCandidateFit($0, call: call) }.joined(separator: " ; ")
-        diagLog.log("OVLD unresolved name=\(anon(name)) off=\(off) labels=\(anonLabels(Self.argumentLabels(of: call))) cands=\(candidates.count) renamed=\(renamed.count): \(renamedDetails)")
-    }
-
-    /// Per-arg fit detail for a single candidate (recomputes scoring locally) — only used by the
-    /// diagnostic reporter, so the hot path stays log-free.
-    private func describeCandidateFit(_ cand: Symbol, call: FunctionCallExprSyntax) -> String {
-        guard let pTypes = table.functionParamTypes[cand.id] else { return "noPTypes" }
-        let args = Array(call.arguments.map { $0.expression })
-        var perArg: [String] = []
-        var score = 0
-        for (i, arg) in args.enumerated() {
-            guard i < pTypes.count, let pType = pTypes[i] else { perArg.append("?"); continue }
-            switch argConstraint(arg) {
-            case .enumCase(let c):
-                if let t = resolveParamType(pType, candidate: cand),
-                   t.kind == .enum {
-                    if enumHasCase(t, c) { score += 1; perArg.append(".\(anon(c))→\(anon(pType))✓") }
-                    else { perArg.append(".\(anon(c))→\(anon(pType))✗noCase") }
-                } else {
-                    perArg.append(".\(anon(c))→\(anon(pType))~unresolvedType")
-                }
-            case .typeSymbol(let argSym):
-                if let pSym = resolveParamType(pType, candidate: cand) {
-                    if pSym.id == argSym.id { score += 1; perArg.append("\(anon(argSym.name))==\(anon(pType))✓") }
-                    else { perArg.append("\(anon(argSym.name))≠\(anon(pType))✗") }
-                } else {
-                    perArg.append("\(anon(argSym.name))~\(anon(pType))")
-                }
-            case .typeName(let tn):
-                if bareTypeName(pType) == tn {
-                    score += 1; perArg.append("\(anon(tn))==\(anon(pType))✓")
-                } else if resolveParamType(pType, candidate: cand) != nil {
-                    perArg.append("\(anon(tn))≠\(anon(pType))✗")
-                } else {
-                    perArg.append("\(anon(tn))~\(anon(pType))")
-                }
-            case .unknown:
-                perArg.append("?~\(anon(pType))")
-            }
-        }
-        let mod = "\(anon(cand.module.name))/\(cand.module.writable ? "w" : "r")"
-        return "mod=\(mod) pTypes=[\(pTypes.map { $0.map(anon) ?? "nil" }.joined(separator: ","))] args=[\(perArg.joined(separator: ","))] score=\(score)"
-    }
-
     private enum ArgConstraint {
         case enumCase(String)
         case typeSymbol(Symbol)   // resolved user-defined type — match by Symbol identity
@@ -2019,8 +1836,7 @@ private final class ResolutionVisitor: SyntaxVisitor {
             case .use(let inherited):
                 candidates = inherited
             case .unknowable:
-                return .failed(.inheritedKindConflict, candidates: candidates.count,
-                               candidateIds: candidates.map(\.id))
+                return .failed(.inheritedKindConflict, candidateIds: candidates.map(\.id))
             }
         }
         if candidates.count == 1 { return outcome(for: candidates[0]) }
@@ -2029,16 +1845,13 @@ private final class ResolutionVisitor: SyntaxVisitor {
         // regardless of which overload the compiler selects.
         if let shared = unambiguousSharedObfTarget(candidates) { return .resolved(shared) }
         guard candidates.allSatisfy({ Self.isCallable($0.kind) }) else {
-            return .failed(.mixedKindCandidates, candidates: candidates.count,
-                           candidateIds: candidates.map(\.id))
+            return .failed(.mixedKindCandidates, candidateIds: candidates.map(\.id))
         }
         guard let call else {
-            return .failed(.ambiguousOverload, candidates: candidates.count,
-                           candidateIds: candidates.map(\.id))
+            return .failed(.ambiguousOverload, candidateIds: candidates.map(\.id))
         }
         guard let picked = chooseOverload(candidates, call: call) else {
-            return .failed(.ambiguousOverload, candidates: candidates.count,
-                           candidateIds: candidates.map(\.id))
+            return .failed(.ambiguousOverload, candidateIds: candidates.map(\.id))
         }
         return outcome(for: picked)
     }
@@ -2195,7 +2008,7 @@ private final class ResolutionVisitor: SyntaxVisitor {
     private func outcome(for sym: Symbol) -> LookupOutcome {
         map.obf(for: sym) != nil
             ? .resolved(sym)
-            : .init(symbol: sym, cause: .candidateHasNoObf, candidates: 1, candidateIds: [sym.id])
+            : .init(symbol: sym, cause: .candidateHasNoObf, candidateIds: [sym.id])
     }
 
     static func isCallable(_ k: SymbolKind) -> Bool {

@@ -3600,26 +3600,6 @@ final class PatternTests: XCTestCase {
     // `RollbackPass`'s returned `RollbackResult` instead of `Diagnostics.txt` — `RollbackPass` no
     // longer emits `SURV` lines at all (see `RollbackResult` in `RollbackPass.swift`).
 
-    /// Runs the pipeline with `--diagnose-overloads` and returns the contents of `Diagnostics.txt`.
-    private func runPipelineDiagnostics(_ source: String, moduleName: String = "M",
-                                        file: String = "Sample.swift") throws -> String {
-        let tempRoot = FileManager.default.temporaryDirectory
-            .appendingPathComponent("SwiftProf-\(UUID().uuidString)")
-        let moduleRoot = tempRoot.appendingPathComponent(moduleName)
-        try FileManager.default.createDirectory(at: moduleRoot, withIntermediateDirectories: true)
-        try source.write(to: moduleRoot.appendingPathComponent(file), atomically: true, encoding: .utf8)
-        let outputDir = tempRoot.appendingPathComponent("out")
-
-        let options = PipelineOptions(
-            modules: [ModuleSpec(name: moduleName, root: moduleRoot, writable: true)],
-            outputDirectory: outputDir, dryRun: false,
-            nameStyle: .debug, introspectSDK: false,
-            diagnoseOverloads: true
-        )
-        _ = try Pipeline(options: options, logger: StderrLogger(verbose: false)).run()
-        return try String(contentsOf: outputDir.appendingPathComponent("Diagnostics.txt"), encoding: .utf8)
-    }
-
     // MARK: - Composite parameter types in signature matching (B-FIX-27)
 
     /// Every `func <name>` declared in the rewritten source, in order.
@@ -4950,42 +4930,11 @@ final class PatternTests: XCTestCase {
                           file: file, line: line)
     }
 
-    // MARK: - UNRES diagnostics (why a use-site was not rewritten)
-
-    /// `OVLD` fires only for an ambiguous overload SET, so a use-site that silently resolved to
-    /// nothing produced no line at all. `UNRES` closes that: one line per (cause, member,
-    /// receiver), hashed through the SAME `Anon.of` used elsewhere so the `member=` token can be
-    /// correlated against `RollbackResult.revertedNames` for the same symbol (see
-    /// `DecisionReportTests.testRollback_unshieldedSurvivor_isReported`, which covers that half —
-    /// `RollbackPass` itself no longer writes to `Diagnostics.txt`).
-    func testDiagnostics_untypeableReceiver_reportedAsUnresolved() throws {
-        let source = """
-        struct Box { var widgetPayload: Int = 0 }
-        func take(_ x: SomeExternalThing) -> Int { return x.widgetPayload }
-        """
-        let diag = try runPipelineDiagnostics(source)
-        XCTAssertTrue(diag.contains("UNRES cause=receiver-untyped member=\(Anon.of("widgetPayload"))"),
-                      "an un-typeable receiver must be reported with its cause:\n\(diag)")
-    }
-
-    /// A receiver we typed fine whose type declares no such member is a DIFFERENT failure from one
-    /// we could not type, and the report has to tell them apart — that distinction is the whole
-    /// point of the cause field. The receiver's type is named (hashed) so the line is actionable.
-    func testDiagnostics_typedReceiverWithoutMember_reportedWithReceiverType() throws {
-        let source = """
-        struct Box { var widgetPayload: Int = 0 }
-        struct Other { var q: Int = 0 }
-        func take(_ o: Other) -> Int { return o.widgetPayload }
-        """
-        let diag = try runPipelineDiagnostics(source)
-        let line = diag.split(separator: "\n").first {
-            $0.contains("UNRES cause=no-candidate-in-scope member=\(Anon.of("widgetPayload"))")
-        }
-        XCTAssertNotNil(line, "a typed receiver missing the member is its own cause:\n\(diag)")
-        XCTAssertTrue(line?.contains("recv=\(Anon.of("Other"))") == true,
-                      "the receiver type must be named: \(line ?? "")")
-        XCTAssertTrue(line?.contains("occ=1") == true, "occurrences are counted: \(line ?? "")")
-    }
+    // The two UNRES tests that lived here moved to `DecisionReportTests`, which asserts the same
+    // causes against the per-use-site records of `--explain` instead of hashed `UNRES` lines in the
+    // removed `Diagnostics.txt`: `testUseSite_unresolvedReceiver_recordsTheCause` covers the
+    // un-typeable receiver, `testUseSite_typedReceiverWithoutMember_namesTheReceiverType` the typed
+    // receiver that declares no such member.
 
     // MARK: - G1: @NSManaged is an ObjC-exposing attribute
 

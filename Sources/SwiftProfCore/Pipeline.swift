@@ -45,11 +45,6 @@ public struct PipelineOptions {
     /// rewrites resolvable `.rawValue` use-sites to `.displayName`. Default `.off`.
     public var rawValueMode: RawValueMode
 
-    /// When true, ResolutionPass emits ANONYMIZED `OVLD …` diagnostics for every overloaded call
-    /// resolution (original identifiers hashed; only structure/kinds/scores logged). For debugging
-    /// why a call did/didn't resolve to the expected overload, on NDA code. Default false.
-    public var diagnoseOverloads: Bool
-
     /// Green-build-first mode: pre-emptively skip obfuscating any function/method whose name has
     /// MORE than one callable in the project. The most common source of overload desync (wrong
     /// pick → `Type X has no member …`) — refusing to rename those at all eliminates the risk at
@@ -113,7 +108,6 @@ public struct PipelineOptions {
         rollbackEnabled: Bool = true,
         obfuscatableKinds: Set<SymbolKind> = [],
         rawValueMode: RawValueMode = .off,
-        diagnoseOverloads: Bool = false,
         skipOverloadedCallables: Bool = false,
         aggressiveRollback: Bool = false,
         indexStorePath: String? = nil,
@@ -138,7 +132,6 @@ public struct PipelineOptions {
         self.rollbackEnabled = rollbackEnabled
         self.obfuscatableKinds = obfuscatableKinds
         self.rawValueMode = rawValueMode
-        self.diagnoseOverloads = diagnoseOverloads
         self.skipOverloadedCallables = skipOverloadedCallables
         self.aggressiveRollback = aggressiveRollback
         self.indexStorePath = indexStorePath
@@ -382,13 +375,8 @@ public final class Pipeline {
         AmbiguityRollback(table: table, logger: logger).run(map: map, files: project.files)
         logger.log("after ambiguity rollback: \(map.obfBySymbolId.count)")
 
-        // Diagnostics go to a FILE, not the console: they are grepped after the run and can be
-        // thousands of lines, which would bury the progress output they are mixed into.
-        let diagnostics: DiagnosticsLog? = options.diagnoseOverloads ? DiagnosticsLog() : nil
         let useSiteLog: UseSiteLog? = options.explain ? UseSiteLog() : nil
         var renames = ResolutionPass(table: table, map: map, logger: logger,
-                                     diagnoseOverloads: options.diagnoseOverloads,
-                                     diagnostics: diagnostics,
                                      indexContext: indexContext,
                                      uniqueExternalMembers: options.uniqueExternalMembers,
                                      useSiteLog: useSiteLog).run(on: project.files)
@@ -432,13 +420,6 @@ public final class Pipeline {
         try conversion.write(to: options.outputDirectory.appendingPathComponent("ConversionMap.json"))
         let coverage = CoverageReport(table: table, map: map, protector: protector)
         try coverage.write(to: options.outputDirectory.appendingPathComponent("CoverageReport.txt"))
-
-        if let diagnostics, !diagnostics.isEmpty {
-            let written = try diagnostics.write(toDirectory: options.outputDirectory)
-            logger.log("wrote \(written.diagnostics) diagnostic lines to "
-                       + "\(options.outputDirectory.appendingPathComponent("Diagnostics.txt").path)"
-                       + " (--diagnose-overloads)")
-        }
 
         if options.explain {
             let decisions = DecisionReport(table: table, map: map, protector: protector,

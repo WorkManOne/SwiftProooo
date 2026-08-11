@@ -35,7 +35,6 @@ public struct ConfigFile: Decodable, Equatable {
     public var noRollback: Bool?
     public var kinds: [String]?
     public var rawValues: String?
-    public var diagnoseOverloads: Bool?
     public var skipOverloadedCallables: Bool?
     public var indexStorePath: String?
     public var indexStoreGate: Bool?
@@ -63,7 +62,6 @@ public struct ConfigFile: Decodable, Equatable {
         case noRollback = "no-rollback"
         case kinds
         case rawValues = "raw-values"
-        case diagnoseOverloads = "diagnose-overloads"
         case skipOverloadedCallables = "skip-overloaded-callables"
         case indexStorePath = "index-store-path"
         case indexStoreGate = "index-store-gate"
@@ -149,7 +147,6 @@ public struct ConfigFile: Decodable, Equatable {
         r.noRollback = noRollback ?? base.noRollback
         r.kinds = kinds ?? base.kinds
         r.rawValues = rawValues ?? base.rawValues
-        r.diagnoseOverloads = diagnoseOverloads ?? base.diagnoseOverloads
         r.skipOverloadedCallables = skipOverloadedCallables ?? base.skipOverloadedCallables
         r.indexStorePath = indexStorePath ?? base.indexStorePath
         r.indexStoreGate = indexStoreGate ?? base.indexStoreGate

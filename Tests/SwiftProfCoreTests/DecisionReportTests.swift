@@ -729,3 +729,30 @@ extension DecisionReportTests {
                       "each candidate must name its declaration: \(candidateLines)")
     }
 }
+
+extension DecisionReportTests {
+
+    /// A receiver we typed fine whose type declares no such member is a DIFFERENT failure from one
+    /// we could not type, and the report has to tell them apart — that distinction is the whole
+    /// point of the cause field. The receiver's type is named so the record is actionable.
+    ///
+    /// Converted from `PatternTests.testDiagnostics_typedReceiverWithoutMember_reportedWithReceiverType`,
+    /// which asserted the same two facts against hashed `UNRES` lines in the removed `Diagnostics.txt`.
+    func testUseSite_typedReceiverWithoutMember_namesTheReceiverType() throws {
+        let (result, _) = try runExplain("""
+        struct Box { var widgetPayload: Int = 0 }
+        struct Other { var q: Int = 0 }
+        func take(_ o: Other) -> Int { return o.widgetPayload }
+        """)
+        let records = useSites(result, named: "widgetPayload")
+        let kept = records.compactMap { rec -> (UnresolvedCause, String?)? in
+            if case .kept(let c, let recv, _) = rec.outcome { return (c, recv) }
+            return nil
+        }
+        guard let hit = kept.first(where: { $0.0 == .noCandidateInScope }) else {
+            return XCTFail("a typed receiver missing the member is its own cause: \(kept)")
+        }
+        XCTAssertEqual(hit.1, "Other", "the receiver type must be named, got \(String(describing: hit.1))")
+        XCTAssertEqual(records.count, 1, "one use-site, one record: \(records.map(\.outcome))")
+    }
+}
