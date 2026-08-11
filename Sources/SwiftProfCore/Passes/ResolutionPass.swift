@@ -251,10 +251,17 @@ struct LookupOutcome {
     let symbol: Symbol?
     let cause: UnresolvedCause?
     let candidates: Int
+    /// Symbol ids of the candidates that made this ambiguous, so the report can NAME them
+    /// (`candidate: File.swift:12 Owner.member`) instead of printing a bare count. Empty when the
+    /// cause is not about a candidate SET (`receiver-untyped`, `no-contextual-type`).
+    let candidateIds: [Int]
 
-    static func resolved(_ s: Symbol) -> LookupOutcome { .init(symbol: s, cause: nil, candidates: 1) }
-    static func failed(_ c: UnresolvedCause, candidates: Int = 0) -> LookupOutcome {
-        .init(symbol: nil, cause: c, candidates: candidates)
+    static func resolved(_ s: Symbol) -> LookupOutcome {
+        .init(symbol: s, cause: nil, candidates: 1, candidateIds: [])
+    }
+    static func failed(_ c: UnresolvedCause, candidates: Int = 0,
+                       candidateIds: [Int] = []) -> LookupOutcome {
+        .init(symbol: nil, cause: c, candidates: candidates, candidateIds: candidateIds)
     }
 }
 
@@ -490,7 +497,7 @@ private final class ResolutionVisitor: SyntaxVisitor {
                         receiver: Symbol?) -> Symbol? {
         if let cause = outcome.cause {
             reportUnresolved(cause, name: name, token: token, receiver: receiver?.name,
-                             candidates: outcome.candidates)
+                             candidates: outcome.candidates, candidateIds: outcome.candidateIds)
         }
         return outcome.symbol
     }
@@ -1418,10 +1425,12 @@ private final class ResolutionVisitor: SyntaxVisitor {
                 // the two it was is exactly what the report has to say, so classify it the same way
                 // `lookupMember` does: a name with no label-matching callable in reach never had a
                 // candidate; one with several was an unresolved overload.
-                let hadCandidates = !lexicalCallableCandidates(named: name).isEmpty
-                    || !table.callables(named: name).isEmpty
+                let lexical = lexicalCallableCandidates(named: name)
+                let global = table.callables(named: name)
+                let hadCandidates = !lexical.isEmpty || !global.isEmpty
                 reportUnresolved(hadCandidates ? .ambiguousOverload : .noCandidateInScope,
-                                 name: name, token: token)
+                                 name: name, token: token,
+                                 candidateIds: (lexical.isEmpty ? global : lexical).map(\.id))
             }
             return .skipChildren
         }
@@ -2010,7 +2019,8 @@ private final class ResolutionVisitor: SyntaxVisitor {
             case .use(let inherited):
                 candidates = inherited
             case .unknowable:
-                return .failed(.inheritedKindConflict, candidates: candidates.count)
+                return .failed(.inheritedKindConflict, candidates: candidates.count,
+                               candidateIds: candidates.map(\.id))
             }
         }
         if candidates.count == 1 { return outcome(for: candidates[0]) }
@@ -2019,11 +2029,16 @@ private final class ResolutionVisitor: SyntaxVisitor {
         // regardless of which overload the compiler selects.
         if let shared = unambiguousSharedObfTarget(candidates) { return .resolved(shared) }
         guard candidates.allSatisfy({ Self.isCallable($0.kind) }) else {
-            return .failed(.mixedKindCandidates, candidates: candidates.count)
+            return .failed(.mixedKindCandidates, candidates: candidates.count,
+                           candidateIds: candidates.map(\.id))
         }
-        guard let call else { return .failed(.ambiguousOverload, candidates: candidates.count) }
+        guard let call else {
+            return .failed(.ambiguousOverload, candidates: candidates.count,
+                           candidateIds: candidates.map(\.id))
+        }
         guard let picked = chooseOverload(candidates, call: call) else {
-            return .failed(.ambiguousOverload, candidates: candidates.count)
+            return .failed(.ambiguousOverload, candidates: candidates.count,
+                           candidateIds: candidates.map(\.id))
         }
         return outcome(for: picked)
     }
@@ -2178,7 +2193,9 @@ private final class ResolutionVisitor: SyntaxVisitor {
     /// correct as it stands (the declaration was protected or policy-skipped), which is exactly what
     /// turns an unexplained `SURV` into an explained one.
     private func outcome(for sym: Symbol) -> LookupOutcome {
-        map.obf(for: sym) != nil ? .resolved(sym) : .init(symbol: sym, cause: .candidateHasNoObf, candidates: 1)
+        map.obf(for: sym) != nil
+            ? .resolved(sym)
+            : .init(symbol: sym, cause: .candidateHasNoObf, candidates: 1, candidateIds: [sym.id])
     }
 
     static func isCallable(_ k: SymbolKind) -> Bool {

@@ -705,3 +705,27 @@ extension DecisionReportTests {
         }
     }
 }
+
+extension DecisionReportTests {
+
+    /// An ambiguous overload names its candidates instead of printing a bare count: `cands=3` tells
+    /// a reader nothing, three `File.swift:line Owner.member` lines tell them which declarations the
+    /// resolver could not choose between.
+    func testAmbiguousOverload_listsTheCandidates() throws {
+        let (_, outputDir) = try runExplain("""
+        struct Fmt {
+            func render(_ v: Int) -> String { "\\(v)" }
+            func render(_ v: Bool) -> String { "\\(v)" }
+        }
+        func go(_ f: Fmt, _ anything: SomeExternalThing) -> String { f.render(anything) }
+        """)
+        let text = try decisionsText(outputDir)
+        XCTAssertTrue(text.contains("KEPT: ambiguous-overload"),
+                      "the untypeable argument must leave the overload unresolved:\n\(text)")
+        let candidateLines = text.split(separator: "\n").filter { $0.contains("candidate: ") }
+        XCTAssertEqual(candidateLines.count, 2,
+                       "both overloads must be listed:\n\(candidateLines.joined(separator: "\n"))")
+        XCTAssertTrue(candidateLines.allSatisfy { $0.contains("Fmt.render") },
+                      "each candidate must name its declaration: \(candidateLines)")
+    }
+}
