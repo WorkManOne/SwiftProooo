@@ -82,7 +82,6 @@ struct Obfuscate: ParsableCommand {
     @Option(name: .long, help: "Raw-value obfuscation mode: off (default) / safe (skip Codable, explicit literals only) / all (every String enum, materializes implicit raw values). Obfuscates String-enum raw values, adds a `displayName` with the originals, rewrites resolvable .rawValue use-sites to .displayName.")
     var rawValues: String?
 
-
     @Flag(name: .long, inversion: .prefixedNo, help: "Green-build-first: pre-emptively skip renaming any function/method whose name has >1 callable in the project. Eliminates overload-desync risk entirely (no rename → no possible miss). Use when guaranteed-green build matters more than obfuscation coverage.")
     var skipOverloadedCallables: Bool?
 

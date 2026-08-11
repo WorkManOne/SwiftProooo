@@ -108,6 +108,19 @@ final class ConfigFileTests: XCTestCase {
         }
     }
 
+    /// `diagnose-overloads` was removed when `--explain` became the only report surface. A stale
+    /// `swiftprof.yaml` carrying it must FAIL, not be silently ignored: silently dropping it would
+    /// leave the user believing they still get a diagnostics artifact that no longer exists.
+    func testLoad_removedDiagnoseOverloadsKey_isRejected() throws {
+        let url = try write("diagnose-overloads: true")
+        XCTAssertThrowsError(try ConfigFile.load(from: url)) { error in
+            guard case let ConfigFileError.unknownKey(key, _, _) = error else {
+                return XCTFail("expected unknownKey, got \(error)")
+            }
+            XCTAssertEqual(key, "diagnose-overloads")
+        }
+    }
+
     func testLoad_wrongValueType_throws() throws {
         let url = try write("module: not-a-list")           // scalar where list expected
         XCTAssertThrowsError(try ConfigFile.load(from: url)) { error in

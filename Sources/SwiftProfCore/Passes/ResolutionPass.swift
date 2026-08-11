@@ -126,7 +126,7 @@ public final class ResolutionPass {
     }
 }
 
-/// Why the resolver left a use-site un-rewritten. A CLOSED set: every `UNRES` diagnostic line
+/// Why the resolver left a use-site un-rewritten. A CLOSED set: every declined `UseSiteRecord`
 /// carries exactly one of these, so the report can be grepped and counted by cause.
 ///
 /// The reporting this replaced answered only two questions — "which overload sets were ambiguous"
@@ -196,9 +196,9 @@ public enum UnresolvedCause: String, CaseIterable {
 }
 
 /// Outcome of resolving one use-site: the rewrite target (if any) and, when the resolver declined,
-/// WHY. Returning the cause instead of a bare `Symbol?` is what lets a SINGLE reporting helper emit
-/// `UNRES` — the classification stays in the one function that has the knowledge, rather than being
-/// re-derived (and drifting) at each of the member-access branches.
+/// WHY. Returning the cause instead of a bare `Symbol?` is what lets a SINGLE reporting helper
+/// record the decline — the classification stays in the one function that has the knowledge, rather
+/// than being re-derived (and drifting) at each of the member-access branches.
 struct LookupOutcome {
     let symbol: Symbol?
     let cause: UnresolvedCause?
@@ -352,6 +352,11 @@ private final class ResolutionVisitor: SyntaxVisitor {
         // Guarded at the caller, not inside `recordUseSite`: Swift evaluates arguments eagerly, so
         // an inner nil-check would still pay for the position lookup and the `.kept(...)`
         // construction on every declined use-site of the default path (see `emitRename`).
+        //
+        // `candidateIds` is deliberately NOT deferred behind an `@autoclosure`, unlike the position
+        // lookup. Its callers already hold the candidate array (they built it to classify the cause
+        // at all), so the eager cost is one small `map` on a path that only runs when resolution
+        // FAILED — not the per-use-site hot path the guard rule exists for.
         //
         // `.candidateHasNoObf` fires exactly where the caller is about to call `emitRename` on this
         // same token — the resolved-but-not-renamed target IS the record for this position, and it's
