@@ -35,6 +35,12 @@ public final class Protector {
     /// id → human-readable reason. Presence in this map = protected.
     public private(set) var reasonForId: [Int: String] = [:]
 
+    /// External protocol names this pass MENTIONED in a protection reason without being able to
+    /// resolve them to any symbol — vendor and binary-framework names from the client's own
+    /// inheritance clauses. They are in no module, so the decisions report's name-membership scrub
+    /// cannot find them on its own and would ship them in clear in `Decisions-anon.txt`.
+    public private(set) var unknownExternalNames: Set<String> = []
+
     public init(table: SymbolTable, stdlibRegistry: StdlibRegistry, logger: Logger,
                 objcProtection: ObjCProtectionMode = .strict) {
         self.table = table
@@ -284,6 +290,7 @@ public final class Protector {
                 // renames them as a coordinated group) and are unrelated to the unknown external.
                 // Blanket-protecting them was pure over-protection — a `QLPreviewControllerDataSource`
                 // conformer lost its unrelated local-protocol method `f1`.
+                unknownExternalNames.formUnion(unknownExternal)
                 let reason = "conforms to unknown external '\(unknownExternal.joined(separator: ","))'"
                 protect(sym.id, reason: reason)
                 protectAllMembers(of: sym, in: inner, reason: reason,

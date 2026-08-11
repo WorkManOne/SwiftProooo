@@ -40,6 +40,10 @@ public struct DecisionReport {
     /// delimiters, which shipped a real leak (a backticked `.name` beside a quoted one).
     public let projectNames: Set<String>
 
+    /// Absolute paths of every writable file in the run. The anonymized legend keys on these, so it
+    /// covers files the report itself has no entry for.
+    public let writableFilePaths: [String]
+
     public init(table: SymbolTable, map: RenameMap, protector: Protector,
                 plannerSkip: [Int: String], useSites: [UseSiteRecord],
                 rollback: RollbackResult, files: [SourceFile]) {
@@ -55,14 +59,32 @@ public struct DecisionReport {
 
         var syntaxByPath: [String: SourceFileSyntax] = [:]
         for f in files where f.module.writable { syntaxByPath[f.url.path] = f.syntax }
+        self.writableFilePaths = Array(syntaxByPath.keys)
 
         var symbolById: [Int: Symbol] = [:]
         for sym in table.symbols { symbolById[sym.id] = sym }
 
-        // Same set `ResolutionPass` builds to decide which use-sites are worth recording: the names
-        // the client's own modules declare. The anonymized renderer scrubs free text against it.
+        // The scrub set for the anonymized rendering. Deliberately WIDER than the set
+        // `ResolutionPass` uses to decide which use-sites are worth recording (writable declarations
+        // only): the confidentiality boundary is "every identifier originating in the client's
+        // source", not "every identifier a writable module declares". Free-text reasons interpolate
+        // three kinds of name that a writable-only set cannot contain, each of which shipped in
+        // clear before this was widened:
+        //   - a READ-ONLY module's symbol names (`WitnessLinker`'s reverted-group reason names the
+        //     protocol; `Protector` names a `@propertyWrapper` type collected from every module),
+        //   - MODULE names themselves (`Planner`'s "read-only module (X) — never rewritten"),
+        //   - names that resolve to NO symbol at all: the vendor/binary-framework protocols in
+        //     `Protector`'s "conforms to unknown external '…'", which by construction matched
+        //     nothing in the table, so no membership test over the table could ever catch them —
+        //     the Protector hands them over explicitly.
+        // Over-hashing costs readability; under-hashing costs confidentiality, and only one of the
+        // two is recoverable.
         var names: Set<String> = []
-        for sym in table.symbols where sym.module.writable { names.insert(sym.name) }
+        for sym in table.symbols {
+            names.insert(sym.name)
+            names.insert(sym.module.name)
+        }
+        names.formUnion(protector.unknownExternalNames)
         self.projectNames = names
 
         // 1. Declarations.
@@ -184,7 +206,11 @@ public struct DecisionReport {
         let loc = converter.location(for: AbsolutePosition(utf8Offset: sym.declOffset))
         let owner = sym.scope?.owner?.name
         let qualified = owner.map { "\($0).\(sym.name)" } ?? sym.name
-        return "\(sym.file.url.lastPathComponent):\(loc.line) \(qualified)"
+        // FULL path, not the basename: `DecisionRenderer.target` hashes this value on the
+        // anonymized path and the legend keys on full paths, so a basename here would produce a
+        // token that `Decisions-files.txt` cannot resolve — and would collapse two files sharing a
+        // basename across modules onto one token. The renderer shortens it for the human rendering.
+        return "\(sym.file.url.path):\(loc.line) \(qualified)"
     }
 
     /// What a missed use-site cost, when the rollback pass has an opinion about the name.

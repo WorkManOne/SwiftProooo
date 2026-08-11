@@ -164,7 +164,7 @@ public enum UnresolvedCause: String, CaseIterable {
     /// proves the instrumentation's own coverage, so it is high-signal by construction.
     case noDecision = "no-decision"
 
-    /// Low-signal causes go to the `v ` tier, mirroring `SURV blocked-explained`: a use-site we
+    /// Low-signal causes go to the `v ` tier, the same split the report's `v ` tier makes: a use-site we
     /// resolved and deliberately left alone is not a lead, it is the answer.
     public var isExplained: Bool { self == .candidateHasNoObf }
 
@@ -2009,11 +2009,16 @@ private final class ResolutionVisitor: SyntaxVisitor {
 
     /// A resolved candidate, tagged `candidate-has-no-obf` when it carries no obf: the use-site is
     /// correct as it stands (the declaration was protected or policy-skipped), which is exactly what
-    /// turns an unexplained `SURV` into an explained one.
+    /// turns an unexplained survivor into an explained one.
     private func outcome(for sym: Symbol) -> LookupOutcome {
         map.obf(for: sym) != nil
             ? .resolved(sym)
-            : .init(symbol: sym, cause: .candidateHasNoObf, candidateIds: [sym.id])
+            // Empty on purpose: `reportUnresolved` returns before touching `candidateIds` for
+            // `.candidateHasNoObf` (that position's record comes from `emitRename` instead), and
+            // this branch runs on EVERY resolved-but-unrenamed member — the largest population in
+            // the report. Allocating a one-element array here would be a per-use-site cost on the
+            // default path for a value nothing ever reads.
+            : .init(symbol: sym, cause: .candidateHasNoObf, candidateIds: [])
     }
 
     static func isCallable(_ k: SymbolKind) -> Bool {

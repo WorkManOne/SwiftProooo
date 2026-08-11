@@ -26,6 +26,21 @@ final class UseSiteSweep: SyntaxVisitor {
         return .visitChildren
     }
 
+    /// A name in TYPE position — an annotation, a return clause, an `extension` head, a generic
+    /// argument, an inheritance clause. `ResolutionVisitor` rewrites these through `emitRename` as
+    /// well, so leaving them out of the sweep meant a type reference the resolver silently failed to
+    /// resolve produced no record AND no `no-decision` line: exactly the silence this pass exists to
+    /// abolish, over a large population.
+    override func visit(_ node: IdentifierTypeSyntax) -> SyntaxVisitorContinueKind {
+        add(node.name)
+        return .visitChildren
+    }
+
+    override func visit(_ node: MemberTypeSyntax) -> SyntaxVisitorContinueKind {
+        add(node.name)
+        return .visitChildren
+    }
+
     private func add(_ token: TokenSyntax) {
         guard case .identifier = token.tokenKind else { return }
         sites.append((TypeResolver.stripBackticks(token.text),

@@ -178,7 +178,10 @@ extension DecisionReportTests {
         let use = all.first { $0.role == "use-site" && $0.name == "badge" }
         XCTAssertNotNil(use, "roles present: \(Set(all.map(\.role)))")
         XCTAssertEqual(use?.decision, "rewritten")
-        XCTAssertEqual(use?.target, "Sample.swift:1 Card.badge")
+        // The JSON carries the FULL path (the anonymized renderer hashes it and the legend keys on
+        // it); the human rendering shortens it. The owner-qualified tail is the load-bearing part.
+        XCTAssertTrue(use?.target?.hasSuffix("Sample.swift:1 Card.badge") == true,
+                      "target must name the owner: \(String(describing: use?.target))")
         XCTAssertTrue(use?.line ?? 0 > 0)
     }
 
@@ -754,5 +757,66 @@ extension DecisionReportTests {
         }
         XCTAssertEqual(hit.1, "Other", "the receiver type must be named, got \(String(describing: hit.1))")
         XCTAssertEqual(records.count, 1, "one use-site, one record: \(records.map(\.outcome))")
+    }
+}
+
+extension DecisionReportTests {
+
+    /// The confidentiality boundary is "every identifier originating in the client's source", not
+    /// "every identifier a WRITABLE module declares".
+    ///
+    /// Reaching a read-only module's name in the report takes a specific shape, and the fixture has
+    /// to build it: read-only DECLARATIONS are not described at all (the report iterates writable
+    /// symbols), and a use-site is only recorded when its name is a project name. So the name must
+    /// be declared on BOTH sides — then `App.field`'s use-site is recorded, resolves to the
+    /// READ-ONLY declaration, and its detail carries `read-only module (VendorKit)` verbatim.
+    func testAnonTwin_readOnlyModuleNameIsHashed() throws {
+        let tempRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SwiftProf-\(UUID().uuidString)")
+        let appRoot = tempRoot.appendingPathComponent("App")
+        let vendorRoot = tempRoot.appendingPathComponent("VendorKit")
+        for d in [appRoot, vendorRoot] {
+            try FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
+        }
+        try "public struct VendorGadget { public var sharedField: Int = 0 }"
+            .write(to: vendorRoot.appendingPathComponent("Vendor.swift"), atomically: true, encoding: .utf8)
+        try """
+        struct AppUser { var sharedField: Int = 0 }
+        func read(_ g: VendorGadget) -> Int { g.sharedField }
+        """.write(to: appRoot.appendingPathComponent("App.swift"), atomically: true, encoding: .utf8)
+        let outputDir = tempRoot.appendingPathComponent("out")
+        _ = try Pipeline(options: PipelineOptions(
+            modules: [ModuleSpec(name: "App", root: appRoot, writable: true),
+                      ModuleSpec(name: "VendorKit", root: vendorRoot, writable: false)],
+            outputDirectory: outputDir, dryRun: false,
+            nameStyle: .debug, introspectSDK: false, explain: true),
+            logger: StderrLogger(verbose: false)).run()
+
+        let real = try decisionsText(outputDir)
+        let anon = try String(contentsOf: outputDir.appendingPathComponent("Decisions-anon.txt"),
+                              encoding: .utf8)
+        XCTAssertTrue(real.contains("read-only module (VendorKit)"),
+                      "the fixture must actually produce the reason this guards:\n\(real)")
+        XCTAssertFalse(anon.contains("VendorKit"),
+                       "a read-only MODULE name must not reach the anon report:\n\(anon)")
+    }
+
+    /// The hardest route: a vendor protocol that resolves to NO symbol at all, so no membership test
+    /// over the symbol table could ever catch it. The `Protector` hands those names over explicitly.
+    func testAnonTwin_unknownExternalProtocolNameIsHashed() throws {
+        let (_, outputDir) = try runExplain("""
+        struct Widget: AcmeSecretProtocol {
+            var payload: Int = 0
+        }
+        """)
+        let real = try decisionsText(outputDir)
+        let anon = try String(contentsOf: outputDir.appendingPathComponent("Decisions-anon.txt"),
+                              encoding: .utf8)
+        XCTAssertTrue(real.contains("AcmeSecretProtocol"),
+                      "the human report names the protocol (that is its job):\n\(real)")
+        XCTAssertFalse(anon.contains("AcmeSecretProtocol"),
+                       "a vendor protocol name reaches the anon report through the protection reason:\n\(anon)")
+        XCTAssertTrue(anon.contains(Anon.forced("AcmeSecretProtocol")),
+                      "expected the hashed token:\n\(anon)")
     }
 }

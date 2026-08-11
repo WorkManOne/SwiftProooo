@@ -24,7 +24,11 @@ public struct RollbackResult: Sendable {
     public struct Survivor: Sendable {
         public let occurrences: Int
         public let filePath: String
-        public let offset: Int
+        /// 1-based line of the FIRST occurrence. Stored as a line rather than an offset because the
+        /// scan works in UTF-16 (`NSRegularExpression`) while every other offset in the reporting
+        /// layer is UTF-8; handing a raw UTF-16 offset to a consumer that assumes UTF-8 mis-locates
+        /// on any file containing non-ASCII.
+        public let line: Int
     }
     /// Names whose surviving occurrence was NOT shielded: the group was reverted. Green build,
     /// coverage lost.
@@ -81,7 +85,7 @@ public final class RollbackPass {
     private struct Hit {
         var occurrences = 0
         var filePath = ""        // path of the writable file, for the first occurrence
-        var offset = 0           // UTF-16 offset of the first occurrence
+        var line = 0             // 1-based line of the first occurrence
     }
 
     /// Returns what was observed: which names were reverted, which survived behind a shield (the
@@ -186,9 +190,11 @@ public final class RollbackPass {
                     guard renamedNames.contains(word) else { return }
                     if !shieldedNames.contains(word) {
                         survivors.insert(word)
-                        Self.record(word, at: match.range.location, file.url.path, into: &revertedHits)
+                        Self.record(word, at: match.range.location, in: nsString,
+                                    file.url.path, into: &revertedHits)
                     } else {
-                        Self.record(word, at: match.range.location, file.url.path, into: &blockedHits)
+                        Self.record(word, at: match.range.location, in: nsString,
+                                    file.url.path, into: &blockedHits)
                     }
                 }
             }
@@ -197,10 +203,10 @@ public final class RollbackPass {
         func result(_ revertedCount: Int) -> RollbackResult {
             RollbackResult(
                 revertedNames: revertedHits.mapValues {
-                    RollbackResult.Survivor(occurrences: $0.occurrences, filePath: $0.filePath, offset: $0.offset)
+                    RollbackResult.Survivor(occurrences: $0.occurrences, filePath: $0.filePath, line: $0.line)
                 },
                 blockedNames: blockedHits.mapValues {
-                    RollbackResult.Survivor(occurrences: $0.occurrences, filePath: $0.filePath, offset: $0.offset)
+                    RollbackResult.Survivor(occurrences: $0.occurrences, filePath: $0.filePath, line: $0.line)
                 },
                 shieldReasons: shieldReasons,
                 revertedCount: revertedCount)
@@ -260,13 +266,22 @@ public final class RollbackPass {
         k == .method || k == .function
     }
 
-    private static func record(_ name: String, at offset: Int, _ filePath: String,
-                               into dict: inout [String: Hit]) {
+    private static func record(_ name: String, at offset: Int, in text: NSString,
+                               _ filePath: String, into dict: inout [String: Hit]) {
         if dict[name] != nil {
             dict[name]!.occurrences += 1
-        } else {
-            dict[name] = Hit(occurrences: 1, filePath: filePath, offset: offset)
+            return
         }
+        // Counted only for the FIRST occurrence of each name, so this stays O(file) per reported
+        // name rather than per match. `text` is the length-preserving stripped content, so a
+        // newline count up to `offset` is the line in the REAL file.
+        var line = 1
+        var i = 0
+        while i < offset && i < text.length {
+            if text.character(at: i) == 10 { line += 1 }
+            i += 1
+        }
+        dict[name] = Hit(occurrences: 1, filePath: filePath, line: line)
     }
 
     /// Strip string literals (triple-quoted FIRST, then single-quoted excluding newlines) and
@@ -275,7 +290,7 @@ public final class RollbackPass {
     /// LENGTH-PRESERVING: every stripped character becomes a space (newlines kept), so an offset in
     /// the result names the same position in the input. The scan only looks for free identifiers
     /// and a run of spaces bounds a word exactly like the removed text did, so the scan is
-    /// unaffected — and a caller can turn `RollbackResult.Survivor.offset` into a real line number.
+    /// unaffected — and the recorded line number points at the real file.
     static func strip(_ s: String) -> String {
         var out = s
         out = Self.blankMatches(out, pattern: #""""[\s\S]*?""""#)

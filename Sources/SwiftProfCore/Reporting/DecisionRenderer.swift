@@ -9,14 +9,14 @@ public enum DecisionRenderer {
     public enum Identity {
         /// Real names and real paths. The artifact a human opens next to Xcode.
         case real
-        /// Every identifier and file name through `Anon.of`. The artifact that is safe to hand out.
+        /// Every identifier and file name hashed. The artifact that is safe to hand out.
         case anonymized
     }
 
     private static func ident(_ s: String, _ identity: Identity) -> String {
         switch identity {
         case .real: return s
-        case .anonymized: return Anon.of(s)
+        case .anonymized: return Anon.forced(s)
         }
     }
 
@@ -28,17 +28,25 @@ public enum DecisionRenderer {
         }
     }
 
-    /// A "File.swift:12 Owner.member" string, re-anonymized component by component.
+    /// A `"<full path>:<line> <Owner>.<member>"` string as `DecisionReport.describe` builds it,
+    /// re-rendered per identity: the human artifact shows the file's basename (the full path is
+    /// noise next to Xcode), the anonymized one hashes the SAME full path the legend keys on, so a
+    /// token here resolves through `Decisions-files.txt` and two files sharing a basename across
+    /// modules stay distinct.
     private static func target(_ t: String, _ identity: Identity) -> String {
-        guard identity == .anonymized else { return t }
-        // "<file>:<line> <Owner>.<member>"
         let parts = t.split(separator: " ", maxSplits: 1).map(String.init)
-        guard parts.count == 2 else { return Anon.of(t) }
-        let fileAndLine = parts[0].split(separator: ":").map(String.init)
-        let file = fileAndLine.first.map { Anon.of($0) } ?? "?"
-        let line = fileAndLine.count > 1 ? fileAndLine[1] : "?"
-        let qualified = parts[1].split(separator: ".").map { Anon.of(String($0)) }.joined(separator: ".")
-        return "\(file):\(line) \(qualified)"
+        guard parts.count == 2, let colon = parts[0].lastIndex(of: ":") else {
+            return identity == .anonymized ? Anon.of(t) : t
+        }
+        let path = String(parts[0][..<colon])
+        let line = String(parts[0][parts[0].index(after: colon)...])
+        switch identity {
+        case .real:
+            return "\(URL(fileURLWithPath: path).lastPathComponent):\(line) \(parts[1])"
+        case .anonymized:
+            let qualified = parts[1].split(separator: ".").map { Anon.forced(String($0)) }.joined(separator: ".")
+            return "\(Anon.of(path)):\(line) \(qualified)"
+        }
     }
 
     private static func pad(_ s: String, _ width: Int) -> String {
@@ -50,7 +58,10 @@ public enum DecisionRenderer {
     /// contains a real path itself.
     public static func fileLegend(_ report: DecisionReport) -> String {
         var lines = ["# file-hash legend for Decisions-anon.txt. CONTAINS REAL PATHS — local use only."]
-        for p in report.byFile.keys.sorted() {
+        // Every writable file, not just the ones with entries: a file with no declarations and no
+        // recorded use-sites can still be named by a layer-1 `first at` line, and a hash with no
+        // legend row is unresolvable.
+        for p in report.writableFilePaths.sorted() {
             lines.append("\(Anon.of(p)) \(p)")
         }
         return lines.joined(separator: "\n") + "\n"
@@ -86,7 +97,7 @@ public enum DecisionRenderer {
         var token = ""
         func flush() {
             guard !token.isEmpty else { return }
-            out += projectNames.contains(token) ? Anon.of(token) : token
+            out += projectNames.contains(token) ? Anon.forced(token) : token
             token = ""
         }
         for c in s {
@@ -119,27 +130,34 @@ public enum DecisionRenderer {
         let all = report.byFile.values.flatMap { $0 }
         let decls = all.filter { $0.role == "declaration" }
         let uses = all.filter { $0.role == "use-site" }
-        let rewritten = uses.filter { $0.decision == "rewritten" }.count
+        // A use-site whose rename rollback undid still carries `decision == "rewritten"` (the edit
+        // WAS emitted) with `reason == "reverted"`. Counting it as rewritten would over-report the
+        // headline by exactly the population the report exists to make visible.
+        let rewritten = uses.filter { $0.decision == "rewritten" && $0.reason != "reverted" }.count
+        let undone = uses.filter { $0.decision == "rewritten" && $0.reason == "reverted" }.count
 
         var lines = ["=== SwiftProf decisions: summary ==="]
         lines.append("files \(report.byFile.count) · declarations \(decls.count) "
-                   + "· use-sites recorded \(uses.count) · rewritten \(rewritten)")
+                   + "· use-sites recorded \(uses.count) · rewritten \(rewritten)"
+                   + " · rewritten-then-reverted \(undone)")
         lines.append("")
 
         lines.append("--- RED BUILD RISK: original name survived, revert was blocked "
                    + "(\(rollback.blockedNames.count) names) ---")
-        for (name, hit) in rollback.blockedNames.sorted(by: { $0.value.occurrences > $1.value.occurrences }) {
+        for (name, hit) in rollback.blockedNames
+            .sorted(by: { ($0.value.occurrences, $1.key) > ($1.value.occurrences, $0.key) }) {
             let shields = (rollback.shieldReasons[name] ?? []).sorted().joined(separator: "+")
             lines.append("  \(pad(ident(name, identity), 24)) occ=\(hit.occurrences)  shield \(shields)")
-            lines.append("  \(String(repeating: " ", count: 24)) first at \(path(hit.filePath, identity))")
+            lines.append("  \(String(repeating: " ", count: 24)) first at \(path(hit.filePath, identity)):\(hit.line)")
         }
         lines.append("")
 
         lines.append("--- COVERAGE LOSS: rename reverted because a use-site survived "
                    + "(\(rollback.revertedNames.count) names) ---")
-        for (name, hit) in rollback.revertedNames.sorted(by: { $0.value.occurrences > $1.value.occurrences }) {
+        for (name, hit) in rollback.revertedNames
+            .sorted(by: { ($0.value.occurrences, $1.key) > ($1.value.occurrences, $0.key) }) {
             lines.append("  \(pad(ident(name, identity), 24)) occ=\(hit.occurrences)")
-            lines.append("  \(String(repeating: " ", count: 24)) first at \(path(hit.filePath, identity))")
+            lines.append("  \(String(repeating: " ", count: 24)) first at \(path(hit.filePath, identity)):\(hit.line)")
         }
         lines.append("")
 
@@ -150,10 +168,10 @@ public enum DecisionRenderer {
             topName[u.reason, default: [:]][u.name, default: 0] += 1
         }
         lines.append("--- UNRESOLVED USE-SITES by cause ---")
-        for (cause, count) in byCause.sorted(by: { $0.value > $1.value }) {
+        for (cause, count) in byCause.sorted(by: { ($0.value, $1.key) > ($1.value, $0.key) }) {
             let gloss = UnresolvedCause(rawValue: cause)?.gloss ?? ""
             lines.append("  \(pad(String(count), 6)) \(pad(cause, 24)) \(gloss)")
-            let top = (topName[cause] ?? [:]).sorted { $0.value > $1.value }.prefix(3)
+            let top = (topName[cause] ?? [:]).sorted { ($0.value, $1.key) > ($1.value, $0.key) }.prefix(3)
                 .map { "\(ident($0.key, identity)) \($0.value)" }.joined(separator: " · ")
             if !top.isEmpty { lines.append("         top: \(top)") }
         }
@@ -250,7 +268,7 @@ public enum DecisionRenderer {
             return "candidate: " + target(String(d[r.upperBound...]), identity)
         }
         if let r = d.range(of: "receiver type: ") {
-            return "receiver type: " + Anon.of(String(d[r.upperBound...]))
+            return "receiver type: " + scrubFreeText(String(d[r.upperBound...]), projectNames)
         }
         return scrubFreeText(d, projectNames)
     }
