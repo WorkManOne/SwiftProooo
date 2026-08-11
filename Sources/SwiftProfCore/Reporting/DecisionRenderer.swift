@@ -56,127 +56,45 @@ public enum DecisionRenderer {
         return lines.joined(separator: "\n") + "\n"
     }
 
-    /// Hashes identifier-looking segments embedded in FREE-TEXT reason/detail sentences — the ones
-    /// the assembler built by string interpolation (a Protector/Planner/RollbackPass reason such as
-    /// `Codable stored key (Ticket)` or `original name 'badge' still appeared in rewritten output`) —
-    /// while leaving the surrounding prose intact. Every such string in the project embeds its real
-    /// identifier one of three ways: a `'quoted name'`, a `(Parenthesized name)`, or a bare `@Name`
-    /// attribute token sitting outside any delimiter (a `Protector` property-wrapper/objc reason,
-    /// e.g. `@Foo property wrapper (creates _x/$x synonyms)` — `@Foo` names a LOCAL client type and
-    /// is not inside quotes or parens at all). A delimited segment is only scrubbed when it "looks
-    /// like" an identifier — no whitespace — so static prose delimited the same way
-    /// (`(or skip-overloaded-callables)`, `(local, not a rename target)`) is left readable rather
-    /// than turned into a single unreadable hash. Bare `@Name` tokens are scrubbed through
-    /// `scrubBareAttributes`, which passes known Apple/Swift attribute names through unhashed.
+    /// Hashes every WORD of a FREE-TEXT reason/detail sentence that is a KNOWN PROJECT IDENTIFIER —
+    /// `report.projectNames`, the names declared by the writable modules. A token is a maximal run
+    /// of identifier characters (`[A-Za-z0-9_]`, plus non-ASCII letters/digits so a Unicode-spelled
+    /// Swift identifier is one token rather than several); everything between tokens is copied
+    /// verbatim, so the sentence reconstructs exactly.
+    ///
+    /// This replaces PARSING THE PROSE FOR DELIMITERS (`'quoted'` / `(parenthesized)` segments plus
+    /// an allowlisted bare `@Name`), which had to GUESS which substrings were identifiers and got it
+    /// wrong twice: `AmbiguityRollback` writes its case name in BACKTICKS as well as in quotes
+    /// (``…used at a shorthand `.shared` site``) and the backticked one shipped verbatim — a real
+    /// leak; and parity-based quote pairing desynchronizes on an apostrophe in ordinary prose
+    /// (`target 'Foo' doesn't match 'Bar'` scrubbed `Foo` and shipped `Bar`). Membership in a known
+    /// set is EXACT, so neither shape can recur and no new delimiter ever has to be taught. It also
+    /// subsumes the attribute allowlist: `@Wrapped` tokenizes to `Wrapped`, which IS a project name
+    /// and is hashed, while `@objc` tokenizes to `objc`, which is not and passes through.
+    ///
+    /// It OVER-hashes when a project identifier collides with an English word — a project declaring
+    /// a property named `key` turns "stored key" into "stored #ab12cd". That is the deliberate and
+    /// correct trade: over-hashing costs readability, under-hashing costs confidentiality, and this
+    /// artifact exists for confidentiality.
+    ///
     /// `.real` never calls this: `Decisions.txt` must stay byte-identical to today.
-    private static func scrubFreeText(_ s: String) -> String {
-        var out = ""
-        var rest = Substring(s)
-        while true {
-            let quoteIdx = rest.firstIndex(of: "'")
-            let parenIdx = rest.firstIndex(of: "(")
-            let openIdx: Substring.Index
-            switch (quoteIdx, parenIdx) {
-            case (nil, nil):
-                out += scrubBareAttributes(rest)
-                return out
-            case (let q?, nil):
-                openIdx = q
-            case (nil, let p?):
-                openIdx = p
-            case (let q?, let p?):
-                openIdx = min(q, p)
-            }
-            let open = rest[openIdx]
-            let close: Character = open == "'" ? "'" : ")"
-            out += scrubBareAttributes(rest[rest.startIndex..<openIdx])
-            let afterOpen = rest.index(after: openIdx)
-            guard let closeIdx = rest[afterOpen...].firstIndex(of: close) else {
-                // No matching closing delimiter — the rest is not a well-formed quote/paren pair;
-                // copy it verbatim (bare `@Name` tokens in it still get scrubbed) rather than guess.
-                out += scrubBareAttributes(rest[openIdx...])
-                return out
-            }
-            let inner = rest[afterOpen..<closeIdx]
-            out.append(open)
-            out += scrubIdentifierSegment(String(inner))
-            out.append(close)
-            rest = rest[rest.index(after: closeIdx)...]
+    private static func scrubFreeText(_ s: String, _ projectNames: Set<String>) -> String {
+        func isIdentifierChar(_ c: Character) -> Bool {
+            c == "_" || c.isLetter || c.isNumber
         }
-    }
-
-    /// Attribute names that are Apple/Swift vocabulary, not project identifiers — safe to print
-    /// unhashed because they carry no client information (they're the same finite set on every
-    /// project). Anything NOT in this list is a project type name until proven otherwise — e.g. a
-    /// LOCAL `@propertyWrapper`/`@resultBuilder` type the client declared — so the default is to
-    /// hash it, never to pass it through.
-    private static let knownAttributeNames: Set<String> = [
-        "objc", "objcMembers", "IBOutlet", "IBAction", "IBInspectable", "IBDesignable", "IBSegueAction",
-        "NSManaged", "State", "Binding", "Published", "ObservedObject", "StateObject", "EnvironmentObject",
-        "Environment", "AppStorage", "SceneStorage", "FocusState", "GestureState", "Namespace",
-        "escaping", "autoclosure", "main", "available", "discardableResult", "propertyWrapper", "resultBuilder",
-    ]
-
-    /// Hashes the name half of an `@Name` attribute token (the `@` is kept so the sentence stays
-    /// readable), passing known Apple/Swift attribute names through via `knownAttributeNames`.
-    private static func scrubAttribute(_ name: String) -> String {
-        knownAttributeNames.contains(name) ? "@" + name : "@" + Anon.of(name)
-    }
-
-    /// Hashes every bare `@Name` attribute token in `s` — one that sits OUTSIDE any quote/paren
-    /// delimiter, so `scrubIdentifierSegment` (the delimited-segment scrubber) never sees it —
-    /// while copying everything else verbatim. The counterpart to `scrubIdentifierSegment`'s own
-    /// `@`-prefixed-token branch, which handles the same shape when it DOES land inside a
-    /// delimiter; both route through `scrubAttribute` so the allowlist can't drift between them.
-    private static func scrubBareAttributes<S: StringProtocol>(_ s: S) -> String where S.SubSequence == Substring {
-        var out = ""
-        var chars = Substring(s)
-        while let atIdx = chars.firstIndex(of: "@") {
-            out += chars[chars.startIndex..<atIdx]
-            var idx = chars.index(after: atIdx)
-            var name = ""
-            while idx < chars.endIndex, chars[idx].isLetter || chars[idx].isNumber || chars[idx] == "_" {
-                name.append(chars[idx])
-                idx = chars.index(after: idx)
-            }
-            if name.isEmpty {
-                // A bare "@" with no identifier following it — copy verbatim, nothing to hash.
-                out.append("@")
-                chars = chars[chars.index(after: atIdx)...]
-            } else {
-                out += scrubAttribute(name)
-                chars = chars[idx...]
-            }
-        }
-        out += chars
-        return out
-    }
-
-    /// Hashes `inner` component-by-component (split on `.`/`,`, the two separators real reason
-    /// strings use for qualified/multi names) so a leaf name still correlates with its hash
-    /// elsewhere in the report. Left untouched when it contains whitespace — that is prose, not an
-    /// identifier, and hashing it would just produce noise (e.g. `(or skip-overloaded-callables)`).
-    private static func scrubIdentifierSegment(_ inner: String) -> String {
-        guard !inner.isEmpty, !inner.contains(where: { $0.isWhitespace }) else { return inner }
         var out = ""
         var token = ""
         func flush() {
             guard !token.isEmpty else { return }
-            if token.hasPrefix("@") {
-                out += scrubAttribute(String(token.dropFirst()))
-            } else if token.hasPrefix("`") && token.hasSuffix("`") && token.count >= 2 {
-                out += "`" + Anon.of(String(token.dropFirst().dropLast())) + "`"
-            } else {
-                out += Anon.of(token)
-            }
+            out += projectNames.contains(token) ? Anon.of(token) : token
             token = ""
         }
-        for c in inner {
-            if c == "." || c == "," {
+        for c in s {
+            if isIdentifierChar(c) {
+                token.append(c)
+            } else {
                 flush()
                 out.append(c)
-            } else {
-                token.append(c)
             }
         }
         flush()
@@ -264,7 +182,8 @@ public enum DecisionRenderer {
             for e in report.byFile[filePath]! {
                 if !lastRole.isEmpty && e.role != lastRole { lines.append("") }
                 lastRole = e.role
-                lines.append(contentsOf: entryLines(e, identity: identity))
+                lines.append(contentsOf: entryLines(e, identity: identity,
+                                                    projectNames: report.projectNames))
             }
             lines.append("")
         }
@@ -275,7 +194,8 @@ public enum DecisionRenderer {
     /// on the head line only, so a `grep -v '^v '` leaves no orphan detail behind — detail lines are
     /// indented past column 0 and are dropped with their head by any line-oriented filter that keys
     /// on the head. Detail lines therefore also carry the prefix.
-    private static func entryLines(_ e: DecisionReport.Entry, identity: Identity) -> [String] {
+    private static func entryLines(_ e: DecisionReport.Entry, identity: Identity,
+                                   projectNames: Set<String>) -> [String] {
         let lowSignal = e.decision == "kept" && e.reason == UnresolvedCause.candidateHasNoObf.rawValue
         let prefix = lowSignal ? "v " : "  "
         let role = e.role == "declaration" ? "decl" : "use "
@@ -284,14 +204,17 @@ public enum DecisionRenderer {
             + role + " "
             + pad(e.kind, 11) + " "
             + pad(ident(e.name, identity), 15) + " "
-            + verdict(e, identity: identity)
+            + verdict(e, identity: identity, projectNames: projectNames)
         var out = [head]
         let indent = prefix + String(repeating: " ", count: 8 + 5 + 12 + 16)
-        for d in e.detail ?? [] { out.append(indent + detailLine(d, identity: identity)) }
+        for d in e.detail ?? [] {
+            out.append(indent + detailLine(d, identity: identity, projectNames: projectNames))
+        }
         return out
     }
 
-    private static func verdict(_ e: DecisionReport.Entry, identity: Identity) -> String {
+    private static func verdict(_ e: DecisionReport.Entry, identity: Identity,
+                                projectNames: Set<String>) -> String {
         switch (e.role, e.decision) {
         case ("declaration", "obfuscated"):
             // `e.reason` here is the obf token itself (e.g. "T0"), never the original name — safe
@@ -301,7 +224,8 @@ public enum DecisionRenderer {
             // protected/skipped/reverted: `e.reason` is a free-text sentence the assembler built by
             // interpolating a real name (a Codable key, a protocol name, the surviving original in
             // a rollback revert) — must be scrubbed on the anonymized path.
-            let reason = identity == .anonymized ? scrubFreeText(e.reason) : e.reason
+            let reason = identity == .anonymized
+                ? scrubFreeText(e.reason, projectNames) : e.reason
             return "\(e.decision.uppercased()): \(reason)"
         case (_, "rewritten") where e.reason == "reverted":
             return "→ REVERTED   resolved: \(target(e.target ?? "?", identity))"
@@ -317,8 +241,10 @@ public enum DecisionRenderer {
     /// (`candidate: ` renders a "File:line Owner.member" target, `receiver type: ` is a bare type
     /// name); everything else — including `target is PROTECTED/SKIPPED/REVERTED: <reason>`, whose
     /// `<reason>` is the same free text `verdict` scrubs for declarations — falls through to the
-    /// same identifier scrub so a name embedded in quotes or parens cannot leak through this path.
-    private static func detailLine(_ d: String, identity: Identity) -> String {
+    /// same identifier scrub so a name embedded anywhere in that free text cannot leak through this
+    /// path.
+    private static func detailLine(_ d: String, identity: Identity,
+                                   projectNames: Set<String>) -> String {
         guard identity == .anonymized else { return d }
         if let r = d.range(of: "candidate: ") {
             return "candidate: " + target(String(d[r.upperBound...]), identity)
@@ -326,6 +252,6 @@ public enum DecisionRenderer {
         if let r = d.range(of: "receiver type: ") {
             return "receiver type: " + Anon.of(String(d[r.upperBound...]))
         }
-        return scrubFreeText(d)
+        return scrubFreeText(d, projectNames)
     }
 }

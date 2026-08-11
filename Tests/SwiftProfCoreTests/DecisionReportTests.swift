@@ -473,12 +473,12 @@ extension DecisionReportTests {
 
 extension DecisionReportTests {
 
-    /// The residual left by Task 8: a bare `@Name` attribute token sitting OUTSIDE any quote/paren
-    /// delimiter is not caught by the delimited-segment scrub. `Protector.runPropertyWrapperProtection`
-    /// builds exactly this shape for a CUSTOM local `@propertyWrapper` type: `"@Wrapped property
-    /// wrapper (creates _x/$x synonyms)"` — `Wrapped` is a project type name declared in the
-    /// client's own module, and `@Wrapped` is bare text before the parenthesized (whitespace-only,
-    /// already-safe) prose.
+    /// A bare `@Name` attribute token sitting outside any delimiter.
+    /// `Protector.runPropertyWrapperProtection` builds exactly this shape for a CUSTOM local
+    /// `@propertyWrapper` type: `"@Wrapped property wrapper (creates _x/$x synonyms)"` — `Wrapped`
+    /// is a project type name declared in the client's own module. Under the project-name scrub the
+    /// `@` is a separator, so the token IS `Wrapped`, it IS in `report.projectNames`, and it hashes;
+    /// nothing about the `@` has to be special-cased.
     func testAnonTwin_scrubsABareAtNameAttributeToken_customPropertyWrapper() throws {
         let (_, outputDir) = try runExplain("""
         @propertyWrapper
@@ -504,13 +504,18 @@ extension DecisionReportTests {
                       "expected the bare @Name token to be hashed but still keep its '@':\n\(anon)")
     }
 
-    /// Allowlist passthrough: `class Thing: NSObject { var value: Int = 0 }` taints `Thing` via
-    /// `objcRootClassNames` (default `--objc-protection strict`), which the Protector reports as the
-    /// STATIC reason string `"@objc / transitive objc-class"` for the type and
-    /// `"@objc class member (transitive)"` for its members — both a bare `@objc` token with no
-    /// project data behind it. `objc` is Apple/Swift vocabulary (`knownAttributeNames`), so it must
-    /// print unhashed on the anonymized path too, exactly as it does on `.real`.
-    func testAnonTwin_bareAtNameAllowlist_objcPassesThroughUnhashed() throws {
+    /// Non-project vocabulary passes through: `class Thing: NSObject { var value: Int = 0 }` taints
+    /// `Thing` via `objcRootClassNames` (default `--objc-protection strict`), which the Protector
+    /// reports as the STATIC reason strings `"@objc / transitive objc-class"` for the type and
+    /// `"@objc class member (transitive)"` for its members — no project data in either.
+    ///
+    /// This test used to assert the ALLOWLIST (`knownAttributeNames`) kept `@objc` literal; that
+    /// list is gone, and the guarantee it protected is now supplied by non-membership: `objc`,
+    /// `class`, `member` and `transitive` are not names any writable module declares, so they are
+    /// copied verbatim. The assertion is therefore STRONGER than before — the whole member reason
+    /// now survives byte-for-byte, where the old delimited scrub hashed the `(transitive)`
+    /// parenthetical just for being a whitespace-free word inside parens.
+    func testAnonTwin_nonProjectVocabulary_passesThroughUnhashed() throws {
         let (_, outputDir) = try runExplain("""
         import Foundation
         class Thing: NSObject {
@@ -524,22 +529,92 @@ extension DecisionReportTests {
 
         let anon = try String(contentsOf: outputDir.appendingPathComponent("Decisions-anon.txt"),
                               encoding: .utf8)
-        // The type-level reason has no parens at all ("@objc / transitive objc-class"), so it is
-        // pure bare-token prose end to end and must survive byte-for-byte.
         XCTAssertTrue(anon.contains("@objc / transitive objc-class"),
-                      "an allowlisted Apple attribute must pass through unhashed on the anon path:\n\(anon)")
-        // The member-level reason is "@objc class member (transitive)": the bare "@objc" token is
-        // the allowlist case under test; the single-word parenthetical "(transitive)" that follows
-        // goes through the PRE-EXISTING delimited-segment scrubber (`scrubIdentifierSegment`, not
-        // touched by this fix), which hashes any whitespace-free parenthesized word regardless of
-        // whether it is a real identifier — a separate, already-conservative-not-leaky quirk this
-        // task does not touch. Assert only the allowlisted token itself stays literal.
-        XCTAssertTrue(anon.contains("@objc class member ("),
-                      "the allowlisted @objc token must pass through unhashed here too:\n\(anon)")
-        // And the type/member NAMES around it must still be hashed — the allowlist covers the
-        // attribute vocabulary only, never project identifiers.
+                      "Apple/Swift vocabulary declares no project symbol, so it must pass through "
+                      + "unhashed on the anon path:\n\(anon)")
+        XCTAssertTrue(anon.contains("@objc class member (transitive)"),
+                      "the whole reason is non-project vocabulary and must survive byte-for-byte:\n\(anon)")
+        // And the type/member NAMES around it must still be hashed — passthrough is by
+        // non-membership in `projectNames`, never a blanket exemption for prose.
         if let leaked = anon.split(separator: "\n").first(where: { $0.contains("Thing") || $0.contains(" value ") }) {
             XCTFail("real identifier survived into the anonymized report on this line:\n\(leaked)")
+        }
+    }
+}
+
+extension DecisionReportTests {
+
+    /// The `[A-Za-z0-9_]` words of `text` — the same token class the anonymized scrub uses.
+    /// Asserting on WORDS rather than substrings is what makes "the name did not survive" provable:
+    /// an unrelated hash token that happens to contain those letters cannot mask a real leak.
+    func words(_ text: String) -> Set<String> {
+        var out: Set<String> = []
+        var token = ""
+        for c in text {
+            if c == "_" || c.isLetter || c.isNumber {
+                token.append(c)
+            } else if !token.isEmpty {
+                out.insert(token); token = ""
+            }
+        }
+        if !token.isEmpty { out.insert(token) }
+        return out
+    }
+
+    /// The confirmed leak the delimiter-parsing scrub shipped. `AmbiguityRollback` builds
+    /// `"ambiguous enum case 'shared' — same name in >1 enum, used at a shorthand `.shared` site"`:
+    /// the old scrub hashed the QUOTED occurrence and copied the BACKTICKED one verbatim, so a real
+    /// client enum-case name reached `Decisions-anon.txt`. Hashing by project-name membership has
+    /// no notion of delimiters, so both occurrences are the same token and get the same treatment.
+    func testAnonTwin_backtickedIdentifierInAFreeTextReason_isHashed() throws {
+        let (_, outputDir) = try runExplain("""
+        enum A { case shared }
+        enum B { case shared }
+        func use() {
+            let b: B = .shared
+            _ = b
+        }
+        """)
+        let real = try decisionsText(outputDir)
+        XCTAssertTrue(real.contains("shared"),
+                      "sanity check: the real report must name the case:\n\(real)")
+
+        let anon = try String(contentsOf: outputDir.appendingPathComponent("Decisions-anon.txt"),
+                              encoding: .utf8)
+        XCTAssertFalse(words(anon).contains("shared"),
+                       "the real name must not survive as a word anywhere in the anon twin:\n\(anon)")
+        XCTAssertTrue(anon.contains(Anon.of("shared")),
+                      "expected the hashed token to stand in for it:\n\(anon)")
+    }
+
+    /// The same fixture, asserted per LINE: the reason string names the identifier TWICE (once
+    /// quoted, once backticked), so the anonymized line must carry the hash twice and the real name
+    /// zero times. A scrub that catches only the first occurrence passes the file-wide test above
+    /// (the other occurrences are hashed elsewhere in the report) and fails this one.
+    func testAnonTwin_freeTextReason_everyOccurrenceOfTheNameIsHashed() throws {
+        let (_, outputDir) = try runExplain("""
+        enum A { case shared }
+        enum B { case shared }
+        func use() {
+            let b: B = .shared
+            _ = b
+        }
+        """)
+        let anon = try String(contentsOf: outputDir.appendingPathComponent("Decisions-anon.txt"),
+                              encoding: .utf8)
+        let hash = Anon.of("shared")
+        let reasonLines = anon.split(separator: "\n").map(String.init)
+            .filter { $0.contains("ambiguous enum case") }
+        XCTAssertFalse(reasonLines.isEmpty,
+                       "expected the AmbiguityRollback revert reason to be rendered:\n\(anon)")
+        for line in reasonLines {
+            // The reason only — a declaration line also carries the hashed name column, which is
+            // `ident`'s job, not the free-text scrub's.
+            let reason = String(line[line.range(of: "ambiguous enum case")!.lowerBound...])
+            XCTAssertEqual(reason.components(separatedBy: hash).count - 1, 2,
+                           "both the quoted and the backticked occurrence must be hashed: \(reason)")
+            XCTAssertFalse(words(reason).contains("shared"),
+                           "the real name survived on this line: \(reason)")
         }
     }
 }

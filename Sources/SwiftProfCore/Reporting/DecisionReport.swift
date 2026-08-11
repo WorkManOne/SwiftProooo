@@ -35,6 +35,11 @@ public struct DecisionReport {
 
     public let byFile: [String: [Entry]]
 
+    /// Every identifier declared by a writable module. The anonymized rendering hashes any word in a
+    /// free-text reason that appears here: exact by construction, unlike parsing prose for
+    /// delimiters, which shipped a real leak (a backticked `.name` beside a quoted one).
+    public let projectNames: Set<String>
+
     public init(table: SymbolTable, map: RenameMap, protector: Protector,
                 plannerSkip: [Int: String], useSites: [UseSiteRecord],
                 rollback: RollbackResult, files: [SourceFile]) {
@@ -53,6 +58,12 @@ public struct DecisionReport {
 
         var symbolById: [Int: Symbol] = [:]
         for sym in table.symbols { symbolById[sym.id] = sym }
+
+        // Same set `ResolutionPass` builds to decide which use-sites are worth recording: the names
+        // the client's own modules declare. The anonymized renderer scrubs free text against it.
+        var names: Set<String> = []
+        for sym in table.symbols where sym.module.writable { names.insert(sym.name) }
+        self.projectNames = names
 
         // 1. Declarations.
         for sym in table.symbols where sym.module.writable {
