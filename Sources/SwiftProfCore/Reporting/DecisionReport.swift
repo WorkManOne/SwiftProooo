@@ -14,6 +14,70 @@ import SwiftSyntax
 /// Use-site outcomes are read against the FINAL `RenameMap`: `RollbackPass` and the A6 validator run
 /// after `ResolutionPass`, so a rewrite recorded during resolution may have been undone since.
 public struct DecisionReport {
+
+    /// A declaration named by a use-site entry: the one it RESOLVED to, or one of the candidates the
+    /// resolver could not choose between. Decomposed, not preformatted.
+    ///
+    /// It used to be the string `"<full path>:<line> <Owner>.<member>"`, which `DecisionRenderer`
+    /// took apart again to render it — the human artifact wants the basename, the anonymized one
+    /// wants the full path hashed and each component of the qualified name hashed separately. That
+    /// re-parse split on the FIRST space, so a project directory containing one
+    /// (`/Users/x/My Project/Foo.swift`) left a colon-less head, failed the guard and fell back to
+    /// hashing the whole string as ONE token: safe, but the anonymized reader lost the line, the
+    /// member name and any way to resolve the file through `Decisions-files.txt`. Re-parsing a string
+    /// this same module had just formatted was the defect; the PARTS are what the renderer needs.
+    public struct Target: Codable {
+        /// Absolute path of the file the declaration lives in. FULL, never the basename: the
+        /// anonymized legend keys on full paths, so a basename here would produce a token
+        /// `Decisions-files.txt` cannot resolve, and would collapse two files sharing a basename
+        /// across modules onto one token. The renderer shortens it for the human rendering.
+        public let path: String
+        /// 1-based line in that file's ANALYSIS text (`SourceFile.analysisLocation`).
+        public let line: Int
+        /// `Owner.member`, or a bare `member` for a top-level declaration.
+        public let qualified: String
+    }
+
+    /// One line rendered under an entry. The two shapes that carry STRUCTURE are cases of their own,
+    /// so the renderer never has to recover them from prose — it used to find them by searching the
+    /// line for a `"candidate: "` / `"receiver type: "` substring, which is both a re-parse of its
+    /// own output and a rule any free text containing those words could trip.
+    ///
+    /// `.text` is the assembler's free prose, built by interpolating real names (a Codable key, a
+    /// protocol name, the surviving original in a rollback revert), and is the only shape the
+    /// anonymized rendering has to scrub word by word.
+    public enum Detail: Codable {
+        case text(String)
+        case candidate(Target)
+        case receiverType(String)
+
+        private enum CodingKeys: String, CodingKey { case text, candidate, receiverType }
+
+        public init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            if let s = try c.decodeIfPresent(String.self, forKey: .text) {
+                self = .text(s)
+            } else if let t = try c.decodeIfPresent(Target.self, forKey: .candidate) {
+                self = .candidate(t)
+            } else if let s = try c.decodeIfPresent(String.self, forKey: .receiverType) {
+                self = .receiverType(s)
+            } else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .text, in: c,
+                    debugDescription: "a detail carries exactly one of text/candidate/receiverType")
+            }
+        }
+
+        public func encode(to encoder: Encoder) throws {
+            var c = encoder.container(keyedBy: CodingKeys.self)
+            switch self {
+            case .text(let s):         try c.encode(s, forKey: .text)
+            case .candidate(let t):    try c.encode(t, forKey: .candidate)
+            case .receiverType(let s): try c.encode(s, forKey: .receiverType)
+            }
+        }
+    }
+
     public struct Entry: Codable {
         public let line: Int
         public let column: Int
@@ -27,10 +91,10 @@ public struct DecisionReport {
         /// The obfuscated name, the human reason, or (for a rewritten use-site whose target was
         /// later reverted) the literal "reverted".
         public let reason: String
-        /// use-site only: "File.swift:12 Owner.member", the declaration the resolver chose.
-        public let target: String?
+        /// use-site only: the declaration the resolver chose.
+        public let target: Target?
         /// Extra lines rendered under the entry (cause gloss, effect, candidate list).
-        public let detail: [String]?
+        public let detail: [Detail]?
     }
 
     /// Why one shielded survivor (a name in `RollbackResult.blockedNames`) is NOT reported at full
@@ -67,9 +131,17 @@ public struct DecisionReport {
     /// delimiters, which shipped a real leak (a backticked `.name` beside a quoted one).
     public let projectNames: Set<String>
 
-    /// Absolute paths of every writable file in the run. The anonymized legend keys on these, so it
-    /// covers files the report itself has no entry for.
-    public let writableFilePaths: [String]
+    /// Every absolute path the anonymized rendering can turn into a hash, so `Decisions-files.txt`
+    /// has a row for each. Two sources, and the second is NOT a subset of the first:
+    ///
+    /// - every WRITABLE file in the run, entries or not — a layer-1 `first at <path>:<line>` line
+    ///   can name a file whose per-file trace is empty;
+    /// - every file a `Target` points INTO. `describe` places a declaration wherever it lives, and a
+    ///   use-site in a writable file routinely resolves into a READ-ONLY module (`--readonly`,
+    ///   `--auto-spm` SPM checkouts). Iterating the writable files alone left such a target rendering
+    ///   as `resolved: <hash>:12 <hash>.<hash>` with no legend row for that first hash — no leak, but
+    ///   an unresolvable token, which is the one thing the legend exists to prevent.
+    public let legendFilePaths: [String]
 
     public init(table: SymbolTable, map: RenameMap, protector: Protector,
                 plannerSkip: [Int: String], useSites: [UseSiteRecord],
@@ -82,13 +154,26 @@ public struct DecisionReport {
         // offset converted against the output drifts down the file and clamps at EOF, which is how
         // every entry near the end of a file collapsed onto one bogus line.
         var fileByPath: [String: SourceFile] = [:]
-        var writablePaths: [String] = []
-        for f in files where f.module.writable {
-            // Keyed by path, so two modules rooted at the same directory contribute one legend row,
-            // exactly as the dictionary this replaced did.
-            if fileByPath.updateValue(f, forKey: f.url.path) == nil { writablePaths.append(f.url.path) }
+        var legendPaths: [String] = []
+        var seenLegendPath: Set<String> = []
+        // Deduped in insertion order: two modules rooted at the same directory contribute one legend
+        // row, exactly as the dictionary this replaced did, and a target pointing at an
+        // already-listed file adds nothing.
+        func noteLegendPath(_ p: String) {
+            if seenLegendPath.insert(p).inserted { legendPaths.append(p) }
         }
-        self.writableFilePaths = writablePaths
+        /// `describe`, plus the side effect that keeps the legend complete. Every `Target` this
+        /// report builds goes through here, so a target can never name a file the legend omits —
+        /// the alternative, listing the writable files and hoping every target lands in one, is
+        /// exactly what left read-only declarations unresolvable.
+        func describeTarget(_ sym: Symbol) -> Target {
+            let t = Self.describe(sym)
+            noteLegendPath(t.path)
+            return t
+        }
+        for f in files where f.module.writable {
+            if fileByPath.updateValue(f, forKey: f.url.path) == nil { noteLegendPath(f.url.path) }
+        }
 
         var symbolById: [Int: Symbol] = [:]
         for sym in table.symbols { symbolById[sym.id] = sym }
@@ -169,8 +254,8 @@ public struct DecisionReport {
             let kind: String
             let decision: String
             let reason: String
-            var target: String? = nil
-            var detail: [String] = []
+            var target: Target? = nil
+            var detail: [Detail] = []
 
             switch rec.outcome {
             case .rewritten(let id):
@@ -178,22 +263,22 @@ public struct DecisionReport {
                 // validator run after `ResolutionPass` and may have undone it since.
                 let sym = symbolById[id]
                 kind = sym?.kind.rawValue ?? "unknown"
-                target = sym.map { Self.describe($0) }
+                target = sym.map { describeTarget($0) }
                 if let sym, let obf = map.obf(for: sym) {
                     decision = "rewritten"; reason = obf
                 } else if let sym, let r = map.revertReason(sym.id) {
                     decision = "rewritten"; reason = "reverted"
-                    detail.append("resolution was correct; the rename was undone afterwards")
-                    detail.append("reverted: \(r)")
+                    detail.append(.text("resolution was correct; the rename was undone afterwards"))
+                    detail.append(.text("reverted: \(r)"))
                 } else if let sym, let r = protector.reason(for: sym) {
                     decision = "kept"; reason = UnresolvedCause.candidateHasNoObf.rawValue
-                    detail.append("target is PROTECTED: \(r)")
+                    detail.append(.text("target is PROTECTED: \(r)"))
                 } else if let sym, let r = plannerSkip[sym.id] {
                     decision = "kept"; reason = UnresolvedCause.candidateHasNoObf.rawValue
-                    detail.append("target is SKIPPED: \(r)")
+                    detail.append(.text("target is SKIPPED: \(r)"))
                 } else {
                     decision = "kept"; reason = UnresolvedCause.candidateHasNoObf.rawValue
-                    detail.append("target is not renamed (no specific reason recorded)")
+                    detail.append(.text("target is not renamed (no specific reason recorded)"))
                 }
 
             case .resolvedNotRenamed(let id):
@@ -203,32 +288,32 @@ public struct DecisionReport {
                 // Never "rewritten": nothing at this position was ever written, let alone undone.
                 let sym = symbolById[id]
                 kind = sym?.kind.rawValue ?? "unknown"
-                target = sym.map { Self.describe($0) }
+                target = sym.map { describeTarget($0) }
                 decision = "kept"
                 reason = UnresolvedCause.candidateHasNoObf.rawValue
                 if let sym, let r = protector.reason(for: sym) {
-                    detail.append("target is PROTECTED: \(r)")
+                    detail.append(.text("target is PROTECTED: \(r)"))
                 } else if let sym, let r = plannerSkip[sym.id] {
-                    detail.append("target is SKIPPED: \(r)")
+                    detail.append(.text("target is SKIPPED: \(r)"))
                 } else if let sym, let r = map.revertReason(sym.id) {
-                    detail.append("target is REVERTED: \(r)")
+                    detail.append(.text("target is REVERTED: \(r)"))
                 } else {
-                    detail.append("target is not renamed (no specific reason recorded)")
+                    detail.append(.text("target is not renamed (no specific reason recorded)"))
                 }
 
             case .kept(let cause, let receiver, let candidateIds):
                 kind = "unknown"
                 decision = "kept"
                 reason = cause.rawValue
-                detail.append(cause.gloss)
-                if let receiver { detail.append("receiver type: \(receiver)") }
+                detail.append(.text(cause.gloss))
+                if let receiver { detail.append(.receiverType(receiver)) }
                 for id in candidateIds {
                     guard let c = symbolById[id] else { continue }
-                    detail.append("candidate: " + Self.describe(c))
+                    detail.append(.candidate(describeTarget(c)))
                 }
                 if let effect = Self.effect(for: rec.name, rollback: rollback,
                                             tier: tiers[rec.name]) {
-                    detail.append(effect)
+                    detail.append(.text(effect))
                 }
             }
 
@@ -247,23 +332,23 @@ public struct DecisionReport {
             }
         }
         self.byFile = grouped
+        self.legendFilePaths = legendPaths
     }
 
-    /// "File.swift:12 Owner.member", or "File.swift:12 member" for a top-level declaration.
+    /// Where a symbol is declared, as PARTS. Never a preformatted string — see `Target`.
     ///
     /// Takes no converter: the symbol's own file is the only thing that can place its `declOffset`,
     /// and it does so against the text that offset came from. A candidate can live in a READ-ONLY
     /// module, which is never rewritten — `analysisLocation` covers both without a second path,
     /// and keeps doing so when read-only SPM modules become writable.
-    static func describe(_ sym: Symbol) -> String {
+    ///
+    /// Callers inside the initializer go through its local `describeTarget`, which also records the
+    /// path for `legendFilePaths`; this is the plain half, kept separate so it stays testable.
+    static func describe(_ sym: Symbol) -> Target {
         let loc = sym.file.analysisLocation(atUTF8Offset: sym.declOffset)
         let owner = sym.scope?.owner?.name
-        let qualified = owner.map { "\($0).\(sym.name)" } ?? sym.name
-        // FULL path, not the basename: `DecisionRenderer.target` hashes this value on the
-        // anonymized path and the legend keys on full paths, so a basename here would produce a
-        // token that `Decisions-files.txt` cannot resolve — and would collapse two files sharing a
-        // basename across modules onto one token. The renderer shortens it for the human rendering.
-        return "\(sym.file.url.path):\(loc.line) \(qualified)"
+        return Target(path: sym.file.url.path, line: loc.line,
+                      qualified: owner.map { "\($0).\(sym.name)" } ?? sym.name)
     }
 
     /// What a missed use-site cost, when the rollback pass has an opinion about the name.

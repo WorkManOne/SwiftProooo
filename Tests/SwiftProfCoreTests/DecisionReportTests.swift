@@ -190,9 +190,12 @@ extension DecisionReportTests {
         XCTAssertNotNil(use, "roles present: \(Set(all.map(\.role)))")
         XCTAssertEqual(use?.decision, "rewritten")
         // The JSON carries the FULL path (the anonymized renderer hashes it and the legend keys on
-        // it); the human rendering shortens it. The owner-qualified tail is the load-bearing part.
-        XCTAssertTrue(use?.target?.hasSuffix("Sample.swift:1 Card.badge") == true,
-                      "target must name the owner: \(String(describing: use?.target))")
+        // it); the human rendering shortens it. The owner-qualified name is the load-bearing part.
+        XCTAssertEqual(use?.target?.qualified, "Card.badge",
+                       "target must name the owner: \(String(describing: use?.target))")
+        XCTAssertEqual(use?.target?.line, 1)
+        XCTAssertTrue(use?.target?.path.hasSuffix("Sample.swift") == true,
+                      "target must carry the full path: \(String(describing: use?.target))")
         XCTAssertTrue(use?.line ?? 0 > 0)
     }
 
@@ -246,8 +249,12 @@ extension DecisionReportTests {
         let use = all.first { $0.role == "use-site" && $0.name == "shared" }
         XCTAssertEqual(use?.decision, "kept",
                        "no edit was ever emitted here, so this must never read as rewritten: \(String(describing: use))")
-        XCTAssertTrue(use?.detail?.contains { $0.contains("REVERTED") } ?? false,
-                      "detail should name the target as reverted: \(String(describing: use?.detail))")
+        let prose = (use?.detail ?? []).compactMap { d -> String? in
+            if case .text(let s) = d { return s }
+            return nil
+        }
+        XCTAssertTrue(prose.contains { $0.contains("REVERTED") },
+                      "detail should name the target as reverted: \(prose)")
     }
 
     /// The same position must produce exactly ONE use-site record, not two contradicting ones (the
@@ -804,6 +811,138 @@ extension DecisionReportTests {
                          "hash token '\(token)' from legend must appear in Decisions-anon.txt")
         }
     }
+
+    /// The path-hash token of every `resolved:` / `candidate: ` line in an anonymized report — the
+    /// tokens a reader has to look up in `Decisions-files.txt` to place a declaration. Reading them
+    /// out of the rendered text (rather than recomputing them from a path the test already knows) is
+    /// what makes these assertions about the artifact a client actually receives.
+    static func anonTargetPathTokens(_ anon: String) -> [String] {
+        anon.split(separator: "\n").compactMap { line -> String? in
+            let marker = line.range(of: "resolved: ") ?? line.range(of: "candidate: ")
+            guard let marker else { return nil }
+            let tail = line[marker.upperBound...]
+            guard let colon = tail.firstIndex(of: ":") else { return nil }
+            return String(tail[..<colon])
+        }
+    }
+
+    /// A project directory whose name contains a SPACE — `/Users/x/My Project/Foo.swift`, which is
+    /// an ordinary shape on a real Mac and appears nowhere in the fixtures.
+    ///
+    /// The renderer used to recover a target's parts by splitting the `"<full path>:<line>
+    /// Owner.member"` string the report had just assembled, on its FIRST space. With a space in the
+    /// path the head is `/Users/x/My`, which holds no colon, the guard fires, and the whole string
+    /// is hashed as ONE token. That fails SAFE — nothing leaks — and the human artifact loses only
+    /// its basename shortening, but the anonymized reader loses the line, the member name, and every
+    /// route from the token back to the file through `Decisions-files.txt`.
+    func testAnonTarget_projectPathContainingASpace_stillResolvesThroughTheLegend() throws {
+        // Both components carry a space, so neither a leading nor a trailing split can dodge it.
+        let tempRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SwiftProf Report \(UUID().uuidString)")
+        let moduleRoot = tempRoot.appendingPathComponent("My Project")
+        try FileManager.default.createDirectory(at: moduleRoot, withIntermediateDirectories: true)
+        try """
+        struct Card { var badge: Int = 0 }
+        func read(_ c: Card) -> Int { c.badge }
+        """.write(to: moduleRoot.appendingPathComponent("Sample.swift"),
+                  atomically: true, encoding: .utf8)
+        let outputDir = tempRoot.appendingPathComponent("out")
+        _ = try Pipeline(options: PipelineOptions(
+            modules: [ModuleSpec(name: "M", root: moduleRoot, writable: true)],
+            outputDirectory: outputDir, dryRun: false,
+            nameStyle: .debug, introspectSDK: false, explain: true),
+            logger: StderrLogger(verbose: false)).run()
+
+        let anon = try String(contentsOf: outputDir.appendingPathComponent("Decisions-anon.txt"),
+                              encoding: .utf8)
+        let legend = try String(contentsOf: outputDir.appendingPathComponent("Decisions-files.txt"),
+                                encoding: .utf8)
+
+        // The legend row is the source of truth for the real path: the pipeline may resolve
+        // /var → /private/var, and the token has to be the hash of whatever it actually recorded.
+        let rows = Self.legendDataLines(legend)
+        guard let row = rows.first(where: { $0.path.hasSuffix("Sample.swift") }) else {
+            return XCTFail("the legend must map the source file:\n\(legend)")
+        }
+        XCTAssertTrue(row.path.contains("My Project"),
+                      "the fixture must really put a space in the path: \(row.path)")
+
+        // The whole target, exactly: `<path hash>:<line> <Owner hash>.<member hash>`. With the bug
+        // in place this line reads `resolved: <one hash of the entire string>` instead.
+        let expected = "resolved: \(Anon.of(row.path)):1 "
+                     + "\(Anon.forced("Card")).\(Anon.forced("badge"))"
+        XCTAssertTrue(anon.contains(expected),
+                      "expected the target to keep its line and member:\n\(expected)\nin:\n\(anon)")
+
+        // And the token in the report resolves: it is a row of the legend, not a hash of something
+        // no reader can look up.
+        let tokens = Set(Self.anonTargetPathTokens(anon))
+        XCTAssertFalse(tokens.isEmpty, "the report must name at least one target:\n\(anon)")
+        XCTAssertTrue(tokens.isSubset(of: Set(rows.map(\.token))),
+                      "these target tokens have no legend row: \(tokens.subtracting(Set(rows.map(\.token))))")
+    }
+
+    /// A use-site in a WRITABLE module that resolves into a READ-ONLY one (`--readonly`,
+    /// `--auto-spm` SPM checkouts). `DecisionReport.describe` places a declaration wherever it
+    /// lives, so the anonymized `resolved:` line hashes a path in a module the report never walks —
+    /// and the legend, which iterated the WRITABLE files only, had no row for it. No leak, but a
+    /// token the reader cannot resolve, which is the one job `Decisions-files.txt` has.
+    ///
+    /// Not reproducible on the tracked fixtures — they declare no read-only module — so the setup is
+    /// explicit. Two things the fixture has to arrange: read-only DECLARATIONS are never described
+    /// (the report iterates writable symbols), and a use-site is recorded only when its name is
+    /// declared by a WRITABLE module. So `sharedField` is declared on both sides; the use-site is
+    /// then recorded, and it resolves to the read-only `VendorGadget.sharedField`.
+    func testAnonFileLegend_targetInAReadOnlyModule_hasALegendRow() throws {
+        let tempRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SwiftProf-\(UUID().uuidString)")
+        let appRoot = tempRoot.appendingPathComponent("App")
+        let vendorRoot = tempRoot.appendingPathComponent("VendorKit")
+        for d in [appRoot, vendorRoot] {
+            try FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
+        }
+        try "public struct VendorGadget { public var sharedField: Int = 0 }"
+            .write(to: vendorRoot.appendingPathComponent("Vendor.swift"),
+                   atomically: true, encoding: .utf8)
+        try """
+        struct AppUser { var sharedField: Int = 0 }
+        func read(_ g: VendorGadget) -> Int { g.sharedField }
+        """.write(to: appRoot.appendingPathComponent("App.swift"),
+                  atomically: true, encoding: .utf8)
+        let outputDir = tempRoot.appendingPathComponent("out")
+        _ = try Pipeline(options: PipelineOptions(
+            modules: [ModuleSpec(name: "App", root: appRoot, writable: true),
+                      ModuleSpec(name: "VendorKit", root: vendorRoot, writable: false)],
+            outputDirectory: outputDir, dryRun: false,
+            nameStyle: .debug, introspectSDK: false, explain: true),
+            logger: StderrLogger(verbose: false)).run()
+
+        let anon = try String(contentsOf: outputDir.appendingPathComponent("Decisions-anon.txt"),
+                              encoding: .utf8)
+        let legend = try String(contentsOf: outputDir.appendingPathComponent("Decisions-files.txt"),
+                                encoding: .utf8)
+        let rows = Self.legendDataLines(legend)
+
+        // The premise: this run really did resolve a use-site into the read-only module. Without it
+        // the assertion below would pass on an empty set.
+        let real = try decisionsText(outputDir)
+        XCTAssertTrue(real.contains("resolved: Vendor.swift:1 VendorGadget.sharedField"),
+                      "the fixture must resolve into the read-only module:\n\(real)")
+
+        guard let vendorRow = rows.first(where: { $0.path.hasSuffix("VendorKit/Vendor.swift") }) else {
+            return XCTFail("the read-only file a target names has no legend row:\n\(legend)")
+        }
+        XCTAssertEqual(vendorRow.token, Anon.of(vendorRow.path),
+                       "a legend token must be Anon.of(the real path):\n\(legend)")
+
+        // The general invariant, not just this one row: nothing in the anonymized report may name a
+        // file the legend cannot resolve.
+        let tokens = Set(Self.anonTargetPathTokens(anon))
+        XCTAssertTrue(tokens.contains(vendorRow.token),
+                      "expected the read-only target's hash among \(tokens)")
+        XCTAssertTrue(tokens.isSubset(of: Set(rows.map(\.token))),
+                      "these target tokens have no legend row: \(tokens.subtracting(Set(rows.map(\.token))))")
+    }
 }
 
 extension DecisionReportTests {
@@ -952,13 +1091,6 @@ extension DecisionReportTests {
         text.components(separatedBy: "\n").firstIndex { $0.contains(needle) }.map { $0 + 1 }
     }
 
-    /// The line a `"<path>:<line> Owner.member"` target string points at.
-    func targetLine(_ target: String?) -> Int? {
-        guard let head = target?.split(separator: " ", maxSplits: 1).first,
-              let colon = head.lastIndex(of: ":") else { return nil }
-        return Int(head[head.index(after: colon)...])
-    }
-
     /// The defect this guards: every offset the report converts (`Symbol.declOffset`,
     /// `UseSiteRecord.offset`) was taken from the ORIGINAL parse, while the report is built after
     /// `Rewriter` replaced `file.contents` with the obfuscated output. Renaming preserves the
@@ -1025,9 +1157,9 @@ extension DecisionReportTests {
         let use = try XCTUnwrap(all.first {
             $0.role == "use-site" && $0.name == "quaternaryDisplayCaptionText" && $0.target != nil
         })
-        XCTAssertEqual(targetLine(use.target),
+        XCTAssertEqual(use.target?.line,
                        lineNumber(of: "var quaternaryDisplayCaptionText", in: source),
-                       "the resolved target names the wrong declaration line: \(use.target ?? "?")")
+                       "the resolved target names the wrong declaration line: \(String(describing: use.target))")
     }
 
     /// The analysis input is not always the file as it was loaded: `RawValueObfuscationPass`

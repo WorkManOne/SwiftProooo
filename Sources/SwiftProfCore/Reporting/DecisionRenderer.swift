@@ -28,24 +28,36 @@ public enum DecisionRenderer {
         }
     }
 
-    /// A `"<full path>:<line> <Owner>.<member>"` string as `DecisionReport.describe` builds it,
-    /// re-rendered per identity: the human artifact shows the file's basename (the full path is
-    /// noise next to Xcode), the anonymized one hashes the SAME full path the legend keys on, so a
-    /// token here resolves through `Decisions-files.txt` and two files sharing a basename across
-    /// modules stay distinct.
-    private static func target(_ t: String, _ identity: Identity) -> String {
-        let parts = t.split(separator: " ", maxSplits: 1).map(String.init)
-        guard parts.count == 2, let colon = parts[0].lastIndex(of: ":") else {
-            return identity == .anonymized ? Anon.of(t) : t
-        }
-        let path = String(parts[0][..<colon])
-        let line = String(parts[0][parts[0].index(after: colon)...])
+    /// A `DecisionReport.Target` rendered per identity: the human artifact shows the file's basename
+    /// (the full path is noise next to Xcode), the anonymized one hashes the SAME full path the
+    /// legend keys on, so a token here resolves through `Decisions-files.txt` and two files sharing
+    /// a basename across modules stay distinct.
+    ///
+    /// It takes the PARTS. It used to take the `"<full path>:<line> <Owner>.<member>"` string
+    /// `DecisionReport.describe` had just assembled and split it on the FIRST space to get them
+    /// back — which any project directory containing a space defeats: the head is then a path
+    /// fragment with no colon, the guard fires, and the whole string is hashed as one token. The
+    /// failure is SAFE (nothing leaks) and costs the human artifact only its basename shortening,
+    /// but it costs the anonymized one the line, the member name and every route back to the file
+    /// through the legend — most of what that artifact is for.
+    ///
+    /// `shortenPath` is the human rendering's choice of file spelling, and the two call sites differ
+    /// on purpose: a `resolved:` verdict prints the basename, while a `candidate:` detail line
+    /// prints the full path, as it has since the report existed. Preserved rather than unified —
+    /// this change is about the PARSE, and `Decisions.txt` stays byte-identical. The anonymized
+    /// rendering ignores the flag: it always hashes the FULL path, the only thing the legend can
+    /// resolve.
+    private static func target(_ t: DecisionReport.Target?, _ identity: Identity,
+                               shortenPath: Bool) -> String {
+        guard let t else { return "?" }
         switch identity {
         case .real:
-            return "\(URL(fileURLWithPath: path).lastPathComponent):\(line) \(parts[1])"
+            let file = shortenPath ? URL(fileURLWithPath: t.path).lastPathComponent : t.path
+            return "\(file):\(t.line) \(t.qualified)"
         case .anonymized:
-            let qualified = parts[1].split(separator: ".").map { Anon.forced(String($0)) }.joined(separator: ".")
-            return "\(Anon.of(path)):\(line) \(qualified)"
+            let qualified = t.qualified.split(separator: ".").map { Anon.forced(String($0)) }
+                .joined(separator: ".")
+            return "\(Anon.of(t.path)):\(t.line) \(qualified)"
         }
     }
 
@@ -58,10 +70,11 @@ public enum DecisionRenderer {
     /// contains a real path itself.
     public static func fileLegend(_ report: DecisionReport) -> String {
         var lines = ["# file-hash legend for Decisions-anon.txt. CONTAINS REAL PATHS — local use only."]
-        // Every writable file, not just the ones with entries: a file with no declarations and no
-        // recorded use-sites can still be named by a layer-1 `first at` line, and a hash with no
-        // legend row is unresolvable.
-        for p in report.writableFilePaths.sorted() {
+        // `legendFilePaths`, not the writable files: it is every path the anonymized rendering can
+        // hash, which is the writable set UNION the files targets resolve INTO — a read-only
+        // module's declaration is named by a use-site in a writable file and is in neither the
+        // writable set nor the per-file trace. A hash with no legend row is unresolvable.
+        for p in report.legendFilePaths.sorted() {
             lines.append("\(Anon.of(p)) \(p)")
         }
         return lines.joined(separator: "\n") + "\n"
@@ -298,30 +311,33 @@ public enum DecisionRenderer {
                 ? scrubFreeText(e.reason, projectNames) : e.reason
             return "\(e.decision.uppercased()): \(reason)"
         case (_, "rewritten") where e.reason == "reverted":
-            return "→ REVERTED   resolved: \(target(e.target ?? "?", identity))"
+            return "→ REVERTED   resolved: \(target(e.target, identity, shortenPath: true))"
         case (_, "rewritten"):
-            return "→ \(e.reason)   resolved: \(target(e.target ?? "?", identity))"
+            return "→ \(e.reason)   resolved: \(target(e.target, identity, shortenPath: true))"
         default:
-            if let t = e.target { return "resolved: \(target(t, identity))" }
+            if let t = e.target { return "resolved: \(target(t, identity, shortenPath: true))" }
             return "KEPT: \(e.reason)"
         }
     }
 
-    /// Detail lines are free text produced by the assembler. Two shapes get structured rewrites
-    /// (`candidate: ` renders a "File:line Owner.member" target, `receiver type: ` is a bare type
-    /// name); everything else — including `target is PROTECTED/SKIPPED/REVERTED: <reason>`, whose
-    /// `<reason>` is the same free text `verdict` scrubs for declarations — falls through to the
-    /// same identifier scrub so a name embedded anywhere in that free text cannot leak through this
-    /// path.
-    private static func detailLine(_ d: String, identity: Identity,
+    /// One detail line. The shape is the `Detail` case, never a substring of the rendered line: this
+    /// used to search the text for `"candidate: "` / `"receiver type: "` and take apart whatever
+    /// followed, so the renderer was parsing its own output and any free-text reason containing
+    /// those words would have been mis-routed.
+    ///
+    /// `.text` — including `target is PROTECTED/SKIPPED/REVERTED: <reason>`, whose `<reason>` is the
+    /// same free text `verdict` scrubs for declarations — goes through the identifier scrub, so a
+    /// name embedded anywhere in that prose cannot leak through this path.
+    private static func detailLine(_ d: DecisionReport.Detail, identity: Identity,
                                    projectNames: Set<String>) -> String {
-        guard identity == .anonymized else { return d }
-        if let r = d.range(of: "candidate: ") {
-            return "candidate: " + target(String(d[r.upperBound...]), identity)
+        switch d {
+        case .candidate(let t):
+            return "candidate: " + target(t, identity, shortenPath: false)
+        case .receiverType(let name):
+            return "receiver type: "
+                + (identity == .anonymized ? scrubFreeText(name, projectNames) : name)
+        case .text(let s):
+            return identity == .anonymized ? scrubFreeText(s, projectNames) : s
         }
-        if let r = d.range(of: "receiver type: ") {
-            return "receiver type: " + scrubFreeText(String(d[r.upperBound...]), projectNames)
-        }
-        return scrubFreeText(d, projectNames)
     }
 }
