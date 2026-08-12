@@ -33,7 +33,34 @@ public struct DecisionReport {
         public let detail: [String]?
     }
 
+    /// Why one shielded survivor (a name in `RollbackResult.blockedNames`) is NOT reported at full
+    /// volume. Two INDEPENDENT readings, either of which demotes it; neither of which is a proof.
+    ///
+    /// The inherent limit, and the reason this tiers rather than deletes: shield data alone cannot
+    /// separate "the shield covers an Apple use-site" from "the shield covers OUR missed use-site",
+    /// and the use-site cross-reference cannot either — a real miss on a `some View` chain records
+    /// exactly like Apple's own modifier. Both readings are EVIDENCE, and the evidence is printed
+    /// next to the name so the reader can overrule it.
+    public struct SurvivorTier {
+        /// `RollbackPass` found a declaration it deliberately left un-renamed that explains the
+        /// surviving occurrence.
+        public let namesakeExplained: Bool
+        /// The causes of every use-site this report recorded as KEPT for the name, by cause. Empty
+        /// when the resolver recorded no decision about the name at all, which is no evidence rather
+        /// than good evidence.
+        public let causes: [String: Int]
+        /// At least one decision was recorded for the name and NOT ONE of them is a red-build lead
+        /// (`UnresolvedCause.isRedBuildLead`). One lead is enough to keep the name loud.
+        public let useSitesExplained: Bool
+
+        public var isExplained: Bool { namesakeExplained || useSitesExplained }
+    }
+
     public let byFile: [String: [Entry]]
+
+    /// One entry per name in `rollback.blockedNames`. A name missing from this map has no reading at
+    /// all and belongs at full volume.
+    public let blockedTiers: [String: SurvivorTier]
 
     /// Every identifier declared by a writable module. The anonymized rendering hashes any word in a
     /// free-text reason that appears here: exact by construction, unlike parsing prose for
@@ -88,6 +115,29 @@ public struct DecisionReport {
         }
         names.formUnion(protector.unknownExternalNames)
         self.projectNames = names
+
+        // Tier the shielded survivors BEFORE the entry loop: the `effect:` line under a use-site must
+        // make the same claim the summary does, so both read one value. Built from the raw records
+        // rather than from the entries, because an entry's `reason` for a resolved-but-unrenamed
+        // target is already normalized to `candidate-has-no-obf` and the record is the source.
+        var keptCauses: [String: [String: Int]] = [:]
+        for rec in useSites {
+            guard case .kept(let cause, _, _) = rec.outcome else { continue }
+            guard rollback.blockedNames[rec.name] != nil else { continue }
+            keptCauses[rec.name, default: [:]][cause.rawValue, default: 0] += 1
+        }
+        var tiers: [String: SurvivorTier] = [:]
+        for name in rollback.blockedNames.keys {
+            let causes = keptCauses[name] ?? [:]
+            // An unknown cause string is a lead: this must not fall open if the enum gains a case
+            // whose raw value this build does not know.
+            let noLeads = causes.keys.allSatisfy { UnresolvedCause(rawValue: $0)?.isRedBuildLead == false }
+            tiers[name] = SurvivorTier(
+                namesakeExplained: rollback.shieldExplainedNames.contains(name),
+                causes: causes,
+                useSitesExplained: !causes.isEmpty && noLeads)
+        }
+        self.blockedTiers = tiers
 
         // 1. Declarations.
         for sym in table.symbols where sym.module.writable {
@@ -176,7 +226,8 @@ public struct DecisionReport {
                     guard let c = symbolById[id] else { continue }
                     detail.append("candidate: " + Self.describe(c))
                 }
-                if let effect = Self.effect(for: rec.name, rollback: rollback) {
+                if let effect = Self.effect(for: rec.name, rollback: rollback,
+                                            tier: tiers[rec.name]) {
                     detail.append(effect)
                 }
             }
@@ -216,10 +267,18 @@ public struct DecisionReport {
     }
 
     /// What a missed use-site cost, when the rollback pass has an opinion about the name.
-    static func effect(for name: String, rollback: RollbackResult) -> String? {
+    ///
+    /// Tiered by the SAME value the summary heads its sections with. Saying `DESYNC SHIPS` under every
+    /// blocked name is what made this claim unreadable: on the IceTrays fixture it printed under all
+    /// 122 occurrences of an Apple SwiftUI modifier, in a run whose output typechecks with 0 errors.
+    static func effect(for name: String, rollback: RollbackResult, tier: SurvivorTier?) -> String? {
         if rollback.blockedNames[name] != nil {
             let shields = (rollback.shieldReasons[name] ?? []).sorted().joined(separator: "+")
-            return "effect: DESYNC SHIPS. rollback blocked by shield \(shields)"
+            guard tier?.isExplained == true else {
+                return "effect: DESYNC SHIPS. rollback blocked by shield \(shields)"
+            }
+            return "effect: the name survives here; shield \(shields) blocked the revert, "
+                 + "and the summary has a benign reading for this survivor"
         }
         if rollback.revertedNames[name] != nil {
             return "effect: reverted, the name stays readable"

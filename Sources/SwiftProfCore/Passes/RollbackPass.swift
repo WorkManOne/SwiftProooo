@@ -38,11 +38,21 @@ public struct RollbackResult: Sendable {
     public let blockedNames: [String: Survivor]
     /// name → the shields that claimed it (`1b` / `1c` / `1d` / `1e`).
     public let shieldReasons: [String: Set<String>]
+    /// The subset of `blockedNames` whose survival a DECLARATION WE DELIBERATELY LEFT ALONE already
+    /// explains: the benign `self.name = name` shape (a property renamed, its same-named parameter
+    /// policy-skipped), a Swift keyword, an optional-binding local. Such a name is EXPECTED in the
+    /// output, so it is not a lead. Computed here rather than by the report because this is the only
+    /// place that knows the KINDS on both sides of the rename boundary.
+    ///
+    /// Empty on `.empty`, and a name absent from it is treated as unexplained: a consumer that
+    /// cannot compute this reports at full volume, which is the fail-closed direction.
+    public let shieldExplainedNames: Set<String>
     /// How many names were actually reverted (the old `run` return value).
     public let revertedCount: Int
 
     public static let empty = RollbackResult(revertedNames: [:], blockedNames: [:],
-                                             shieldReasons: [:], revertedCount: 0)
+                                             shieldReasons: [:], shieldExplainedNames: [],
+                                             revertedCount: 0)
 }
 
 /// Safety net pass — scans already-rewritten writable files for surviving original names.
@@ -120,6 +130,15 @@ public final class RollbackPass {
         // a shield is what turns "coverage loss" into "red build", so naming it is what lets the
         // `--explain` report distinguish the two.
         var shieldReasons: [String: Set<String>] = [:]
+        // Names with an UN-renamed callable namesake. Collected in its own loop on purpose: the
+        // shield loop below `continue`s past exactly these names when the overload exception fires,
+        // so folding the two would lose the very names the tiering rule asks about.
+        var unrenamedCallableNames: Set<String> = []
+        for sym in table.symbols where map.obf(for: sym) == nil {
+            if Self.isCallable(sym.kind), renamedNames.contains(sym.name) {
+                unrenamedCallableNames.insert(sym.name)
+            }
+        }
         var shieldedNames: Set<String> = []
         for sym in table.symbols where map.obf(for: sym) == nil {
             guard renamedNames.contains(sym.name) else { continue }
@@ -200,6 +219,27 @@ public final class RollbackPass {
             }
         }
 
+        // 2b. Split the blocked names by whether a declaration we deliberately left alone explains
+        // the survivor. The rule is `main`'s, restored verbatim in meaning from the `reportSurvivors`
+        // reporter this pass used to carry:
+        //
+        //   * shielded ONLY as an Apple API name (1c) — no un-renamed declaration of ours can be
+        //     what survived, so the occurrence is either Apple's own member or our miss;
+        //   * shielded by 1b while a CALLABLE of the name was renamed and the un-renamed namesake is
+        //     NOT callable — a surviving CALL cannot be that namesake.
+        //
+        // Everything else is the benign `self.name = name` shape (a property renamed, its same-named
+        // parameter left alone), a keyword, or an optional-binding local. Fail closed: a name is
+        // explained only when the rule says so, never by default.
+        var shieldExplained: Set<String> = []
+        for name in blockedHits.keys {
+            let shields = shieldReasons[name] ?? []
+            let renamedCallable = (symbolsByName[name] ?? []).contains { Self.isCallable($0.kind) }
+            let unexplained = shields == ["1c"]
+                || (shields.contains("1b") && renamedCallable && !unrenamedCallableNames.contains(name))
+            if !unexplained { shieldExplained.insert(name) }
+        }
+
         func result(_ revertedCount: Int) -> RollbackResult {
             RollbackResult(
                 revertedNames: revertedHits.mapValues {
@@ -209,6 +249,7 @@ public final class RollbackPass {
                     RollbackResult.Survivor(occurrences: $0.occurrences, filePath: $0.filePath, line: $0.line)
                 },
                 shieldReasons: shieldReasons,
+                shieldExplainedNames: shieldExplained,
                 revertedCount: revertedCount)
         }
 

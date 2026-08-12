@@ -168,6 +168,31 @@ public enum UnresolvedCause: String, CaseIterable {
     /// resolved and deliberately left alone is not a lead, it is the answer.
     public var isExplained: Bool { self == .candidateHasNoObf }
 
+    /// Is a use-site declined for this cause a LEAD for a red build — a place where the original name
+    /// survives and the reader should suspect a desync we shipped?
+    ///
+    /// Consumed by the summary's tiering of `RollbackResult.blockedNames`: a shielded survivor whose
+    /// every recorded decline is a non-lead has a benign reading and is demoted out of RED BUILD RISK.
+    ///
+    /// `receiver-untyped` / `no-contextual-type` are non-leads because they are the shape of an Apple
+    /// modifier chain (`.font(.headline)` on a `some View`), which is where the bulk of them come
+    /// from. They are NOT proof: the SAME record shape covers a use-site of OUR OWN that we failed to
+    /// type, which is exactly why this only demotes a name to a softer section and never removes it.
+    ///
+    /// The switch is exhaustive on purpose. A new cause must be classified deliberately, and the
+    /// fail-closed answer for one is `true`.
+    public var isRedBuildLead: Bool {
+        switch self {
+        case .receiverUntyped, .noContextualType:
+            return false        // unresolvable member chain; see the caveat above
+        case .candidateHasNoObf:
+            return false        // resolved to a declaration we chose not to rename: correct as it stands
+        case .noCandidateInScope, .mixedKindCandidates, .ambiguousOverload,
+             .inheritedKindConflict, .noDecision:
+            return true
+        }
+    }
+
     /// One-line plain-English statement of the cause, rendered into the report next to the
     /// use-site. The enum is the ONE source: `Diagnostics.txt` used to carry a hand-maintained
     /// header listing the causes, which is how `inherited-kind-conflict` shipped undocumented in

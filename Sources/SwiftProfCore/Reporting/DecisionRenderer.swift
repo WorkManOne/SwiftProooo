@@ -120,11 +120,11 @@ public enum DecisionRenderer {
         return out
     }
 
-    /// The layer-1 summary: tens of lines read FIRST, answering "where is the damage". Three
-    /// sections — the red-build set (a shielded survivor, revert blocked, desync ships), the
-    /// coverage losses (a revert that DID happen, green but under-obfuscated), and a histogram of
-    /// unresolved use-sites by cause with the top names per cause. This is what the separate
-    /// `Diagnostics.txt` aggregates today.
+    /// The layer-1 summary: tens of lines read FIRST, answering "where is the damage". Four
+    /// sections — the red-build set (a shielded survivor nothing explains, so the desync ships), the
+    /// shielded survivors that DO have a benign reading (same population, demoted to the `v ` tier),
+    /// the coverage losses (a revert that DID happen, green but under-obfuscated), and a histogram of
+    /// unresolved use-sites by cause with the top names per cause.
     private static func summary(_ report: DecisionReport, rollback: RollbackResult,
                                 identity: Identity) -> String {
         let all = report.byFile.values.flatMap { $0 }
@@ -142,13 +142,65 @@ public enum DecisionRenderer {
                    + " · rewritten-then-reverted \(undone)")
         lines.append("")
 
-        lines.append("--- RED BUILD RISK: original name survived, revert was blocked "
-                   + "(\(rollback.blockedNames.count) names) ---")
-        for (name, hit) in rollback.blockedNames
-            .sorted(by: { ($0.value.occurrences, $1.key) > ($1.value.occurrences, $0.key) }) {
-            let shields = (rollback.shieldReasons[name] ?? []).sorted().joined(separator: "+")
-            lines.append("  \(pad(ident(name, identity), 24)) occ=\(hit.occurrences)  shield \(shields)")
-            lines.append("  \(String(repeating: " ", count: 24)) first at \(path(hit.filePath, identity)):\(hit.line)")
+        // A blocked name is a surviving original whose revert a shield refused. Before the branch that
+        // introduced this summary, `main` split that population in two and only the unexplained half
+        // was printed at full volume; printing all of it put an Apple SwiftUI modifier at the head of
+        // a section titled RED BUILD RISK on a run with 0 desyncs and a clean typecheck. Both tiers
+        // are printed, so the fail-closed direction holds: a survivor is demoted, never dropped.
+        let blocked = rollback.blockedNames.sorted {
+            ($0.value.occurrences, $1.key) > ($1.value.occurrences, $0.key)
+        }
+        let explained = blocked.filter { report.blockedTiers[$0.key]?.isExplained == true }
+        let unexplained = blocked.filter { report.blockedTiers[$0.key]?.isExplained != true }
+
+        func shields(_ name: String) -> String {
+            (rollback.shieldReasons[name] ?? []).sorted().joined(separator: "+")
+        }
+        func firstAt(_ hit: RollbackResult.Survivor) -> String {
+            "first at \(path(hit.filePath, identity)):\(hit.line)"
+        }
+
+        lines.append("--- RED BUILD RISK: original name survived, revert was blocked, "
+                   + "nothing explains it (\(unexplained.count) names) ---")
+        for (name, hit) in unexplained {
+            lines.append("  \(pad(ident(name, identity), 24)) occ=\(hit.occurrences)  shield \(shields(name))")
+            lines.append("  \(String(repeating: " ", count: 24)) \(firstAt(hit))")
+        }
+        lines.append("")
+
+        lines.append("--- SHIELDED SURVIVORS with a benign explanation "
+                   + "(\(explained.count) names) ---")
+        // The caveat belongs to the entries, so it is printed only when there are entries: a run with
+        // nothing to demote should not carry five lines about a risk it does not have.
+        if !explained.isEmpty {
+            lines.append("# Read these second. Neither reading below is a PROOF: a shield says a name MAY")
+            lines.append("# legitimately survive, never that every occurrence of it is Apple's, and a")
+            lines.append("# use-site we could not type looks the same whether the receiver was an Apple")
+            lines.append("# chain or ours. A real desync can hide here, so read this section whenever the")
+            lines.append("# build is red and the section above did not explain it.")
+        }
+        for (name, hit) in explained {
+            let tier = report.blockedTiers[name]
+            var why: [String] = []
+            if tier?.namesakeExplained == true {
+                why.append("un-renamed namesake declaration")
+            }
+            if tier?.useSitesExplained == true {
+                let causes = tier?.causes ?? [:]
+                let hist = causes.sorted { ($0.value, $1.key) > ($1.value, $0.key) }
+                    .map { "\($0.key) \($0.value)" }.joined(separator: " ")
+                // How much of the survival the evidence actually covers. The two counts are measured
+                // differently on purpose and do NOT have to agree: `occ` counts free identifiers in
+                // the rewritten text, which includes positions that are no use-site at all (an Apple
+                // ARGUMENT LABEL is the common one), while a decision exists only where the resolver
+                // looked. A low ratio is a weak demotion, and the reader can see that it is.
+                let covered = causes.values.reduce(0, +)
+                why.append("no unresolved use-site of it is a lead (\(hist)), "
+                         + "covering \(covered) of \(hit.occurrences) occurrences")
+            }
+            lines.append("v \(pad(ident(name, identity), 24)) occ=\(hit.occurrences)  shield \(shields(name))")
+            lines.append("v \(String(repeating: " ", count: 24)) explained: \(why.joined(separator: " · "))")
+            lines.append("v \(String(repeating: " ", count: 24)) \(firstAt(hit))")
         }
         lines.append("")
 

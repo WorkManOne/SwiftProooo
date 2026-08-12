@@ -10,6 +10,17 @@ final class DecisionReportTests: XCTestCase {
         }
     }
 
+    /// Two classifications of the same enum answer two different questions (is this line worth
+    /// reading, is this survivor worth suspecting) and can drift apart as cases are added. They may
+    /// not contradict: a cause we call EXPLAINED at a use-site cannot be a red-build lead when the
+    /// summary tiers the same name.
+    func testUnresolvedCause_anExplainedCauseIsNeverARedBuildLead() {
+        for cause in UnresolvedCause.allCases where cause.isExplained {
+            XCTAssertFalse(cause.isRedBuildLead,
+                           "'\(cause.rawValue)' is the low-signal tier at a use-site but a lead in the summary")
+        }
+    }
+
     func testUnresolvedCause_noDecisionExistsAndIsHighSignal() {
         XCTAssertTrue(UnresolvedCause.allCases.contains(.noDecision))
         XCTAssertEqual(UnresolvedCause.noDecision.rawValue, "no-decision")
@@ -353,10 +364,31 @@ extension DecisionReportTests {
         return Array(rest[..<end])
     }
 
+    /// One entry of a survivor section: the line that names `name` plus its indented continuation
+    /// lines. An entry's head is the only line carrying `occ=`, which is what bounds it.
+    func entry(_ sectionLines: [String], named name: String) -> [String] {
+        guard let start = sectionLines.firstIndex(where: {
+            $0.contains(name) && $0.contains("occ=")
+        }) else { return [] }
+        var out = [sectionLines[start]]
+        var i = sectionLines.index(after: start)
+        while i < sectionLines.endIndex, !sectionLines[i].contains("occ="),
+              !sectionLines[i].trimmingCharacters(in: .whitespaces).isEmpty {
+            out.append(sectionLines[i])
+            i = sectionLines.index(after: i)
+        }
+        return out
+    }
+
     func testSummary_namesTheRedBuildSet() throws {
+        // A survivor the report has a LEAD for: `o.camera` types its receiver to `Other`, which
+        // declares no such member, so the resolver declined with `no-candidate-in-scope` while
+        // `Box.camera` renamed. `camera` is an Apple API name, so shield 1c blocks the revert and the
+        // desync ships. Nothing explains this one, so it belongs at full volume.
         let (_, outputDir) = try runExplain("""
         struct Box { var camera: Int = 0 }
-        func take(_ x: SomeExternalThing) -> Int { return x.camera }
+        struct Other { var pad: Int = 0 }
+        func take(_ o: Other) -> Int { return o.camera }
         """)
         let text = try decisionsText(outputDir)
         XCTAssertTrue(text.contains("RED BUILD RISK"), "\n\(text)")
@@ -365,6 +397,71 @@ extension DecisionReportTests {
                       "the shielded survivor must be named:\n\(sectionLines.joined(separator: "\n"))")
         XCTAssertTrue(sectionLines.contains { $0.contains("1c") },
                       "the shield must be named:\n\(sectionLines.joined(separator: "\n"))")
+    }
+
+    /// Tier (a), restored from `main`'s deleted `RollbackPass.reportSurvivors`: the benign
+    /// `self.name = name` shape. The property renames, the init parameter is policy-skipped and keeps
+    /// its name, so the original survives and shield 1b blocks the revert. Nothing desynced.
+    func testSummary_namesakeExplainedSurvivor_isDemotedOutOfTheRedBuildSet() throws {
+        let (_, outputDir) = try runExplain("""
+        struct Person {
+            var widgetLabel: String
+            init(widgetLabel: String) { self.widgetLabel = widgetLabel }
+        }
+        """)
+        let text = try decisionsText(outputDir)
+        let red = section(text, titled: "RED BUILD RISK")
+        XCTAssertFalse(red.contains { $0.contains("widgetLabel") },
+                       "an un-renamed namesake explains this survivor:\n\(red.joined(separator: "\n"))")
+        let explained = section(text, titled: "SHIELDED SURVIVORS")
+        XCTAssertTrue(explained.contains { $0.hasPrefix("v ") && $0.contains("widgetLabel") },
+                      "it must still be listed, in the low-signal tier:\n\(explained.joined(separator: "\n"))")
+        let listed = entry(explained, named: "widgetLabel")
+        XCTAssertTrue(listed.joined(separator: "\n").contains("namesake"),
+                      "the demotion must name its evidence:\n\(listed.joined(separator: "\n"))")
+        XCTAssertTrue(listed.allSatisfy { $0.hasPrefix("v ") },
+                      "no continuation line may outlive a `grep -v '^v '`:\n\(listed.joined(separator: "\n"))")
+    }
+
+    /// Tier (b), the cross-reference: this is the `font occ=122` shape on IceTrays. Every use-site the
+    /// resolver declined for this name is an unresolvable member chain, which is what an Apple
+    /// modifier call looks like, so the summary must not head it "RED BUILD RISK".
+    func testSummary_unresolvableChainSurvivor_isDemotedOutOfTheRedBuildSet() throws {
+        let (_, outputDir) = try runExplain("""
+        struct Box { var camera: Int = 0 }
+        func take(_ x: SomeExternalThing) -> Int { return x.camera }
+        """)
+        let text = try decisionsText(outputDir)
+        let red = section(text, titled: "RED BUILD RISK")
+        XCTAssertFalse(red.contains { $0.contains("camera") },
+                       "every recorded use-site of this name is an untypeable receiver:\n\(red.joined(separator: "\n"))")
+        let explained = section(text, titled: "SHIELDED SURVIVORS")
+        let listed = entry(explained, named: "camera")
+        XCTAssertTrue(listed.joined(separator: "\n").contains(UnresolvedCause.receiverUntyped.rawValue),
+                      "the demotion must name the cause it cross-referenced:\n\(listed.joined(separator: "\n"))")
+        // How much of the survival the cross-reference actually covers. Here it is all of it; on a
+        // real project it is often a fraction, and a demotion on thin evidence must say so.
+        XCTAssertTrue(listed.joined(separator: "\n").contains("covering 1 of 1 occurrences"),
+                      "the demotion must quantify its evidence:\n\(listed.joined(separator: "\n"))")
+    }
+
+    /// The guard-rail for tier (b). Same name, same shield, same untypeable-receiver use-site as the
+    /// test above, PLUS one use-site the resolver declined for a reason that is a real lead. One lead
+    /// is enough: the name goes back to full volume rather than hiding behind the chain records.
+    func testSummary_shieldedDesyncWithALead_staysAtFullVolume() throws {
+        let (_, outputDir) = try runExplain("""
+        struct Box { var camera: Int = 0 }
+        struct Other { var pad: Int = 0 }
+        func typed(_ o: Other) -> Int { return o.camera }
+        func untyped(_ x: SomeExternalThing) -> Int { return x.camera }
+        """)
+        let text = try decisionsText(outputDir)
+        let red = section(text, titled: "RED BUILD RISK")
+        XCTAssertTrue(red.contains { $0.contains("camera") },
+                      "a lead must not be demoted by the chain records beside it:\n\(text)")
+        let explained = section(text, titled: "SHIELDED SURVIVORS")
+        XCTAssertFalse(explained.contains { $0.contains("camera") },
+                       "a name belongs to exactly one tier:\n\(explained.joined(separator: "\n"))")
     }
 
     func testSummary_namesTheCoverageLoss() throws {
