@@ -48,18 +48,20 @@ public struct DecisionReport {
                 plannerSkip: [Int: String], useSites: [UseSiteRecord],
                 rollback: RollbackResult, files: [SourceFile]) {
         var grouped: [String: [Entry]] = [:]
-        var convertersByPath: [String: SourceLocationConverter] = [:]
 
-        func converter(forPath path: String, syntax: SourceFileSyntax) -> SourceLocationConverter {
-            if let c = convertersByPath[path] { return c }
-            let c = SourceLocationConverter(fileName: path, tree: syntax)
-            convertersByPath[path] = c
-            return c
+        // Every position below is converted through `SourceFile.analysisLocation`, i.e. against the
+        // text the PASSES parsed. This report is assembled after `Rewriter` and `RollbackPass` have
+        // moved `file.contents` on to the obfuscated output, and a rename changes byte lengths: an
+        // offset converted against the output drifts down the file and clamps at EOF, which is how
+        // every entry near the end of a file collapsed onto one bogus line.
+        var fileByPath: [String: SourceFile] = [:]
+        var writablePaths: [String] = []
+        for f in files where f.module.writable {
+            // Keyed by path, so two modules rooted at the same directory contribute one legend row,
+            // exactly as the dictionary this replaced did.
+            if fileByPath.updateValue(f, forKey: f.url.path) == nil { writablePaths.append(f.url.path) }
         }
-
-        var syntaxByPath: [String: SourceFileSyntax] = [:]
-        for f in files where f.module.writable { syntaxByPath[f.url.path] = f.syntax }
-        self.writableFilePaths = Array(syntaxByPath.keys)
+        self.writableFilePaths = writablePaths
 
         var symbolById: [Int: Symbol] = [:]
         for sym in table.symbols { symbolById[sym.id] = sym }
@@ -89,8 +91,7 @@ public struct DecisionReport {
 
         // 1. Declarations.
         for sym in table.symbols where sym.module.writable {
-            let conv = converter(forPath: sym.file.url.path, syntax: sym.file.syntax)
-            let loc = conv.location(for: AbsolutePosition(utf8Offset: sym.declOffset))
+            let loc = sym.file.analysisLocation(atUTF8Offset: sym.declOffset)
             let decision: String
             let reason: String
             if let obf = map.obf(for: sym) {
@@ -112,9 +113,8 @@ public struct DecisionReport {
 
         // 2. Use-sites.
         for rec in useSites {
-            guard let syntax = syntaxByPath[rec.filePath] else { continue }
-            let conv = converter(forPath: rec.filePath, syntax: syntax)
-            let loc = conv.location(for: AbsolutePosition(utf8Offset: rec.offset))
+            guard let file = fileByPath[rec.filePath] else { continue }
+            let loc = file.analysisLocation(atUTF8Offset: rec.offset)
 
             let kind: String
             let decision: String
@@ -128,8 +128,7 @@ public struct DecisionReport {
                 // validator run after `ResolutionPass` and may have undone it since.
                 let sym = symbolById[id]
                 kind = sym?.kind.rawValue ?? "unknown"
-                target = sym.map { Self.describe($0, converter: converter(forPath: $0.file.url.path,
-                                                                          syntax: $0.file.syntax)) }
+                target = sym.map { Self.describe($0) }
                 if let sym, let obf = map.obf(for: sym) {
                     decision = "rewritten"; reason = obf
                 } else if let sym, let r = map.revertReason(sym.id) {
@@ -154,8 +153,7 @@ public struct DecisionReport {
                 // Never "rewritten": nothing at this position was ever written, let alone undone.
                 let sym = symbolById[id]
                 kind = sym?.kind.rawValue ?? "unknown"
-                target = sym.map { Self.describe($0, converter: converter(forPath: $0.file.url.path,
-                                                                          syntax: $0.file.syntax)) }
+                target = sym.map { Self.describe($0) }
                 decision = "kept"
                 reason = UnresolvedCause.candidateHasNoObf.rawValue
                 if let sym, let r = protector.reason(for: sym) {
@@ -176,8 +174,7 @@ public struct DecisionReport {
                 if let receiver { detail.append("receiver type: \(receiver)") }
                 for id in candidateIds {
                     guard let c = symbolById[id] else { continue }
-                    detail.append("candidate: " + Self.describe(
-                        c, converter: converter(forPath: c.file.url.path, syntax: c.file.syntax)))
+                    detail.append("candidate: " + Self.describe(c))
                 }
                 if let effect = Self.effect(for: rec.name, rollback: rollback) {
                     detail.append(effect)
@@ -202,8 +199,13 @@ public struct DecisionReport {
     }
 
     /// "File.swift:12 Owner.member", or "File.swift:12 member" for a top-level declaration.
-    static func describe(_ sym: Symbol, converter: SourceLocationConverter) -> String {
-        let loc = converter.location(for: AbsolutePosition(utf8Offset: sym.declOffset))
+    ///
+    /// Takes no converter: the symbol's own file is the only thing that can place its `declOffset`,
+    /// and it does so against the text that offset came from. A candidate can live in a READ-ONLY
+    /// module, which is never rewritten — `analysisLocation` covers both without a second path,
+    /// and keeps doing so when read-only SPM modules become writable.
+    static func describe(_ sym: Symbol) -> String {
+        let loc = sym.file.analysisLocation(atUTF8Offset: sym.declOffset)
         let owner = sym.scope?.owner?.name
         let qualified = owner.map { "\($0).\(sym.name)" } ?? sym.name
         // FULL path, not the basename: `DecisionRenderer.target` hashes this value on the

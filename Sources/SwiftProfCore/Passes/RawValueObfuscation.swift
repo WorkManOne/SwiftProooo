@@ -128,6 +128,11 @@ public final class RawValueObfuscationPass {
         for file in files where file.module.writable {
             if let edits = editsByFile[ObjectIdentifier(file)], !edits.isEmpty {
                 rewriter.apply(edits)
+                // The transformed text IS the input from here on: every offset the main pipeline
+                // records below comes from re-parsing it. This inserts a whole `displayName`
+                // property, so without the re-pin the report would convert those offsets against a
+                // text that is both shorter and short by several LINES.
+                file.pinAnalysisInput()
                 touched.append(file)
             }
         }

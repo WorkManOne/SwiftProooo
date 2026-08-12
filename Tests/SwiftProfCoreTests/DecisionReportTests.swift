@@ -820,3 +820,156 @@ extension DecisionReportTests {
                       "expected the hashed token:\n\(anon)")
     }
 }
+
+// MARK: - Reported positions name the text the PASSES parsed, not the rewritten output
+
+extension DecisionReportTests {
+
+    /// `runExplain`, plus the rewritten file's URL and the knobs these tests need. The report is
+    /// assembled AFTER the rewrite, so what is on disk at the end is the other half of the check.
+    func runExplainOnDisk(_ source: String,
+                          fileName: String = "Sample.swift",
+                          rawValueMode: RawValueMode = .off,
+                          ignoreNames: Set<String> = []) throws
+        -> (result: PipelineResult, outputDir: URL, sourceURL: URL) {
+        let tempRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SwiftProf-\(UUID().uuidString)")
+        let moduleRoot = tempRoot.appendingPathComponent("M")
+        try FileManager.default.createDirectory(at: moduleRoot, withIntermediateDirectories: true)
+        let sourceURL = moduleRoot.appendingPathComponent(fileName)
+        try source.write(to: sourceURL, atomically: true, encoding: .utf8)
+        let outputDir = tempRoot.appendingPathComponent("out")
+        let options = PipelineOptions(
+            modules: [ModuleSpec(name: "M", root: moduleRoot, writable: true)],
+            outputDirectory: outputDir, dryRun: false,
+            nameStyle: .debug, introspectSDK: false,
+            ignoreNames: ignoreNames,
+            rawValueMode: rawValueMode, explain: true)
+        let result = try Pipeline(options: options,
+                                  logger: StderrLogger(verbose: false)).run()
+        return (result, outputDir, sourceURL)
+    }
+
+    /// 1-based index of the first line containing `needle`, or nil.
+    func lineNumber(of needle: String, in text: String) -> Int? {
+        text.components(separatedBy: "\n").firstIndex { $0.contains(needle) }.map { $0 + 1 }
+    }
+
+    /// The line a `"<path>:<line> Owner.member"` target string points at.
+    func targetLine(_ target: String?) -> Int? {
+        guard let head = target?.split(separator: " ", maxSplits: 1).first,
+              let colon = head.lastIndex(of: ":") else { return nil }
+        return Int(head[head.index(after: colon)...])
+    }
+
+    /// The defect this guards: every offset the report converts (`Symbol.declOffset`,
+    /// `UseSiteRecord.offset`) was taken from the ORIGINAL parse, while the report is built after
+    /// `Rewriter` replaced `file.contents` with the obfuscated output. Renaming preserves the
+    /// newline COUNT but not byte lengths, so an offset converted against the output drifts
+    /// progressively further down each file and clamps at EOF once the drift exceeds the text that
+    /// is left — dozens of entries at the end of a file collapsing onto one bogus position.
+    ///
+    /// The fixture therefore has to SHRINK: several long names above the declaration under test,
+    /// each rewritten to a two-character debug obf. One whose renames happened to preserve the
+    /// total length would pass with the bug in place.
+    func testDecisionReport_declarationBelowShrinkingRenames_reportsItsRealSourceLine() throws {
+        let source = """
+        struct ConfigurationDescriptorHolder {
+            var primaryDisplayCaptionText: String = ""
+            var secondaryDisplayCaptionText: String = ""
+            var tertiaryDisplayCaptionText: String = ""
+            var quaternaryDisplayCaptionText: String = ""
+        }
+
+        func renderLeadingCaptionSummary(_ holder: ConfigurationDescriptorHolder) -> String {
+            holder.primaryDisplayCaptionText + holder.secondaryDisplayCaptionText
+        }
+
+        func renderTrailingCaptionSummary(_ holder: ConfigurationDescriptorHolder) -> String {
+            holder.tertiaryDisplayCaptionText + holder.quaternaryDisplayCaptionText
+        }
+
+        struct TrailingSentinelStructure {
+            var trailingSentinelValue: Int = 0
+        }
+        """
+        let (_, outputDir, sourceURL) = try runExplainOnDisk(source)
+
+        // The premise: the run really did shorten the file, by much more than the tail below the
+        // declaration under test. Without that this fixture proves nothing.
+        let rewritten = try String(contentsOf: sourceURL, encoding: .utf8)
+        let shrink = source.utf8.count - rewritten.utf8.count
+        XCTAssertGreaterThan(shrink, 100,
+                             "the fixture must shrink the text for the drift to be observable")
+
+        let all = try entries(outputDir)
+        let sourceLines = source.components(separatedBy: "\n")
+
+        // The declaration under test sits below every one of those renames.
+        let trueLine = try XCTUnwrap(lineNumber(of: "var trailingSentinelValue", in: source))
+        let decl = try XCTUnwrap(all.first { $0.role == "declaration" && $0.name == "trailingSentinelValue" })
+        XCTAssertEqual(decl.line, trueLine,
+                       "reported at line \(decl.line), really on line \(trueLine) "
+                     + "— the text shrank by \(shrink) bytes between the parse and the report")
+
+        // And not just that one: no entry may sit on a line that does not spell its own name.
+        for e in all {
+            guard e.line - 1 < sourceLines.count else {
+                return XCTFail("\(e.role) '\(e.name)' reported at line \(e.line), "
+                             + "past the end of a \(sourceLines.count)-line file")
+            }
+            XCTAssertTrue(sourceLines[e.line - 1].contains(e.name),
+                          "\(e.role) '\(e.name)' reported at \(e.line):\(e.column), "
+                        + "which reads: \(sourceLines[e.line - 1])")
+        }
+
+        // `resolved:`/`candidate:` targets are built by a second position lookup — `describe` —
+        // over a symbol that can live in another file, so it needs its own check.
+        let use = try XCTUnwrap(all.first {
+            $0.role == "use-site" && $0.name == "quaternaryDisplayCaptionText" && $0.target != nil
+        })
+        XCTAssertEqual(targetLine(use.target),
+                       lineNumber(of: "var quaternaryDisplayCaptionText", in: source),
+                       "the resolved target names the wrong declaration line: \(use.target ?? "?")")
+    }
+
+    /// The analysis input is not always the file as it was loaded: `RawValueObfuscationPass`
+    /// rewrites the source first and the main pipeline re-parses THAT, so the baseline has to
+    /// follow. The inserted `displayName` property is several LINES long, so every declaration
+    /// below the enum would be off by that many if it did not.
+    ///
+    /// Checked against the file on disk rather than the fixture string: the rewrite changes byte
+    /// lengths but never newline counts, so the output has exactly the line structure of the
+    /// analysis input. `trailingSentinelValue` is ignore-listed to keep it spelled out there.
+    func testDecisionReport_afterRawValuePreprocessing_reportsLinesInTheTransformedSource() throws {
+        let source = """
+        enum BeverageFlavorChoice: String {
+            case vanillaSelection = "Vanilla Selection"
+            case hazelnutSelection = "Hazelnut Selection"
+            case cinnamonSelection = "Cinnamon Selection"
+        }
+
+        struct TrailingSentinelStructure {
+            var trailingSentinelValue: Int = 0
+        }
+        """
+        let (_, outputDir, sourceURL) = try runExplainOnDisk(
+            source, rawValueMode: .safe, ignoreNames: ["trailingSentinelValue"])
+
+        let rewritten = try String(contentsOf: sourceURL, encoding: .utf8)
+        let all = try entries(outputDir)
+
+        // The premise: the preprocessing ran and its inserted property is in the analysis input.
+        XCTAssertTrue(all.contains { $0.role == "declaration" && $0.name == "displayName" },
+                      "the raw-value pass must have inserted displayName: \(all.map(\.name))")
+        XCTAssertGreaterThan(rewritten.components(separatedBy: "\n").count,
+                             source.components(separatedBy: "\n").count,
+                             "the insertion must add lines for this test to bite")
+
+        let trueLine = try XCTUnwrap(lineNumber(of: "var trailingSentinelValue", in: rewritten))
+        let decl = try XCTUnwrap(all.first { $0.role == "declaration" && $0.name == "trailingSentinelValue" })
+        XCTAssertEqual(decl.line, trueLine,
+                       "reported at line \(decl.line), really on line \(trueLine) of the "
+                     + "preprocessed source the passes parsed")
+    }
+}
