@@ -118,9 +118,18 @@ public struct CoverageReport {
                    contextual: byKindCtx[k] ?? 0,
                    policy: byKindPolicy[k] ?? 0)
         }
-        self.topProtectionReasons = reasonCounts
-            .sorted { $0.value > $1.value }
-            .prefix(10)
+        self.topProtectionReasons = Self.rankedReasons(reasonCounts)
+    }
+
+    /// Rank protection reasons for the summary and keep the top `limit`. The comparator is a TOTAL
+    /// order — descending by count, then ascending by reason text on a tie — so the rendered list
+    /// is byte-identical across runs. Without the secondary key, tied reasons came out in
+    /// hash-seeded `Dictionary` order, which changed both the order AND (because the list is
+    /// truncated) the membership of the tail between runs of the same binary on the same input.
+    static func rankedReasons(_ counts: [String: Int], limit: Int = 10) -> [(reason: String, count: Int)] {
+        counts
+            .sorted { ($0.value, $1.key) > ($1.value, $0.key) }
+            .prefix(limit)
             .map { (reason: $0.key, count: $0.value) }
     }
 
