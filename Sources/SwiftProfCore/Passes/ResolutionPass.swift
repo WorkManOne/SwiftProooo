@@ -1669,7 +1669,7 @@ private final class ResolutionVisitor: SyntaxVisitor {
         // tiebreak both when several overloads tie at the top positive score AND when there's no
         // discriminating arg signal at all (zero-arg calls, all-unknown args) — the only thing
         // that distinguishes the duplicates is their module.
-        let pool: [Symbol]
+        var pool: [Symbol]
         if let maxScore = scored.map(\.score).max(), maxScore > 0 {
             let top = scored.filter { $0.score == maxScore }
             if top.count == 1 { return top[0].sym }
@@ -1679,8 +1679,88 @@ private final class ResolutionVisitor: SyntaxVisitor {
             // type) — fall through to module-based tiebreak across all label-matching candidates.
             pool = scored.map { $0.sym }
         }
+        // Result-type disambiguation. Swift resolves overloads by the EXPECTED RESULT TYPE too, not
+        // only by arguments — and that is the ONLY signal left when the argument is untypeable (a
+        // stdlib optional-chain call like `source?.data(using:)`, the reported desync). When the
+        // enclosing context WRITES the type the result must have (`guard let x: T = f1(...)`,
+        // `let x: T = …`, an explicit `return`), keep only the candidates whose own return type is
+        // consistent with it. A unique positive match wins; a set narrowed to one survivor wins;
+        // otherwise fall through to the module tiebreak on the (possibly narrowed) pool. Fail-safe:
+        // a protocol / unknown return stays neutral (never eliminated), so a mis-read context can
+        // only fail to pick, never pick wrong.
+        if pool.count > 1, let expected = expectedResultType(of: call) {
+            let fits = pool.map { (sym: $0, fit: resultFit(of: $0, expected: expected)) }
+            let matched = fits.filter { $0.fit == .matches }
+            if matched.count == 1 { return matched[0].sym }
+            let survivors = fits.filter { $0.fit != .contradicts }.map(\.sym)
+            if survivors.count == 1 { return survivors[0] }
+            if survivors.count > 1 && survivors.count < pool.count { pool = survivors }
+        }
         let sameModule = pool.filter { $0.module.name == file.module.name }
         return sameModule.count == 1 ? sameModule[0] : nil
+    }
+
+    /// How a candidate's declared RETURN type fits an expected result type. Mirrors the
+    /// argument-side neutrality of `disambiguateByArgTypes`: a protocol on either side (a conformer
+    /// is a valid result we cannot string-match) or an unknown return (tuple/function/`Void`) stays
+    /// `.neutral` and is never eliminated; only two resolvable CONCRETE / external types that differ
+    /// `.contradicts`. Elimination therefore carries the same class-hierarchy imprecision the
+    /// argument side already accepts, which is safe next to the String-vs-Data shape this resolves.
+    private enum ResultFit { case matches, neutral, contradicts }
+    private func resultFit(of cand: Symbol, expected: ContextualType) -> ResultFit {
+        guard let ret = table.functionReturnType[cand.id] else { return .neutral }
+        let expScope = expected.scope ?? currentScope
+        if TypeNameEquivalence.sameType(expected.name, inScope: expScope, module: file.module.name,
+                                        ret, inScope: cand.scope, module: cand.module.name,
+                                        table: table) {
+            return .matches
+        }
+        // A protocol on EITHER side accepts a conformer we cannot string-match — stay neutral.
+        if typeResolver.typeSymbol(forQualifiedName: bareTypeName(expected.name), in: expScope)?.kind == .protocol
+            || resolveParamType(ret, candidate: cand)?.kind == .protocol {
+            return .neutral
+        }
+        return .contradicts
+    }
+
+    /// The type a call's RESULT is expected to have, from an enclosing WRITTEN annotation or an
+    /// explicit `return` — the signal Swift uses to disambiguate overloads by result type. Only the
+    /// IMMEDIATE binding/return context counts: a call nested inside a larger expression (a member
+    /// access `f1(...).x`, an operator, another call's argument) has no directly-written expected
+    /// type, so this returns nil rather than borrow an annotation that types the OUTER expression.
+    /// The optional wrapper is dropped by `WrittenTypeName.of` on both this side and the stored
+    /// return type, so a `guard let x: Data` (unwrapped annotation) compares equal to a `-> Data?`.
+    private func expectedResultType(of call: FunctionCallExprSyntax) -> ContextualType? {
+        guard let parent = call.parent else { return nil }
+        // `let / var / guard let / if let / while let  x: T = call` — the call is the initializer
+        // directly (not nested inside a bigger initializer expression).
+        if let initClause = parent.as(InitializerClauseSyntax.self), initClause.value.id == call.id {
+            if let ob = initClause.parent?.as(OptionalBindingConditionSyntax.self),
+               let annotation = ob.typeAnnotation, let name = WrittenTypeName.of(annotation.type) {
+                return ContextualType(name: name, scope: nil)   // written at the use-site
+            }
+            if let pb = initClause.parent?.as(PatternBindingSyntax.self),
+               let annotation = pb.typeAnnotation, let name = WrittenTypeName.of(annotation.type) {
+                return ContextualType(name: name, scope: nil)
+            }
+            return nil
+        }
+        // `return call` — the enclosing function's written return type.
+        if parent.is(ReturnStmtSyntax.self) {
+            var probe: Syntax? = parent.parent
+            while let p = probe {
+                if let fn = p.as(FunctionDeclSyntax.self) {
+                    if let rc = fn.signature.returnClause, let name = WrittenTypeName.of(rc.type) {
+                        return ContextualType(name: name, scope: nil)
+                    }
+                    return nil
+                }
+                // A closure / accessor return type is inferred or unwritten — we don't model it.
+                if p.is(ClosureExprSyntax.self) || p.is(AccessorDeclSyntax.self) { return nil }
+                probe = p.parent
+            }
+        }
+        return nil
     }
 
     private enum ArgConstraint {

@@ -1669,6 +1669,99 @@ final class PatternTests: XCTestCase {
                        "handle(u) must resolve to the URL overload, not the S2 one:\n\(r)")
     }
 
+    func testOverloadByResultType_guardLetAnnotation_picksReturnMatchingOverload() throws {
+        // The reported bug: `f1` is overloaded by BOTH parameter and result type, and the sole
+        // argument (`source?.data(using:)`, a stdlib optional-chain call) is UNTYPEABLE — so
+        // argument scoring gives no signal and `disambiguateByArgTypes` failed closed → the call was
+        // left original while both decls renamed → the desync shipped. Swift disambiguates by the
+        // EXPECTED RESULT TYPE too: `guard let p1: Data = f1(...)` forces the `Data?`-returning
+        // overload. The written binding annotation is that signal.
+        let r = try runPipeline("""
+        import Foundation
+        final class Codec {
+            func f1(_ source: String?) -> String? { return source }
+            func f1(_ source: Data?) -> Data? { return source }
+            func encode(_ source: String?) -> String? {
+                guard let blob: Data = f1(source?.data(using: .utf8)) else { return nil }
+                return blob.base64EncodedString()
+            }
+        }
+        """)
+        let dataOverloadObf = try firstGroup(#"func (\w+)\(_ \w+: Data\?"#, in: r)
+        let callObf = try firstGroup(#"guard let blob: Data = (\w+)\("#, in: r)
+        XCTAssertNotEqual(callObf, "f1", "the call must be obfuscated, not reverted:\n\(r)")
+        XCTAssertEqual(callObf, dataOverloadObf,
+                       "f1(...) must resolve to the Data overload via the guard annotation:\n\(r)")
+    }
+
+    func testOverloadByResultType_returnPosition_picksReturnMatchingOverload() throws {
+        // Same untypeable-argument tie, disambiguated by an explicit `return` in a function with a
+        // written return clause: the result must be `Data?`, so the `Data?` overload is selected.
+        let r = try runPipeline("""
+        import Foundation
+        final class Codec {
+            func f1(_ source: String?) -> String? { return source }
+            func f1(_ source: Data?) -> Data? { return source }
+            func decode(_ source: String?) -> Data? {
+                return f1(source?.data(using: .utf8))
+            }
+        }
+        """)
+        let dataOverloadObf = try firstGroup(#"func (\w+)\(_ \w+: Data\?"#, in: r)
+        // The method's own `source` parameter is itself renamed, so match the call's base as \w+.
+        let callObf = try firstGroup(#"return (\w+)\(\w+\?\.data"#, in: r)
+        XCTAssertNotEqual(callObf, "f1", "the call must be obfuscated, not reverted:\n\(r)")
+        XCTAssertEqual(callObf, dataOverloadObf,
+                       "return context must pick the Data overload:\n\(r)")
+    }
+
+    func testOverloadByResultType_sameReturnType_staysFailClosed() throws {
+        // Guard-rail: the result-type filter must PICK only when the result type DISCRIMINATES. Two
+        // overloads returning the SAME type (differing only by parameter) give no result-type
+        // signal, so with an untypeable argument the call must stay ambiguous → fail closed
+        // (reverted), never a guessed wrong overload (which RollbackPass could not catch).
+        let r = try runPipeline("""
+        import Foundation
+        final class Codec {
+            func f1(_ source: String?) -> Data? { return source?.data(using: .utf8) }
+            func f1(_ source: Data?) -> Data? { return source }
+            func encode(_ source: String?) -> Data? {
+                guard let blob: Data = f1(source?.data(using: .utf8)) else { return nil }
+                return blob
+            }
+        }
+        """)
+        XCTAssertTrue(r.contains("guard let blob: Data = f1("),
+                      "ambiguous-by-result call must stay fail-closed, not a guessed rename:\n\(r)")
+    }
+
+    func testOverloadByResultType_userTypes_picksReturnMatchingOverload() throws {
+        // NOT limited to stdlib String/Data: the result type is compared through
+        // TypeNameEquivalence.sameType, so two USER types disambiguate by Symbol identity the same
+        // way. Here the two overloads differ ONLY by return type (both take `Any`), so the argument
+        // ties — result-type context is the sole discriminator, and it renames the call to the
+        // `Beta`-returning overload (and `beta.b` to Beta's member).
+        let r = try runPipeline("""
+        struct Alpha { var a = 0 }
+        struct Beta { var b = 0 }
+        final class Maker {
+            func make(_ seed: Any) -> Alpha? { return Alpha() }
+            func make(_ seed: Any) -> Beta? { return Beta() }
+            func run(_ seed: Any) {
+                guard let beta: Beta = make(seed) else { return }
+                _ = beta.b
+            }
+        }
+        """)
+        // `Beta` is itself renamed, so pin the overload through the binding's obf type name.
+        let betaTypeObf = try firstGroup(#"guard let beta: (\w+) = "#, in: r)
+        let betaOverloadObf = try firstGroup(#"func (\w+)\(_ \w+: Any\) -> \#(betaTypeObf)\?"#, in: r)
+        let callObf = try firstGroup(#"guard let beta: \w+ = (\w+)\("#, in: r)
+        XCTAssertNotEqual(callObf, "make", "the call must be obfuscated, not reverted:\n\(r)")
+        XCTAssertEqual(callObf, betaOverloadObf,
+                       "make(seed) must resolve to the Beta overload via the binding annotation:\n\(r)")
+    }
+
     func testOptionalBinding_localTypeMember_resolvesAndRenames() throws {
         // A binding of a LOCAL type (`if let acc = makeAccount()`): member access `acc.balance` and
         // a method call `acc.describe()` must rename to the type's obf members (the binding name `acc`
