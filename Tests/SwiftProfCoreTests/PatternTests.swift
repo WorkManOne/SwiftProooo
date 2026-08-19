@@ -1762,6 +1762,90 @@ final class PatternTests: XCTestCase {
                        "make(seed) must resolve to the Beta overload via the binding annotation:\n\(r)")
     }
 
+    func testOptionalBinding_sameNameGuardRebindingOfClosureParam_memberResolves() throws {
+        // A `guard let x = x` that re-binds a HOF-typed closure parameter to ITS OWN NAME must keep
+        // the type: the binding is `Payload?` unwrapped to `Payload`, so `result.field` resolves.
+        // The bug was an ordering one — `shadowFrames.bind(name)` ran before the initializer was
+        // typed, so `localBindingType(name)` answered `.untyped` while typing the binding's own
+        // initializer `result`, and the type computed to nil → the member read was left original
+        // while the property renamed (class-1 desync; a red build on the real project).
+        let r = try runPipeline("""
+        protocol Client { func fetch(_ completion: @escaping (Payload?) -> Void) }
+        struct Payload { let field: String? }
+        final class Screen {
+            let client: Client
+            init(client: Client) { self.client = client }
+            func load() {
+                client.fetch { [weak self] result in
+                    guard let self = self, let result = result else { return }
+                    _ = result.field
+                }
+            }
+        }
+        """)
+        let declObf = try firstGroup(#"struct \w+ \{ let (\w+): String\?"#, in: r)
+        let useObf  = try firstGroup(#"_ = result\.(\w+)"#, in: r)
+        XCTAssertNotEqual(declObf, "field",
+                          "property must stay renamed (a revert here means the use-site desynced):\n\(r)")
+        XCTAssertEqual(useObf, declObf,
+                       "member read through the same-named rebinding must resolve to the property:\n\(r)")
+    }
+
+    func testOptionalBinding_sameNameIfLetRebindingOfClosureParam_memberResolves() throws {
+        // Same ordering bug, `if let` form — the fix is in the shared `visitPost` path, so both
+        // conditional-binding statements are covered.
+        let r = try runPipeline("""
+        protocol Client { func fetch(_ completion: @escaping (Payload?) -> Void) }
+        struct Payload { let field: String? }
+        final class Screen {
+            let client: Client
+            init(client: Client) { self.client = client }
+            func load() {
+                client.fetch { result in
+                    if let result = result {
+                        _ = result.field
+                    }
+                }
+            }
+        }
+        """)
+        let declObf = try firstGroup(#"struct \w+ \{ let (\w+): String\?"#, in: r)
+        let useObf  = try firstGroup(#"_ = result\.(\w+)"#, in: r)
+        XCTAssertNotEqual(declObf, "field",
+                          "property must stay renamed (a revert here means the use-site desynced):\n\(r)")
+        XCTAssertEqual(useObf, declObf,
+                       "member read through the same-named rebinding must resolve to the property:\n\(r)")
+    }
+
+    func testOptionalBinding_rebindingChain_eachMemberResolves() throws {
+        // Pentest for the ordering fix: a chain in one guard — the same-name `a = a` (the fixed
+        // bug), then cross-name reads off a rebinding's member (`b = a.next`, `c = b.next`). Each
+        // binding must keep its type so every member read resolves. Pre-fix, `a = a` loses a's type
+        // → `a.next` is unresolved → b untyped → the whole chain cascades.
+        let r = try runPipeline("""
+        protocol Client { func fetch(_ completion: @escaping (Payload?) -> Void) }
+        struct Payload { let field: String?; let next: Payload? }
+        final class Screen {
+            let client: Client
+            init(client: Client) { self.client = client }
+            func load() {
+                client.fetch { a in
+                    guard let a = a, let b = a.next, let c = b.next else { return }
+                    _ = a.field
+                    _ = b.field
+                    _ = c.field
+                }
+            }
+        }
+        """)
+        let declObf = try firstGroup(#"struct \w+ \{ let (\w+): String\?"#, in: r)
+        XCTAssertNotEqual(declObf, "field", "property reverted → a rebinding in the chain desynced:\n\(r)")
+        for base in ["a", "b", "c"] {
+            let useObf = try firstGroup(#"_ = \#(base)\.(\w+)"#, in: r)
+            XCTAssertEqual(useObf, declObf, "\(base).field must resolve to the property:\n\(r)")
+        }
+    }
+
     func testOptionalBinding_localTypeMember_resolvesAndRenames() throws {
         // A binding of a LOCAL type (`if let acc = makeAccount()`): member access `acc.balance` and
         // a method call `acc.describe()` must rename to the type's obf members (the binding name `acc`
@@ -6910,4 +6994,5 @@ final class PatternTests: XCTestCase {
         XCTAssertFalse(r.contains("displayName"),
                        "no displayName may be synthesized for the aborted enum:\n\(r)")
     }
+
 }

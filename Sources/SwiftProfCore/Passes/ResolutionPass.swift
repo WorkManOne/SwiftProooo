@@ -936,11 +936,18 @@ private final class ResolutionVisitor: SyntaxVisitor {
         // with. The frame this lands in is the ENCLOSING block's, so without the bound the binding
         // outlives its statement by the whole method.
         let extent = ConditionBindingExtent.visibility(of: node)
-        shadowFrames.bind(name, visibleIn: extent)
+        // Type the initializer BEFORE marking the name a binding. `shadowFrames.bind` makes
+        // `localBindingType(name)` answer `.untyped` (B-FIX-46) for that name, and for a same-name
+        // rebinding `guard let x = x` the initializer IS `x` — binding the name first poisons the
+        // typing of the binding's OWN initializer, so `x` (an HOF-typed closure param, or any value
+        // reachable only by inference) types to nil and every member read through the binding fails.
+        // This is the TYPE half of "a binding is not in scope within its own initializer" (B-FIX-21
+        // covered the NAME half). Order matters, not the presence of both binds.
         if let initializer = node.initializer {
             recordShadowBindingType(name: name, annotation: node.typeAnnotation,
                                     initializer: initializer.value, visibleIn: extent)
         }
+        shadowFrames.bind(name, visibleIn: extent)
     }
 
     /// `if case .run(let m) = value` / `while case …` / `guard case …` — the payload binding of a
