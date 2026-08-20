@@ -176,6 +176,12 @@ private final class DeclVisitor: SyntaxVisitor {
         if let t = WrittenTypeName.of(node.initializer.value) {
             table.typealiasTarget[sym.id] = t
         }
+        // A typealias to a FUNCTION type (`typealias Handler = (En1) -> Void`) carries closure inputs
+        // that `WrittenTypeName.of` cannot express (it returns nil for function types), so record them
+        // here so a `func f(_ h: Handler)` parameter can still type its closure argument (B-FIX-55).
+        if let inputs = Self.closureInputTypeNames(of: node.initializer.value) {
+            table.typealiasClosureInput[sym.id] = inputs
+        }
         return .visitChildren
     }
 

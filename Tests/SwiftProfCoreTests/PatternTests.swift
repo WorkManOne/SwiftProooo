@@ -6849,6 +6849,72 @@ final class PatternTests: XCTestCase {
                       "named closure params of sort(by:) must be typed as the Element:\n\(r)")
     }
 
+    // MARK: - B-FIX-55: a typealias-wrapped closure parameter types its closure argument
+
+    func testTypealiasClosure_namedParamMemberResolves() throws {
+        // `func f(_ h: Handler)` with `typealias Handler = (Item) -> Void` records nothing in
+        // `functionParamClosureInput` (the parameter is not a literal FunctionTypeSyntax), so the
+        // closure's param `item` stayed untyped and `item.field` survived while its decl renamed.
+        let r = try runPipeline("""
+        typealias Handler = (Item) -> Void
+        struct Item {
+            let field: Int
+        }
+        final class Service {
+            func run(_ h: Handler) {}
+        }
+        final class Client {
+            let service = Service()
+            func go() {
+                service.run { item in
+                    _ = item.field
+                }
+            }
+        }
+        """)
+        let fieldObf = try firstGroup(#"let (\w+): Int"#, in: r)
+        XCTAssertNotEqual(fieldObf, "field", "the property decl must stay obfuscated:\n\(r)")
+        XCTAssertTrue(r.contains("item.\(fieldObf)") && !r.contains("item.field"),
+                      "the typealias-closure param member must resolve:\n\(r)")
+    }
+
+    func testTypealiasClosure_switchPayloadBinding_memberResolves() throws {
+        // The reported shape: a completion handler typed through a typealias delivers an enum; a
+        // `switch` on that closure parameter binds a payload, and a member read on the payload must
+        // resolve. Before B-FIX-55 the closure param was untyped, so the switch subject was untyped,
+        // so the payload binding was never typed, so `par1.leaf` was receiver-untyped and desynced.
+        let r = try runPipeline("""
+        typealias Completion = (Outcome) -> Void
+        enum Outcome {
+            case ok(Detail)
+            case fail
+        }
+        struct Detail {
+            let leaf: Int
+        }
+        final class Worker {
+            func perform(_ c: Completion) {}
+        }
+        final class Caller {
+            let worker = Worker()
+            func start() {
+                worker.perform { result in
+                    switch result {
+                    case .ok(let par1):
+                        _ = par1.leaf
+                    case .fail:
+                        break
+                    }
+                }
+            }
+        }
+        """)
+        let leafObf = try firstGroup(#"let (\w+): Int"#, in: r)
+        XCTAssertNotEqual(leafObf, "leaf", "the payload property decl must stay obfuscated:\n\(r)")
+        XCTAssertTrue(r.contains("par1.\(leafObf)") && !r.contains("par1.leaf"),
+                      "the switch payload member, typed through the typealias completion, must resolve:\n\(r)")
+    }
+
     // MARK: - B-FIX-52: every STORED type name resolves in its DECLARING scope
 
     // B-FIX-23 established the invariant for `declaredType`; these are the readers that were

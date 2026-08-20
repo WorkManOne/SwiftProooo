@@ -43,6 +43,14 @@ public final class SymbolTable {
     /// declared signature — generalizing HOF closure-param inference beyond the hardcoded stdlib
     /// registry (B-FIX-2). E.g. `func transform(_ f: (Item) -> Int)` records `[0: ["Item"]]`.
     public internal(set) var functionParamClosureInput: [Int: [Int: [String]]] = [:]
+    /// For a `typealias` whose underlying type is a FUNCTION type (`typealias Handler = (En1) -> Void`),
+    /// the closure's input type names, keyed by the typealias symbol id. `functionParamClosureInput`
+    /// only sees a LITERAL `FunctionTypeSyntax` on the parameter, so a `func f(_ h: Handler)` records
+    /// nothing there and the closure's `$0`/named param could not be typed (a switch subject bound
+    /// through such a completion handler stayed untyped → its payload binding untyped → member reads
+    /// through it desynced). This side-table lets `hofClosureParamType` resolve the alias and recover
+    /// the inputs. Input names are WRITTEN in the alias's own scope (carry `Symbol.scope` when reading).
+    public internal(set) var typealiasClosureInput: [Int: [String]] = [:]
     /// Initializer expression for var/let bindings whose type we couldn't infer at declaration
     /// time. TypeInferencePass uses these later, with the full SymbolTable populated.
     public internal(set) var initializerExpr: [Int: ExprSyntax] = [:]

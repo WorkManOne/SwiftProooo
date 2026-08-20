@@ -638,10 +638,25 @@ public final class TypeResolver {
         // label-matching walk that selected the callee (B-FIX-36).
         if let callee = calleeCallable(for: call, in: scope),
            let paramPos = ArgumentLabelMatch.parameterIndex(ofArgument: closureArgIndex, for: callee,
-                                                            call: call, in: table),
-           let inputs = table.functionParamClosureInput[callee.id]?[paramPos],
-           paramIndex < inputs.count, !inputs[paramIndex].isEmpty {
-            return (inputs[paramIndex], callee.scope ?? scope)
+                                                            call: call, in: table) {
+            // Literal function-type parameter (`func f(_ f: (Item) -> Int)`).
+            if let inputs = table.functionParamClosureInput[callee.id]?[paramPos],
+               paramIndex < inputs.count, !inputs[paramIndex].isEmpty {
+                return (inputs[paramIndex], callee.scope ?? scope)
+            }
+            // TYPEALIAS-wrapped function-type parameter (`func f(_ h: Handler)`,
+            // `typealias Handler = (En1) -> Void`). The parameter is not a literal FunctionTypeSyntax,
+            // so nothing landed in `functionParamClosureInput`; resolve the parameter's written type
+            // name to the alias and read its recorded inputs (B-FIX-55). The input name is written in
+            // the ALIAS's scope, so it travels back with `aliasSym.scope` (B-FIX-23 discipline).
+            if let paramTypes = table.functionParamTypes[callee.id], paramPos < paramTypes.count,
+               let paramTypeName = paramTypes[paramPos],
+               let aliasSym = typeSymbol(forQualifiedName: paramTypeName, in: callee.scope ?? scope),
+               aliasSym.kind == .typealias_,
+               let inputs = table.typealiasClosureInput[aliasSym.id],
+               paramIndex < inputs.count, !inputs[paramIndex].isEmpty {
+                return (inputs[paramIndex], aliasSym.scope ?? scope)
+            }
         }
         return nil
     }
