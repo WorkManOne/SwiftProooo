@@ -6988,6 +6988,146 @@ final class PatternTests: XCTestCase {
                       "the switch payload member, typed through the typealias completion, must resolve:\n\(r)")
     }
 
+    // MARK: - B-FIX-57: model stdlib Result<Success, Failure> payloads
+
+    func testResult_switchSuccessPayload_throughProtocolTypealiasCompletion_memberResolves() throws {
+        // The reported shape: a completion typed `(T1) -> Void` where `typealias T1 = Result<S, F>`
+        // in a protocol; `switch` on the closure param binds `.success(let x)`, and `x.member` must
+        // resolve. Result is stdlib (not in our table) and its payload is generic, so without the
+        // Result model `x` stayed untyped and its member desynced.
+        let r = try runPipeline("""
+        protocol Loader {
+            typealias Outcome = Result<Payload, LoadError>
+            func load(completion: @escaping (Outcome) -> Void)
+        }
+        struct Payload {
+            let value: Int
+        }
+        enum LoadError: Error { case boom }
+        final class Client {
+            private let loader: Loader
+            init(loader: Loader) { self.loader = loader }
+            func go() {
+                loader.load { result in
+                    switch result {
+                    case .success(let payload):
+                        _ = payload.value
+                    case .failure:
+                        break
+                    }
+                }
+            }
+        }
+        """)
+        let valueObf = try firstGroup(#"let (\w+): Int"#, in: r)
+        XCTAssertNotEqual(valueObf, "value", "the payload property decl must stay obfuscated:\n\(r)")
+        XCTAssertTrue(r.contains("payload.\(valueObf)") && !r.contains("payload.value"),
+                      "the .success payload member must resolve through the Result model:\n\(r)")
+    }
+
+    func testResult_directResultParam_switchPayloadMemberResolves() throws {
+        // Result written directly on a parameter (no typealias, no closure) — the same model applies.
+        let r = try runPipeline("""
+        struct Payload {
+            let field: Int
+        }
+        enum MyError: Error { case boom }
+        final class Handler {
+            func handle(_ outcome: Result<Payload, MyError>) {
+                switch outcome {
+                case .success(let p):
+                    _ = p.field
+                case .failure:
+                    break
+                }
+            }
+        }
+        """)
+        let fieldObf = try firstGroup(#"let (\w+): Int"#, in: r)
+        XCTAssertTrue(r.contains("p.\(fieldObf)") && !r.contains("p.field"),
+                      "the .success payload member on a direct Result param must resolve:\n\(r)")
+    }
+
+    func testResult_ifCaseSuccessPayload_memberResolves() throws {
+        // The condition-form (`if case .success(let x) = r`) routes through the same recorder.
+        let r = try runPipeline("""
+        struct Payload {
+            let field: Int
+        }
+        enum MyError: Error { case boom }
+        final class Handler {
+            func handle(_ outcome: Result<Payload, MyError>) {
+                if case .success(let p) = outcome {
+                    _ = p.field
+                }
+            }
+        }
+        """)
+        let fieldObf = try firstGroup(#"let (\w+): Int"#, in: r)
+        XCTAssertTrue(r.contains("p.\(fieldObf)") && !r.contains("p.field"),
+                      "the if-case .success payload member must resolve:\n\(r)")
+    }
+
+    func testResult_failurePayload_memberResolves() throws {
+        // `.failure(let e)` binds the SECOND type argument (a custom error struct with a member).
+        let r = try runPipeline("""
+        struct Payload { let ok: Int }
+        struct Failure { let reason: Int }
+        final class Handler {
+            func handle(_ outcome: Result<Payload, Failure>) {
+                switch outcome {
+                case .success:
+                    break
+                case .failure(let e):
+                    _ = e.reason
+                }
+            }
+        }
+        """)
+        // If the .failure payload resolves, `reason` renames at both the decl and `e.reason`, so the
+        // original name vanishes entirely; a desync would leave it surviving at the use-site.
+        XCTAssertFalse(r.contains("reason"),
+                       "the .failure payload member must resolve to the Failure type:\n\(r)")
+    }
+
+    func testResult_multilineTypealiasQualifiedArgs_switchPayloadResolves() throws {
+        // The real project wrote the typealias across several lines with QUALIFIED nested arguments,
+        // so the stored type string carried newlines. `.trimmingCharacters(in: .whitespaces)` leaves a
+        // leading `\n` on each argument, so it never resolved and the payload stayed untyped. This is
+        // the shape that shipped as a red build; the single-line test above would not have caught it.
+        let r = try runPipeline("""
+        enum Domain {
+            struct Success { let value: Int }
+            enum Failure: Error { case boom }
+        }
+        protocol Loader {
+            typealias Outcome = Result<
+                Domain.Success,
+                Domain.Failure
+            >
+            func load(completion: @escaping (Outcome) -> Void)
+        }
+        final class Client {
+            private let loader: Loader
+            init(loader: Loader) { self.loader = loader }
+            func go() {
+                loader.load { result in
+                    switch result {
+                    case .success(let payload):
+                        _ = payload.value
+                    case .failure:
+                        break
+                    }
+                }
+            }
+        }
+        """)
+        let valueObf = try firstGroup(#"let (\w+): Int"#, in: r)
+        XCTAssertNotEqual(valueObf, "value", "the payload property decl must stay obfuscated:\n\(r)")
+        XCTAssertTrue(r.contains("payload.\(valueObf)") && !r.contains("payload.value"),
+                      "the .success payload of a MULTI-LINE Result typealias must resolve:\n\(r)")
+    }
+
     // MARK: - B-FIX-52: every STORED type name resolves in its DECLARING scope
 
     // B-FIX-23 established the invariant for `declaredType`; these are the readers that were

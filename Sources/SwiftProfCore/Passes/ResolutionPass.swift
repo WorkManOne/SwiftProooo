@@ -622,24 +622,48 @@ private final class ResolutionVisitor: SyntaxVisitor {
     /// passes nil: its frame is popped with its own scope.
     private func recordEnumPayloadBindingTypes(pattern: PatternSyntax, matching subject: ExprSyntax,
                                                visibleIn extent: ConditionBindingExtent.Visibility? = nil) {
-        guard let enumSym = typeResolver.typeSymbol(of: subject, in: currentScope),
-              enumSym.kind == .enum,
-              let enumScope = innerScope(of: enumSym),
-              let (caseName, bindings) = Self.enumPatternBindings(of: pattern),
-              let caseSym = enumScope.members(named: caseName).first(where: { $0.kind == .enumCase }),
-              let types = table.enumCaseAssociatedTypes[caseSym.id],
-              types.count == bindings.count else { return }
-        let caseScope = caseSym.scope ?? currentScope
-        for (binding, type) in zip(bindings, types) {
-            guard let binding, let type else { continue }
-            // The associated type is WRITTEN in the enum's own scope, so that is where it resolves.
-            // Storing the pair keeps that fact with the name instead of qualifying the string and
-            // hoping the qualified form resolves from wherever it is read (B-FIX-35).
-            let resolved = typeResolver.typeSymbol(forQualifiedName: type, in: caseScope)
-            let info = resolved.map { ($0.name, $0.scope ?? caseScope) } ?? (type, caseScope)
-            shadowBindingTypeFrames.bind(binding, visibleIn: extent,
-                                         (name: info.0, scope: info.1))
+        // LOCAL enum: the case's associated types are recorded and resolve in the enum's own scope.
+        if let enumSym = typeResolver.typeSymbol(of: subject, in: currentScope),
+           enumSym.kind == .enum,
+           let enumScope = innerScope(of: enumSym),
+           let (caseName, bindings) = Self.enumPatternBindings(of: pattern),
+           let caseSym = enumScope.members(named: caseName).first(where: { $0.kind == .enumCase }),
+           let types = table.enumCaseAssociatedTypes[caseSym.id],
+           types.count == bindings.count {
+            let caseScope = caseSym.scope ?? currentScope
+            for (binding, type) in zip(bindings, types) {
+                guard let binding, let type else { continue }
+                // The associated type is WRITTEN in the enum's own scope, so that is where it resolves.
+                // Storing the pair keeps that fact with the name instead of qualifying the string and
+                // hoping the qualified form resolves from wherever it is read (B-FIX-35).
+                let resolved = typeResolver.typeSymbol(forQualifiedName: type, in: caseScope)
+                let info = resolved.map { ($0.name, $0.scope ?? caseScope) } ?? (type, caseScope)
+                shadowBindingTypeFrames.bind(binding, visibleIn: extent,
+                                             (name: info.0, scope: info.1))
+            }
+            return
         }
+        // Stdlib `Result<Success, Failure>` (B-FIX-57): not in our table and its payloads are generic,
+        // so the local path above cannot type `.success(let x)`. Result's shape is fixed, so model it.
+        recordResultPayloadBindingTypes(pattern: pattern, matching: subject, visibleIn: extent)
+    }
+
+    /// `switch r { case .success(let x): … }` where `r : Result<Success, Failure>` (stdlib, commonly
+    /// reached through a protocol `typealias` on a completion handler). `.success` binds the first
+    /// type argument, `.failure` the second (`ResultTypeName`). The Result type name is read via
+    /// `receiverTypeInfo` + `expandedTypeName` (so a `typealias T1 = Result<…>` is unwrapped) and the
+    /// payload is resolved in the scope that type was WRITTEN in (B-FIX-35 discipline). Fail-closed:
+    /// not a Result, an unknown case, or a single-binding pattern only.
+    private func recordResultPayloadBindingTypes(pattern: PatternSyntax, matching subject: ExprSyntax,
+                                                 visibleIn extent: ConditionBindingExtent.Visibility?) {
+        guard let (caseName, bindings) = Self.enumPatternBindings(of: pattern),
+              bindings.count == 1, let binding = bindings[0],
+              let info = typeResolver.receiverTypeInfo(of: subject, in: currentScope) else { return }
+        let expanded = typeResolver.expandedTypeName(info.name, in: info.declScope)
+        guard let payload = ResultTypeName.payloadType(caseName: caseName, of: expanded.name) else { return }
+        let resolved = typeResolver.typeSymbol(forQualifiedName: payload, in: expanded.scope)
+        let bound = resolved.map { ($0.name, $0.scope ?? expanded.scope) } ?? (payload, expanded.scope)
+        shadowBindingTypeFrames.bind(binding, visibleIn: extent, (name: bound.0, scope: bound.1))
     }
 
     /// Subject expression of the `switch` a case belongs to.
