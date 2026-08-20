@@ -536,11 +536,18 @@ private final class ProtectionVisitor: SyntaxVisitor {
         return nil
     }
 
-    private func protectMembers(of typeSym: Symbol, reason: String) {
+    /// Protect the members of `typeSym`. `kinds`, when given, restricts protection to those member
+    /// KINDS — used by the raw-type-enum rule, whose contract ties only the CASES to their names: a
+    /// computed property / method / nested type of a raw enum has nothing to do with the raw value
+    /// and is freely renameable, so protecting it is pure coverage loss. This became visible once
+    /// ExtensionOwnerResolver folds an `extension E.Raw { var p }` member into the enum's scope
+    /// (B-FIX-58): before that the extension member lived in an external scope this pass never saw.
+    private func protectMembers(of typeSym: Symbol, reason: String, kinds: Set<SymbolKind>? = nil) {
         guard let scope = typeSym.scope else { return }
         // Find the child scope owned by this type symbol.
         for child in scope.children where child.owner?.id == typeSym.id {
             for member in child.symbols {
+                if let kinds, !kinds.contains(member.kind) { continue }
                 protect(member.id, reason)
             }
         }
@@ -602,7 +609,10 @@ private final class ProtectionVisitor: SyntaxVisitor {
         }
         if hasRaw, let sym = typeSymbol(declaredAt: node.name) {
             protect(sym.id, "enum with raw type")
-            protectMembers(of: sym, reason: "raw-type enum case")
+            // Only the CASES carry the raw-value contract; a computed property / method / nested type
+            // of the enum (including one added in an `extension E.Raw { … }`, now folded in by
+            // ExtensionOwnerResolver — B-FIX-58) is freely renameable.
+            protectMembers(of: sym, reason: "raw-type enum case", kinds: [.enumCase])
         }
         return .visitChildren
     }

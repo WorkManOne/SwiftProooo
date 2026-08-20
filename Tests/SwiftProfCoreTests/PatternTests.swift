@@ -1209,12 +1209,18 @@ final class PatternTests: XCTestCase {
         let a = try runPipeline(source, rawValues: .safe)
         XCTAssertTrue(a.contains("case happy = \"rv0\""),
                       "the raw literal must be obfuscated to the opaque token (base is now resolvable):\n\(a)")
-        XCTAssertTrue(a.range(of: #"\w+\[0\]\.displayName"#, options: .regularExpression) != nil,
-                      "the subscript-base .rawValue must be redirected to .displayName:\n\(a)")
+        // The `.rawValue` on the subscript base was redirected to the synthesized `displayName`
+        // accessor. Since B-FIX-58 narrowed the raw-enum protection to CASES, that accessor is itself
+        // obfuscated — renamed CONSISTENTLY at its declaration and this use-site (a coverage gain), so
+        // the subscript base now reads `<base>[0].<propertyObf>` rather than the literal `.displayName`.
+        XCTAssertTrue(a.range(of: #"\w+\[0\]\.p\d+"#, options: .regularExpression) != nil,
+                      "the subscript-base .rawValue must be redirected to the displayName accessor:\n\(a)")
         XCTAssertFalse(a.contains(".rawValue"),
                       "no un-redirected .rawValue may survive:\n\(a)")
+        XCTAssertFalse(a.contains(".displayName"),
+                      "the redirected accessor is renamed consistently, so no literal .displayName survives:\n\(a)")
         XCTAssertTrue(a.contains("return \"Happy\""),
-                      "displayName must preserve the original value so runtime behaviour is unchanged:\n\(a)")
+                      "the accessor must preserve the original value so runtime behaviour is unchanged:\n\(a)")
     }
 
     // MARK: - B-FIX-4: transitive @objc inheritance + #selector protection
@@ -7272,6 +7278,158 @@ final class PatternTests: XCTestCase {
                       "an enum with a .rawValue we cannot redirect must NOT be obfuscated:\n\(r)")
         XCTAssertFalse(r.contains("displayName"),
                        "no displayName may be synthesized for the aborted enum:\n\(r)")
+    }
+
+    // MARK: - Extension on a type nested inside ANOTHER extension (B-FIX-58)
+
+    /// The resolution fix, isolated from any protection. A type nested inside an extension
+    /// (`extension Registry { struct Token }`) that is then itself extended
+    /// (`extension Registry.Token { var caption; func summary() }`). ExtensionOwnerResolver runs
+    /// BEFORE ScopeUnification, so at owner-resolution time `Token` is still in the
+    /// `extension Registry` scope and not yet folded into Registry's canonical scope — the qualified
+    /// walk `Registry.Token` failed, the extension's owner was left nil, it was misclassified as an
+    /// EXTERNAL extension, and its members were renamed via the external-unique path while
+    /// ScopeUnification never folded them into `Token`'s scope. The typed use-sites then could not
+    /// find the member. Deliberately NOT property-specific: a METHOD desyncs the same way.
+    func testExtensionOnTypeNestedInExtension_memberUseSitesResolve() throws {
+        let rewritten = try runPipeline("""
+        enum Registry {}
+
+        extension Registry {
+            struct Token {
+                let identifier: Int
+            }
+        }
+
+        extension Registry.Token {
+            var caption: String { "c\\(identifier)" }
+            func summary() -> String { caption }
+        }
+
+        final class Reader {
+            func read(for token: Registry.Token?) -> String? {
+                return token?.caption
+            }
+            func describe(_ token: Registry.Token) -> String {
+                return token.summary()
+            }
+        }
+        """)
+        // Property: renamed at decl, the `token?.caption` use-site, AND the bare `caption` inside
+        // `summary()` (implicit self). Method: renamed at decl AND the `token.summary()` call.
+        XCTAssertFalse(rewritten.contains("caption"),
+                       "property on a type nested in an extension must be renamed at all sites:\n\(rewritten)")
+        XCTAssertFalse(rewritten.contains("summary"),
+                       "method on a type nested in an extension must be renamed at all sites:\n\(rewritten)")
+        // The optional-chained property use-site resolved to a property obf (`p<n>`). The parameter
+        // itself is renamed too (distinct external label), so match on the `?.p` shape, not its name.
+        XCTAssertTrue(rewritten.contains("?.p"),
+                      "the property use-site must resolve to the property's obf:\n\(rewritten)")
+    }
+
+    /// The reported end-to-end shape: the nested type is a raw-type `Decodable` enum, exactly as in
+    /// the bug report. This needs BOTH halves of B-FIX-58 to end green AND obfuscated: owner
+    /// resolution (so `shade?.captionText` resolves) and the raw-enum protection narrowed to CASES
+    /// (so `captionText`, a computed property folded into the enum, is not over-protected).
+    func testExtensionOnRawEnumNestedInExtension_propertyRenamedAndUseSiteResolves() throws {
+        let rewritten = try runPipeline("""
+        enum Palette {}
+
+        extension Palette {
+            enum Shade: String, Decodable {
+                case light = "lightRaw"
+                case dark = "darkRaw"
+            }
+        }
+
+        extension Palette.Shade {
+            var captionText: String {
+                switch self {
+                case .light: return "L"
+                case .dark: return "D"
+                }
+            }
+        }
+
+        final class Renderer {
+            func render(for shade: Palette.Shade?) -> String? {
+                return shade?.captionText
+            }
+        }
+        """)
+        XCTAssertFalse(rewritten.contains("captionText"),
+                       "captionText must be renamed at BOTH its declaration and its use-site:\n\(rewritten)")
+        XCTAssertTrue(rewritten.contains("?.p"),
+                      "the shade?.captionText use-site must resolve to the property's obf:\n\(rewritten)")
+        // The raw-value contract is still protected: the CASES and the type name survive.
+        XCTAssertTrue(rewritten.contains("case light = \"lightRaw\""),
+                      "raw-type enum CASES stay protected (the raw-value contract):\n\(rewritten)")
+        XCTAssertTrue(rewritten.contains("enum Shade"),
+                      "a raw-type enum's own name stays protected:\n\(rewritten)")
+    }
+
+    /// The protection half in isolation (B-FIX-58): the members of a raw-type enum other than its
+    /// CASES carry no raw-value contract, so they must rename. Guards that the narrowing did not
+    /// leak into the cases or the type name.
+    func testRawTypeEnum_nonCaseMembersRename_casesStayProtected() throws {
+        let rewritten = try runPipeline("""
+        enum Mood: String {
+            case calm = "calmRaw"
+            case tense = "tenseRaw"
+
+            var moodCaption: String {
+                switch self {
+                case .calm: return "Calm"
+                case .tense: return "Tense"
+                }
+            }
+            func moodBadge() -> String { moodCaption }
+        }
+
+        final class Screen {
+            func show(_ mood: Mood) -> String {
+                return mood.moodCaption + mood.moodBadge()
+            }
+        }
+        """)
+        XCTAssertFalse(rewritten.contains("moodCaption"),
+                       "a computed property of a raw-type enum is not a case and must rename:\n\(rewritten)")
+        XCTAssertFalse(rewritten.contains("moodBadge"),
+                       "a method of a raw-type enum is not a case and must rename:\n\(rewritten)")
+        XCTAssertTrue(rewritten.contains("case calm = \"calmRaw\""),
+                      "the raw-value CASES stay protected:\n\(rewritten)")
+        XCTAssertTrue(rewritten.contains("enum Mood"),
+                      "the raw-type enum's own name stays protected:\n\(rewritten)")
+    }
+
+    /// A MIDDLE/last segment that is a `typealias` declared in an extension (B-FIX-58): the slow path
+    /// must UNWRAP it to the underlying type, or the extension's members get attributed to the
+    /// typealias symbol (no inner scope ⇒ ScopeUnification never folds them) and the typed use-site
+    /// desyncs — the same class, not mere under-obfuscation.
+    func testExtensionOnTypealiasNestedInExtension_memberUseSiteResolves() throws {
+        let rewritten = try runPipeline("""
+        enum Registry {
+            struct Token { let identifier: Int }
+        }
+
+        extension Registry {
+            typealias Alias = Token
+        }
+
+        extension Registry.Alias {
+            var caption: String { "c\\(identifier)" }
+        }
+
+        final class Reader {
+            func read(for tok: Registry.Token?) -> String? {
+                return tok?.caption
+            }
+        }
+        """)
+        XCTAssertFalse(rewritten.contains("caption"),
+                       "a member added via `extension Registry.Alias` must rename on `Registry.Token` too:\n\(rewritten)")
+        XCTAssertTrue(rewritten.contains("?.p"),
+                      "the tok?.caption use-site must resolve to the property's obf:\n\(rewritten)")
     }
 
 }
