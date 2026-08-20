@@ -878,12 +878,97 @@ public final class TypeResolver {
                                                    receiver: base, in: scope) {
                 return result
             }
+            // `xs.map/compactMap { … }` — a TRANSFORMING member whose element differs from the
+            // receiver's, which `CollectionMemberRegistry` deliberately excludes. The element IS
+            // knowable — it is the type the closure RETURNS — so a HOF (or subscript, or member)
+            // chained after it (`xs.compactMap { … }.sorted { $0.m }`) can finally type its own
+            // closure parameter instead of leaving it untyped (the desync class).
+            if let mapped = transformingMapResult(of: call, in: scope) {
+                return mapped
+            }
             if let callee = calleeCallable(for: call, in: scope),
                let ret = table.functionReturnType[callee.id] {
                 return (ret, callee.scope ?? scope)
             }
         }
         return nil
+    }
+
+    /// Result type of `receiver.map/compactMap/flatMap { … }` on a SEQUENCE receiver, modelled as
+    /// `[R]` where R is the type the closure RETURNS (B-FIX-56). This is the part of "knowing Array's API" that
+    /// `CollectionMemberRegistry` cannot answer statically — a transforming member's element is not a
+    /// function of the receiver's element, it is a function of the closure — so it is computed here by
+    /// typing the closure's return expression, in the closure's OWN scope (that is where its parameter
+    /// `$0` / the named binding lives).
+    ///
+    /// Fail-closed at every step, because a wrong result element drives a wrong rename RollbackPass
+    /// cannot catch:
+    ///   - only a SEQUENCE receiver (`[T]`, `Array<T>`, `Set<T>`): typing `opt.map { }` as `[R]`
+    ///     would be wrong — `Optional.map` yields `R?`, not `[R]`;
+    ///   - `flatMap` over a sequence returns the closure's `[T]`, and `typeSymbol` answers nil for a
+    ///     collection expression (B-FIX-28), so the sequence form of `flatMap` naturally declines
+    ///     here; only its optional form (`opt.flatMap { $0 }`, closure returns `T?`) types, and there
+    ///     the `[T]` we report over an Optional receiver is already excluded by the sequence guard;
+    ///   - a `compactMap` closure filters with `return nil`; those returns are ignored, and the
+    ///     remaining non-nil returns must all type to the SAME symbol or the whole thing declines.
+    private func transformingMapResult(of call: FunctionCallExprSyntax,
+                                       in scope: Scope) -> (name: String, declScope: Scope)? {
+        guard let member = call.calledExpression.as(MemberAccessExprSyntax.self),
+              let receiver = member.base else { return nil }
+        let method = Self.stripBackticks(member.declName.baseName.text)
+        guard method == "map" || method == "compactMap" || method == "flatMap" else { return nil }
+        // Sequence receiver only (not Optional.map / Optional.flatMap).
+        guard let recvInfo = receiverTypeInfo(of: receiver, in: scope) else { return nil }
+        let recvExpanded = expandedTypeName(recvInfo.name, in: recvInfo.declScope)
+        guard CollectionMemberRegistry.sequenceElement(of: recvExpanded.name) != nil else { return nil }
+        guard let closure = Self.closureArgument(of: call, at: 0),
+              let ret = closureReturnType(of: closure, in: scope) else { return nil }
+        // compactMap's element is the closure's non-optional return; `typeSymbol` already unwrapped
+        // any `?`, so the qualified name here is the element directly.
+        return ("[\(TypeInferencePass.qualifiedName(of: ret))]", ret.scope ?? scope)
+    }
+
+    /// The closure passed as argument `index` of `call` — a trailing closure (at position
+    /// `arguments.count`) or a closure literal in the labeled/positional argument list.
+    static func closureArgument(of call: FunctionCallExprSyntax, at index: Int) -> ClosureExprSyntax? {
+        if index == call.arguments.count { return call.trailingClosure }
+        guard index < call.arguments.count else { return nil }
+        let arg = call.arguments[call.arguments.index(call.arguments.startIndex, offsetBy: index)]
+        return arg.expression.as(ClosureExprSyntax.self)
+    }
+
+    /// The type a closure RETURNS, resolved in the closure's own scope. Handles the implicit
+    /// single-expression return and explicit `return <expr>` statements. Fail-closed: a `nil` literal
+    /// return is skipped (the `compactMap` filter), any other return that cannot be typed forces a
+    /// decline, and two non-nil returns that disagree decline. Nested closures / nested `func`s are
+    /// not descended into — their `return` belongs to them.
+    private func closureReturnType(of closure: ClosureExprSyntax, in scope: Scope) -> Symbol? {
+        let closureScope = table.innerScope[closure.id] ?? scope
+        let stmts = closure.statements
+        // Implicit single-expression return: `map { $0.foo }`.
+        if stmts.count == 1, let only = stmts.first, let e = only.item.as(ExprSyntax.self) {
+            return typeSymbol(of: e, in: closureScope)
+        }
+        var result: Symbol?
+        var declined = false
+        func scan(_ node: Syntax) {
+            for child in node.children(viewMode: .sourceAccurate) {
+                if child.is(ClosureExprSyntax.self) || child.is(FunctionDeclSyntax.self) { continue }
+                if let ret = child.as(ReturnStmtSyntax.self) {
+                    if let e = ret.expression, !e.is(NilLiteralExprSyntax.self) {
+                        if let sym = typeSymbol(of: e, in: closureScope) {
+                            if let have = result, have.id != sym.id { declined = true } else { result = sym }
+                        } else {
+                            declined = true
+                        }
+                    }
+                    continue
+                }
+                scan(child)
+            }
+        }
+        scan(Syntax(stmts))
+        return declined ? nil : result
     }
 
     /// Result type of `receiver.member` when `receiver` is a stdlib collection whose member has a

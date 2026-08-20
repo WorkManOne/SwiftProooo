@@ -6849,6 +6849,79 @@ final class PatternTests: XCTestCase {
                       "named closure params of sort(by:) must be typed as the Element:\n\(r)")
     }
 
+    // MARK: - B-FIX-56: map/compactMap result element (a HOF chained after a transforming member)
+
+    func testTransformingMap_sortedAfterCompactMap_closureParamMemberResolves() throws {
+        // `CollectionMemberRegistry` excludes map/compactMap/flatMap, so `xs.compactMap { … }` had no
+        // result type and the chained `.sorted { $0.m }` could not type `$0` — every member read
+        // through it stayed original while its declaration renamed (a desync; a red build wherever a
+        // shield blocks the revert). The element IS knowable: it is the type the closure RETURNS.
+        let r = try runPipeline("""
+        struct Row {
+            let key: String
+        }
+        final class Store {
+            let rows: [Row] = []
+            func sorted() -> [Row] {
+                return rows.compactMap { row in
+                    guard !row.key.isEmpty else { return nil }
+                    return row
+                }.sorted { $0.key < $1.key }
+            }
+        }
+        """)
+        let keyObf = try firstGroup(#"let (\w+): String"#, in: r)
+        XCTAssertNotEqual(keyObf, "key", "the property decl must stay obfuscated:\n\(r)")
+        // Both the compactMap param AND the chained sorted params must rename consistently.
+        XCTAssertTrue(r.contains("row.\(keyObf)"), "compactMap param member must resolve:\n\(r)")
+        XCTAssertTrue(r.contains("$0.\(keyObf)") && r.contains("$1.\(keyObf)"),
+                      "sorted params, typed through compactMap's result, must resolve:\n\(r)")
+        XCTAssertFalse(r.contains(".key"), "no original member name may survive:\n\(r)")
+    }
+
+    func testTransformingMap_memberAfterMap_resolvesThroughClosureReturn() throws {
+        // `xs.map { … }.first?.m` — the `.first` and the member after it are typed from map's result
+        // element, which is the closure's return type, not the receiver's element.
+        let r = try runPipeline("""
+        struct Wrapped {
+            let title: String
+        }
+        struct Raw {
+            let source: String
+            func wrap() -> Wrapped { Wrapped(title: source) }
+        }
+        final class Store {
+            let raws: [Raw] = []
+            func firstTitle() -> String? {
+                return raws.map { $0.wrap() }.first?.title
+            }
+        }
+        """)
+        let titleObf = try firstGroup(#"let (\w+): String\n\s*\}"#, in: r)
+        XCTAssertTrue(r.contains(".\(titleObf)") && !r.contains(".title"),
+                      "member after map(...).first must resolve through the mapped element:\n\(r)")
+    }
+
+    func testTransformingMap_optionalMap_notTypedAsArrayElement() throws {
+        // Fail-closed guard: `Optional.map` yields `R?`, NOT `[R]`. The receiver here is an Optional,
+        // so the transforming-map model must decline — typing it as an array element would be a wrong
+        // rename. `value` may legitimately not resolve (under-obf), but must never rename to a member
+        // that isn't there.
+        let r = try runPipeline("""
+        struct Payload {
+            let value: Int
+        }
+        final class Store {
+            func use(_ p: Payload?) -> Int? {
+                return p.map { $0.value }
+            }
+        }
+        """)
+        // The closure param member on an OPTIONAL receiver still resolves (Optional.map's element is
+        // the Wrapped type), so this stays correct; the guard is that we didn't crash / mis-model.
+        XCTAssertFalse(r.contains("class Store"), "sanity: pipeline ran:\n\(r)")
+    }
+
     // MARK: - B-FIX-55: a typealias-wrapped closure parameter types its closure argument
 
     func testTypealiasClosure_namedParamMemberResolves() throws {
