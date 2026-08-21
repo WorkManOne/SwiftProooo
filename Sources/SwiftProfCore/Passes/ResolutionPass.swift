@@ -87,6 +87,30 @@ public final class ResolutionPass {
             ))
         }
 
+        // 1b) Index-driven use-site renames (opt-in, index active). These come from the compiler's
+        // occurrence set (USR ground truth), so they cover the use-sites the syntactic resolver
+        // cannot type (`receiver-untyped`, generic substitution). Their positions are recorded so
+        // the syntactic pass below defers to them: the index wins wherever it has an occurrence, and
+        // syntax fills the rest (the ~15% of symbols the index never maps, plus every unindexed
+        // position). Declaration renames stay on the pass-1 loop above — the emitter skips each
+        // declaration's own occurrence — so this only ever adds use-site edits.
+        var coveredByIndex: [ObjectIdentifier: Set<Int>] = [:]
+        // `--explain` only: offset → the symbol the index-driven edit targets, so a use-site the
+        // resolver DECLINED (`receiver-untyped`) but the index renamed is recorded as the rewrite it
+        // actually is, not as a survivor. Built only when recording is on.
+        var indexTargetByOffset: [ObjectIdentifier: [Int: Int]] = [:]
+        if let ctx = indexContext {
+            let result = IndexDrivenRenamer(table: table, map: map, ctx: ctx, logger: logger)
+                .run(on: files.filter { $0.module.writable })
+            renames.append(contentsOf: result.renames)
+            coveredByIndex = result.coveredOffsetsByFile
+            if useSiteLog != nil {
+                for r in result.renames {
+                    indexTargetByOffset[ObjectIdentifier(r.file), default: [:]][r.offset] = r.targetSymbolId
+                }
+            }
+        }
+
         // 2) Use-site renames — walk each writable file's syntax tree.
         let uniqueExternal = uniqueExternalMembers
             ? Self.uniqueExternalExtensionMembers(in: table, map: map) : [:]
@@ -100,24 +124,42 @@ public final class ResolutionPass {
         }
         for file in files where file.module.writable {
             guard let fileScope = table.fileScopes[ObjectIdentifier(file)] else { continue }
+            let fileKey = ObjectIdentifier(file)
+            let covered = coveredByIndex[fileKey] ?? []
+            let indexTargets = indexTargetByOffset[fileKey] ?? [:]
             let visitor = ResolutionVisitor(file: file, table: table, map: map, fileScope: fileScope,
                                             indexContext: indexContext,
                                             uniqueExternalMembers: uniqueExternal,
                                             useSiteLog: useSiteLog,
-                                            projectNames: projectNames)
+                                            projectNames: projectNames,
+                                            indexCoveredOffsets: covered,
+                                            indexTargetByOffset: indexTargets)
             visitor.walk(file.syntax)
-            renames.append(contentsOf: visitor.renames)
+            // Index priority: drop any syntactic edit at a position the index already resolved, so
+            // the compiler's pick stands where it disagrees with the syntactic guess.
+            if covered.isEmpty {
+                renames.append(contentsOf: visitor.renames)
+            } else {
+                renames.append(contentsOf: visitor.renames.filter { !covered.contains($0.offset) })
+            }
             // Prove the instrumentation's own coverage: any use-site position the resolver made no
-            // decision about becomes a `no-decision` record rather than silence.
+            // decision about becomes a `no-decision` record rather than silence. A position the index
+            // renamed but the resolver never visited is a rewrite, not a survivor.
             if let log = useSiteLog {
                 let sweep = UseSiteSweep()
                 sweep.walk(file.syntax)
                 for site in sweep.sites
                 where !visitor.recordedOffsets.contains(site.offset)
                    && projectNames.contains(site.name) {
-                    log.record(UseSiteRecord(
-                        filePath: file.url.path, offset: site.offset, name: site.name,
-                        outcome: .kept(cause: .noDecision, receiver: nil, candidateIds: [])))
+                    if covered.contains(site.offset), let tid = indexTargets[site.offset] {
+                        log.record(UseSiteRecord(filePath: file.url.path, offset: site.offset,
+                                                 name: site.name,
+                                                 outcome: .rewritten(targetSymbolId: tid)))
+                    } else {
+                        log.record(UseSiteRecord(
+                            filePath: file.url.path, offset: site.offset, name: site.name,
+                            outcome: .kept(cause: .noDecision, receiver: nil, candidateIds: [])))
+                    }
                 }
             }
         }
@@ -313,6 +355,13 @@ private final class ResolutionVisitor: SyntaxVisitor {
     private let useSiteLog: UseSiteLog?
     /// Names declared by a writable-module symbol. The layer 2 filter.
     private let projectNames: Set<String>
+    /// Positions the index-driven emitter renamed (`--explain` only; empty otherwise). A use-site the
+    /// resolver DECLINES here was actually rewritten by the index, so it is recorded as a rewrite, not
+    /// a survivor — otherwise the report over-counts `receiver-untyped` at positions that WERE renamed.
+    private let indexCoveredOffsets: Set<Int>
+    /// offset → the symbol id the index-driven edit at that offset targets. Read alongside
+    /// `indexCoveredOffsets` when recording an otherwise-declined use-site.
+    private let indexTargetByOffset: [Int: Int]
     /// Every use-site offset this visitor made a decision about, filtered or not. `UseSiteSweep`
     /// (Task 3) diffs against it, so an offset deliberately dropped by `projectNames` must still be
     /// inserted here or the sweep would re-report it as a reporter gap.
@@ -322,7 +371,9 @@ private final class ResolutionVisitor: SyntaxVisitor {
          indexContext: IndexContext? = nil,
          uniqueExternalMembers: [String: [String: Symbol]] = [:],
          useSiteLog: UseSiteLog? = nil,
-         projectNames: Set<String> = []) {
+         projectNames: Set<String> = [],
+         indexCoveredOffsets: Set<Int> = [],
+         indexTargetByOffset: [Int: Int] = [:]) {
         self.file = file
         self.table = table
         self.map = map
@@ -330,6 +381,8 @@ private final class ResolutionVisitor: SyntaxVisitor {
         self.uniqueExternalMembers = uniqueExternalMembers
         self.useSiteLog = useSiteLog
         self.projectNames = projectNames
+        self.indexCoveredOffsets = indexCoveredOffsets
+        self.indexTargetByOffset = indexTargetByOffset
         // Build the converter only when the index is engaged (it parses positions; skip the cost
         // on the syntactic baseline). Use locals to avoid reading self before super.init.
         let path: String?
@@ -388,8 +441,14 @@ private final class ResolutionVisitor: SyntaxVisitor {
         // strictly more informative (it names the target). Recording a `.kept` here too would leave
         // two contradicting records at one source position.
         guard useSiteLog != nil, cause != .candidateHasNoObf else { return }
-        recordUseSite(name: name,
-                      offset: token.positionAfterSkippingLeadingTrivia.utf8Offset,
+        let offset = token.positionAfterSkippingLeadingTrivia.utf8Offset
+        // The index-driven emitter renamed this position, so the syntactic decline is not what
+        // happened here: record the rewrite the index made, not a `receiver-untyped` survivor.
+        if let tid = indexTargetByOffset[offset], indexCoveredOffsets.contains(offset) {
+            recordUseSite(name: name, offset: offset, outcome: .rewritten(targetSymbolId: tid))
+            return
+        }
+        recordUseSite(name: name, offset: offset,
                       outcome: .kept(cause: cause, receiver: receiver, candidateIds: candidateIds))
     }
 
