@@ -486,7 +486,11 @@ private final class ResolutionVisitor: SyntaxVisitor {
         guard let sym = currentScope.lookup(name: name, at: offset) else { return nil }
         guard Self.isValueBinding(sym.kind), let declScope = sym.scope,
               isInsideOwnInitializer(of: sym, node: node) else { return sym }
-        return declScope.parent?.lookup(name: name, at: offset)
+        // Re-resolve as if the local did not exist: from just before its own declaration. This finds
+        // a same-scope shadowed PARAMETER (a closure's `{ p in var p = p }`, where parameter and body
+        // local share ONE scope, B-FIX-59) — which `declScope.parent` would skip — and otherwise
+        // walks the enclosing chain exactly as before (`let count = count + 1` reads the property).
+        return declScope.lookup(name: name, at: sym.declOffset - 1)
     }
 
     /// Whether `pattern` declares an identifier at decl-offset `offset` (`let name`, or a tuple

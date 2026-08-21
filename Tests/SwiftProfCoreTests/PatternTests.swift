@@ -7432,4 +7432,102 @@ final class PatternTests: XCTestCase {
                       "the tok?.caption use-site must resolve to the property's obf:\n\(rewritten)")
     }
 
+    // MARK: - B-FIX-59: a closure body-local shadows a same-named closure parameter
+
+    func testClosureLocalShadowsParam_usesBindToTheLocal_membersRename() throws {
+        // `var item = item` inside a closure: the local shadows the closure PARAMETER — they share
+        // the closure's ONE scope (a closure body is not a nested block the way a function body is),
+        // so every use below the declaration must bind to the LOCAL. Source order returned the
+        // parameter, so the renamed local was orphaned and its uses stayed on the parameter — a
+        // desync — and `item.tag = …` mutated the `let` parameter ("cannot assign to property: … is
+        // a 'let' constant"). B-FIX-59.
+        let r = try runPipeline("""
+        struct Item { var tag: Int; var flag: Bool }
+        final class Runner {
+            func f(_ items: [Item]) -> [Item] {
+                return items.enumerated().map { (idx, item) in
+                    var item = item
+                    item.tag = idx
+                    item.flag = true
+                    return item
+                }
+            }
+        }
+        """)
+        // The local is obfuscated and copies the (un-renameable) closure parameter, still spelled `item`.
+        let localObf = try firstGroup(#"var (\w+) = item"#, in: r)
+        XCTAssertNotEqual(localObf, "item", "the local must be obfuscated:\n\(r)")
+        // Every body use binds to the LOCAL's obf, and its members still rename (typed through the
+        // local, whose type is the parameter's).
+        XCTAssertTrue(r.contains("\(localObf).p"), "member access must bind to the local:\n\(r)")
+        XCTAssertTrue(r.contains("return \(localObf)"), "the return must bind to the local:\n\(r)")
+        XCTAssertFalse(r.contains("item.p"), "no body use may stay on the `let` parameter:\n\(r)")
+        XCTAssertFalse(r.contains("var tag"), "Item.tag must rename (typed through the local):\n\(r)")
+        XCTAssertFalse(r.contains("var flag"), "Item.flag must rename:\n\(r)")
+    }
+
+    func testClosureLocalShadowsParam_letCopy_memberReadBindsToTheLocal() throws {
+        // The `let` copy of a shorthand closure parameter, same invariant.
+        let r = try runPipeline("""
+        struct Item { var tag: Int }
+        final class Runner {
+            func f(_ items: [Item]) -> [Int] {
+                return items.map { item in
+                    let item = item
+                    return item.tag
+                }
+            }
+        }
+        """)
+        let localObf = try firstGroup(#"let (\w+) = item"#, in: r)
+        XCTAssertNotEqual(localObf, "item", "the local must be obfuscated:\n\(r)")
+        XCTAssertTrue(r.contains("return \(localObf).p"),
+                      "the member read binds to the local, whose type is the parameter's:\n\(r)")
+    }
+
+    func testFunctionLocalShadowsParam_differentScopes_stillResolves() throws {
+        // The FUNCTION analogue is the guard-rail: a parameter and a body local sit in DIFFERENT
+        // scopes (the body is a nested block, and the parameter carries a WRITTEN type), so this path
+        // was already correct — the closure fix must not disturb it.
+        let r = try runPipeline("""
+        struct Box { var value: Int }
+        final class C {
+            func g(item: Box) -> Int {
+                var item = item
+                item.value = 5
+                return item.value
+            }
+        }
+        """)
+        let localObf = try firstGroup(#"var (\w+) = item"#, in: r)
+        XCTAssertNotEqual(localObf, "item", "the local must be obfuscated:\n\(r)")
+        XCTAssertTrue(r.contains("\(localObf).p"), "the member access binds to the local:\n\(r)")
+        XCTAssertFalse(r.contains("var value"), "Box.value must rename:\n\(r)")
+    }
+
+    func testClosureLocalShadowsParam_nonSelfCopyInitializer_notMistyped() throws {
+        // The safety guard: only a self-copy `var x = x` inherits the shadowed parameter's type. A
+        // local initialized from something ELSE (`var item = wrap(item)`) must NOT be typed as the
+        // closure element — that would be a wrong rename. Here the local's real type is `Other`, and
+        // reading `item.other` must resolve to `Other.other`, never to `Item`'s member.
+        let r = try runPipeline("""
+        struct Other { var other: Int }
+        struct Item { var tag: Int }
+        final class Runner {
+            func wrap(_ i: Item) -> Other { return Other(other: i.tag) }
+            func f(_ items: [Item]) -> [Int] {
+                return items.map { item in
+                    let item = wrap(item)
+                    return item.other
+                }
+            }
+        }
+        """)
+        // `Other.other` renames and the member read resolves to it — not mistyped as `Item`.
+        XCTAssertFalse(r.contains("var other"), "Other.other must rename:\n\(r)")
+        let otherObf = try firstGroup(#"struct \w+ \{ var (\w+): Int \}"#, in: r)
+        XCTAssertTrue(r.contains("return \(try firstGroup(#"let (\w+) = "#, in: r)).\(otherObf)"),
+                      "the read must resolve through the local's REAL type (Other):\n\(r)")
+    }
+
 }

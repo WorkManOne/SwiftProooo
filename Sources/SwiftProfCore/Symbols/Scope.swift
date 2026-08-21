@@ -86,28 +86,43 @@ public final class Scope {
             guard isVisibleOnlyAfterDeclaration(sym) else { return true }
             return sym.declOffset <= offset
         }
-        return Self.shadowingOrder(visible)
+        return shadowingOrder(visible)
     }
 
     /// Order visible declarations of one name INNERMOST first, so a `.first` pick is the one in
     /// effect at the use-site.
     ///
-    /// One scope holds two visible declarations of a name only because a condition binding was
-    /// flattened into it (B-FIX-42) — Swift itself rejects a redeclaration, and an overload set is
-    /// narrowed by kind and signature downstream, never by this order. Where that happens the
-    /// binding is the lexically NESTED one and shadows the scope's own declaration, including one
-    /// declared ABOVE it, which is legal Swift: `let item = Detail(); if case .calm(let item) = mood
-    /// { item.payloadTag }` compiles, and the body reads the BINDING. Source order answered with the
-    /// enclosing declaration instead, so the binding never won anywhere — a wrong rename no safety
-    /// net catches, since nothing of the original name survives (B-FIX-43).
+    /// TWO legal ways one scope holds two visible declarations of a name, and Swift rejects every
+    /// other redeclaration (an overload set is narrowed by kind and signature downstream, never by
+    /// this order):
     ///
-    /// Only condition bindings are reordered, and only against non-bindings; among themselves the
-    /// most recently declared wins (two sibling `guard case`s binding one name). Everything else
-    /// keeps source order, so no overload set and no cross-file unified type scope is disturbed.
-    private static func shadowingOrder(_ visible: [Symbol]) -> [Symbol] {
-        guard visible.contains(where: { $0.conditionBinding != nil }) else { return visible }
-        return visible.filter { $0.conditionBinding != nil }.sorted { $0.declOffset > $1.declOffset }
-            + visible.filter { $0.conditionBinding == nil }
+    /// 1. A CONDITION BINDING flattened into it (B-FIX-42). The binding is the lexically NESTED one
+    ///    and shadows the scope's own declaration, including one declared ABOVE it, which is legal
+    ///    Swift: `let item = Detail(); if case .calm(let item) = mood { item.payloadTag }` compiles,
+    ///    and the body reads the BINDING (B-FIX-43).
+    /// 2. A body LOCAL shadowing a same-named PARAMETER of a `.block`/`.function` scope. Swift forbids
+    ///    two plain locals in one scope, but a local may shadow a parameter, and a CLOSURE's body
+    ///    shares the closure's scope with its parameters (unlike a function, whose body is a nested
+    ///    block), so `{ (idx, item) in var item = item; item.x }` puts the parameter and the local in
+    ///    ONE scope. The local (declared later) must win at every use below its declaration —
+    ///    verified against swiftc: the read is the LOCAL, and `item.x = …` on a `let` parameter would
+    ///    not even compile. Source order answered with the parameter, so the renamed local was
+    ///    orphaned and its uses stayed on the parameter — a desync (B-FIX-59).
+    ///
+    /// For (2) the LATER declaration wins, so among the value locals the largest `declOffset` comes
+    /// first; a parameter always precedes the body, so this reduces to "the local shadows the
+    /// parameter". Gated to `.block`/`.function` scopes and to a set that actually mixes a `.property`
+    /// with a `.parameter`, so no overload set and no cross-file unified type scope is disturbed.
+    private func shadowingOrder(_ visible: [Symbol]) -> [Symbol] {
+        let bindings = visible.filter { $0.conditionBinding != nil }
+        var rest = visible.filter { $0.conditionBinding == nil }
+        if (kind == .block || kind == .function),
+           rest.contains(where: { $0.kind == .property }),
+           rest.contains(where: { $0.kind == .parameter }) {
+            rest.sort { $0.declOffset > $1.declOffset }
+        }
+        guard !bindings.isEmpty else { return rest }
+        return bindings.sorted { $0.declOffset > $1.declOffset } + rest
     }
 
     /// The offset to carry into the PARENT scope: nil past a `.function`/`.type` boundary, where the

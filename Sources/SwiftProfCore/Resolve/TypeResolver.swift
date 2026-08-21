@@ -351,13 +351,38 @@ public final class TypeResolver {
                 // other scopes (B-FIX-23).
                 return (t, sym.scope ?? scope)
             }
-            // Registered but untyped — a closure parameter or a case-let binding. Registering it for
-            // shadow correctness must not disable the typing that ran when the name was absent from
-            // the scope tree, so the remaining source is tried here too.
-            guard sym.kind == .parameter else { return nil }
-            return inferNamedClosureParamType(name: name, from: ref, in: scope)
+            // Registered but untyped. A closure PARAMETER (or a case-let binding) types via the
+            // name-based closure inference. Registering it for shadow correctness must not disable
+            // the typing that ran when the name was absent from the scope tree, so the remaining
+            // source is tried here too.
+            if sym.kind == .parameter {
+                return inferNamedClosureParamType(name: name, from: ref, in: scope)
+            }
+            // A self-copy body local (`var x = x`) inherits the SHADOWED binding's type: a function
+            // parameter's written annotation (they sit in different scopes), or — for a closure whose
+            // parameter and local share ONE scope — the same closure inference (B-FIX-59). Guarded to
+            // an initializer that is a bare reference to the SAME name, so `var x = x.transform()` (an
+            // un-inferable call) is never mistyped as the element.
+            if isSelfCopyLocal(sym), let declScope = sym.scope,
+               let shadowed = declScope.lookup(name: name, at: sym.declOffset - 1) {
+                if let t = table.declaredType[shadowed.id] { return (t, shadowed.scope ?? scope) }
+                return inferNamedClosureParamType(name: name, from: ref, in: scope)
+            }
+            return nil
         }
         return inferNamedClosureParamType(name: name, from: ref, in: scope)
+    }
+
+    /// A body local whose initializer is exactly a bare reference to its OWN name (`var x = x`) — the
+    /// idiom that copies a shadowed same-named closure parameter into a mutable local. Its static
+    /// type is the shadowed parameter's, so `bareValueTypeInfo` may resolve it the same closure-
+    /// inference way. Excluding any other initializer keeps `var x = x.transform()` from being
+    /// mistyped as the element (B-FIX-59). `initializerExpr` is populated by DeclarationPass and left
+    /// in place by TypeInferencePass, so it still names the copied identifier at resolution time.
+    private func isSelfCopyLocal(_ sym: Symbol) -> Bool {
+        guard sym.kind == .property, let expr = table.initializerExpr[sym.id],
+              let ref = expr.as(DeclReferenceExprSyntax.self) else { return false }
+        return Self.stripBackticks(ref.baseName.text) == sym.name
     }
 
     /// Strip trailing optional markers (`?`/`!`) from a type-name string.
