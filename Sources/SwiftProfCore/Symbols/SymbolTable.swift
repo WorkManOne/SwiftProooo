@@ -87,6 +87,13 @@ public final class SymbolTable {
     /// not a declaration whose name we own. The Planner skips these; without the set they'd be
     /// treated as ordinary renameable typealiases.
     public internal(set) var genericParameterIds: Set<Int> = []
+    /// The ORDERED generic-parameter names of a generic TYPE or function/init, keyed by owner symbol
+    /// id (`struct Wrapper<T>` → [wrapperId: ["T"]], `struct Pair<A, B>` → [pairId: ["A","B"]]).
+    /// `genericParameterIds` is a Set and carries no order, but generic substitution is POSITIONAL —
+    /// mapping `Wrapper<Payload>`'s argument list to the parameter list — so the order is required.
+    /// Used by `TypeResolver` to substitute a generic parameter appearing as a closure-typed init
+    /// parameter (`init(_ f: (T) -> Void)`) with the concrete argument from context (B-FIX-62).
+    public internal(set) var genericParameterNames: [Int: [String]] = [:]
     /// IDs of type symbols (structs) that declare an explicit `init` in their PRIMARY declaration
     /// (NOT in an extension). Swift suppresses the compiler-synthesized memberwise init only for
     /// these — a struct whose only inits are in extensions KEEPS its memberwise init. The

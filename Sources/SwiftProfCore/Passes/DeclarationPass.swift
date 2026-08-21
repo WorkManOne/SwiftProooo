@@ -606,10 +606,12 @@ private final class DeclVisitor: SyntaxVisitor {
     /// placeholder, and it also shadows any same-named global type inside the decl).
     private func registerGenericParameters(_ clause: GenericParameterClauseSyntax?, into scope: Scope) {
         guard let clause else { return }
+        var orderedNames: [String] = []
         for p in clause.parameters {
             let token = p.name
             let name = Self.stripBackticks(token.text)
             guard name != "_" else { continue }
+            orderedNames.append(name)
             let sym = Symbol(
                 id: mintId(), name: name, kind: .typealias_,
                 module: file.module, file: file, scope: scope,
@@ -622,6 +624,12 @@ private final class DeclVisitor: SyntaxVisitor {
             if let inherited = p.inheritedType, let t = WrittenTypeName.of(inherited) {
                 table.typealiasTarget[sym.id] = t
             }
+        }
+        // Record the ORDERED names against the owner (the type or func the clause belongs to) so a
+        // generic parameter used as a closure-typed init parameter can be substituted positionally
+        // with the concrete argument (B-FIX-62). `scope.owner` is the type/func symbol at this point.
+        if let ownerId = scope.owner?.id, !orderedNames.isEmpty {
+            table.genericParameterNames[ownerId] = orderedNames
         }
     }
 

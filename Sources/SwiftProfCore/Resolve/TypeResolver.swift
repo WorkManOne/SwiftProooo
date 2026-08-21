@@ -15,7 +15,11 @@ import SwiftSyntax
 ///   - Optional chaining / force unwrap / try / await — transparent
 ///
 /// What is intentionally NOT supported (these need full Sema-style inference):
-///   - Generic substitution beyond simple `Foo<T>` decomposition
+///   - Generic substitution beyond simple `Foo<T>` decomposition — with ONE narrow, fail-closed
+///     exception: a closure parameter typed as a generic parameter of a USER type's initializer
+///     (`Wrapper<T>.init(_ f: (T) -> Void)`) is substituted with the concrete argument recovered
+///     from context (`genericInitClosureParamType`, B-FIX-62). Member access on a generic-typed
+///     VALUE (`box.value` as concrete `T`) is still not modelled.
 ///   - Closure parameter typing from receiver's element (handled separately by HOF pass)
 ///   - Return type of method calls (`foo.method().X`)
 ///   - Conditional expressions
@@ -698,6 +702,15 @@ public final class TypeResolver {
                 }
             }
         }
+        // Init-style USER generic type: `Wrapper { $0 }` / `Wrapper<Payload> { … }` — a constructor
+        // call whose closure argument is an init parameter typed as one of the type's GENERIC
+        // parameters. `calleeCallable` below can't see it (a type is not a .function/.method) and the
+        // HOFRegistry above knows only stdlib inits, so this is the one path that types such a closure
+        // (B-FIX-62).
+        if let t = genericInitClosureParamType(call: call, closureArgIndex: closureArgIndex,
+                                               paramIndex: paramIndex, in: scope) {
+            return t
+        }
         // User-defined HOF fallback (B-FIX-2): no stdlib registry entry, but the callee is one of
         // OUR functions/methods whose param at `closureArgIndex` is a function type — type the
         // closure's params from that declared signature. Generalizes closure-param inference to any
@@ -735,6 +748,175 @@ public final class TypeResolver {
             }
         }
         return nil
+    }
+
+    /// Type a closure parameter that a USER GENERIC type's initializer hands it, by substituting the
+    /// generic parameter with the concrete argument (B-FIX-62). `Wrapper<T>` with
+    /// `init(_ f: (T) -> Void)`, called `wrap = Wrapper { p in p.member }` where `wrap: Wrapper<Payload>`,
+    /// gives `p` the static type `Payload` — SwiftProf must repeat that substitution or `p.member`
+    /// desyncs while `Payload.member` renames.
+    ///
+    /// This is the syntactic slice of generic substitution the resolver otherwise does not model, kept
+    /// narrow and fail-closed at every step: only a LOCAL generic type, only an init parameter that is
+    /// function-typed with a recorded closure input, only when that input is one of the type's generic
+    /// parameters, and only when the concrete argument is determinable (written on the call, or from
+    /// the assignment target / binding annotation). Anything else returns nil — a wrong substitution
+    /// would be a wrong rename RollbackPass cannot catch, so an undeterminable argument is left untyped.
+    private func genericInitClosureParamType(
+        call: FunctionCallExprSyntax, closureArgIndex: Int, paramIndex: Int, in scope: Scope
+    ) -> (name: String, scope: Scope)? {
+        // Identify the constructed type name and any generic arguments written on the call itself.
+        let calledExpr = call.calledExpression
+        let typeName: String
+        var explicitArgsSource: String? = nil
+        if let ref = calledExpr.as(DeclReferenceExprSyntax.self) {
+            typeName = Self.stripBackticks(ref.baseName.text)
+        } else if let spec = calledExpr.as(GenericSpecializationExprSyntax.self),
+                  let split = Self.splitGenericArguments(of: spec.trimmedDescription) {
+            typeName = split.base
+            explicitArgsSource = spec.trimmedDescription
+        } else {
+            return nil
+        }
+        // Only an upper-cased name is a constructor (cheap pre-filter, same convention as the
+        // constructor case of `typeSymbol(of:)`).
+        guard let first = typeName.first, first.isUppercase else { return nil }
+        // Resolve to a LOCAL generic type carrying recorded, ordered parameter names.
+        guard let typeSym = resolveConstructedTypeSymbol(typeName, in: scope),
+              let paramNames = table.genericParameterNames[typeSym.id], !paramNames.isEmpty,
+              let inner = canonicalInnerScope(of: typeSym) else { return nil }
+        // The init whose parameter at the closure position carries a recorded closure input. Match by
+        // argument labels; if two matching inits disagree on the input, fail closed.
+        var inputName: String? = nil
+        for initSym in inner.members(named: "init") where initSym.kind == .initializer {
+            guard ArgumentLabelMatch.matches(initSym, call: call, in: table),
+                  let paramPos = ArgumentLabelMatch.parameterIndex(ofArgument: closureArgIndex,
+                                                                   for: initSym, call: call, in: table),
+                  let inputs = table.functionParamClosureInput[initSym.id]?[paramPos],
+                  paramIndex < inputs.count, !inputs[paramIndex].isEmpty else { continue }
+            if let existing = inputName, existing != inputs[paramIndex] { return nil }
+            inputName = inputs[paramIndex]
+        }
+        // Only substitution is modelled: the input must BE one of the type's generic parameters. A
+        // concrete input type is a separate, unhandled case (left fail-closed).
+        guard let input = inputName, let pos = paramNames.firstIndex(of: input) else { return nil }
+        guard let args = expectedGenericArguments(forCall: call, typeName: typeName,
+                                                  explicitArgs: explicitArgsSource,
+                                                  arity: paramNames.count, in: scope),
+              pos < args.count else { return nil }
+        return args[pos]
+    }
+
+    /// Resolve a bare constructor type name to its LOCAL Symbol (lexical scope first, then module-aware
+    /// top-level). No typealias unwrap: a generic type's parameter names are recorded on the type
+    /// itself, and an alias would have none, so an alias falls through to fail-closed.
+    private func resolveConstructedTypeSymbol(_ name: String, in scope: Scope) -> Symbol? {
+        if let sym = scope.lookup(name: name), sym.kind.isTypeLike { return sym }
+        return preferredConcreteType(named: name)
+    }
+
+    /// The concrete generic arguments for a constructor call, each with the scope it was written in.
+    /// Two sources, in order of directness:
+    ///   1. explicit on the call — `Wrapper<Payload> { … }` (arguments written at the use-site);
+    ///   2. the expected type of the whole call — the assignment target's declared type
+    ///      (`wrap = Wrapper { … }`, `wrap: Wrapper<Payload>`) or a written binding annotation
+    ///      (`let w: Wrapper<Payload> = Wrapper { … }`).
+    /// Returns nil unless the recovered type's base matches `typeName` and its argument count matches
+    /// the type's arity — a mismatch means the context types a different expression, so fail closed.
+    private func expectedGenericArguments(
+        forCall call: FunctionCallExprSyntax, typeName: String, explicitArgs: String?,
+        arity: Int, in scope: Scope
+    ) -> [(name: String, scope: Scope)]? {
+        if let explicit = explicitArgs, let split = Self.splitGenericArguments(of: explicit),
+           split.base == typeName {
+            guard split.args.count == arity else { return nil }
+            return split.args.map { ($0, scope) }
+        }
+        guard let expected = expectedConstructionType(of: call, in: scope),
+              let split = Self.splitGenericArguments(of: expected.name), split.base == typeName,
+              split.args.count == arity else { return nil }
+        return split.args.map { ($0, expected.scope) }
+    }
+
+    /// The WRITTEN type (name + declaring scope) the whole constructor call is expected to produce.
+    /// Only the IMMEDIATE context is read — the call must BE the initializer / assignment RHS, not
+    /// nested in a larger expression — so a context typing an OUTER expression is never borrowed (same
+    /// discipline as `expectedResultType`).
+    private func expectedConstructionType(of call: FunctionCallExprSyntax, in scope: Scope)
+        -> (name: String, scope: Scope)? {
+        guard let parent = call.parent else { return nil }
+        // `let/var/guard let/if let/while let  x: Wrapper<T> = call` — call is the initializer directly.
+        if let initClause = parent.as(InitializerClauseSyntax.self), initClause.value.id == call.id {
+            if let ob = initClause.parent?.as(OptionalBindingConditionSyntax.self),
+               let annotation = ob.typeAnnotation, let name = WrittenTypeName.of(annotation.type) {
+                return (name, scope)   // annotation written at the use-site
+            }
+            if let pb = initClause.parent?.as(PatternBindingSyntax.self),
+               let annotation = pb.typeAnnotation, let name = WrittenTypeName.of(annotation.type) {
+                return (name, scope)
+            }
+            return nil
+        }
+        // `target = call` — an assignment, raw-parsed as a flat SequenceExpr `[lhs, =, rhs]`. The
+        // call's parent is the SequenceExpr's element LIST, not the SequenceExpr itself, so step up
+        // one more level. The RHS's expected type is the LHS's DECLARED type (generic args intact).
+        if let list = parent.as(ExprListSyntax.self),
+           let seq = list.parent?.as(SequenceExprSyntax.self) {
+            let elems = Array(seq.elements)
+            guard elems.count >= 3, elems[1].is(AssignmentExprSyntax.self),
+                  elems.last?.id == call.id else { return nil }
+            return rawDeclaredTypeName(of: elems[0], in: scope)
+        }
+        return nil
+    }
+
+    /// The declared type NAME of an lvalue expression, KEEPING its generic argument clause (unlike
+    /// `declaredTypeName`, which returns a resolved Symbol's bare name and so drops `<…>`), with the
+    /// scope the type was written in. Handles a bare reference (`wrap`) and a member access
+    /// (`self.wrap`). Optionals are already stripped by `WrittenTypeName` when the entry was recorded.
+    private func rawDeclaredTypeName(of expr: ExprSyntax, in scope: Scope) -> (name: String, scope: Scope)? {
+        if let ref = expr.as(DeclReferenceExprSyntax.self) {
+            var name = Self.stripBackticks(ref.baseName.text)
+            if name.hasPrefix("$") || name.hasPrefix("_") { name = String(name.dropFirst()) }
+            return bareValueTypeInfo(named: name, from: ref, in: scope)
+        }
+        if let member = expr.as(MemberAccessExprSyntax.self), let base = member.base,
+           let baseSym = typeSymbol(of: base, in: scope),
+           let baseScope = canonicalInnerScope(of: baseSym),
+           let mSym = baseScope.member(named: Self.stripBackticks(member.declName.baseName.text)),
+           let t = table.declaredType[mSym.id] {
+            return (t, mSym.scope ?? scope)
+        }
+        return nil
+    }
+
+    /// Split a written generic type name into its base and top-level arguments:
+    /// `Wrapper<Payload>` → ("Wrapper", ["Payload"]), `Pair<A, B>` → ("Pair", ["A","B"]),
+    /// `Box<Dict<K, V>>` → ("Box", ["Dict<K, V>"]). Balanced across `<>`, `[]`, `()` so a nested
+    /// generic / dictionary argument is kept whole. Returns nil for a name with no generic clause.
+    static func splitGenericArguments(of name: String) -> (base: String, args: [String])? {
+        guard let lt = name.firstIndex(of: "<"), name.hasSuffix(">") else { return nil }
+        let base = String(name[..<lt]).trimmingCharacters(in: .whitespaces)
+        let innerEnd = name.index(before: name.endIndex)
+        let innerStart = name.index(after: lt)
+        guard innerStart < innerEnd else { return nil }
+        let inner = name[innerStart..<innerEnd]
+        var args: [String] = []
+        var depth = 0
+        var current = ""
+        for ch in inner {
+            switch ch {
+            case "<", "[", "(": depth += 1; current.append(ch)
+            case ">", "]", ")": depth -= 1; current.append(ch)
+            case "," where depth == 0:
+                args.append(current.trimmingCharacters(in: .whitespaces)); current = ""
+            default: current.append(ch)
+            }
+        }
+        let last = current.trimmingCharacters(in: .whitespaces)
+        if !last.isEmpty { args.append(last) }
+        guard !base.isEmpty, !args.isEmpty else { return nil }
+        return (base, args)
     }
 
     /// The type of closure parameter `paramIndex` when the closure DESTRUCTURES a tuple element

@@ -7688,4 +7688,122 @@ final class PatternTests: XCTestCase {
                       "b.member must resolve to Conc.member's obf:\n\(r)")
     }
 
+    // MARK: - Closure param typed by generic substitution on a user type's initializer (B-FIX-62)
+
+    func testGenericInitClosure_paramTypedFromAssignmentTargetGenericArg_memberResolves() throws {
+        // The reported shape: a closure passed to a user GENERIC type's initializer. The generic
+        // argument for `T` is inferred from the assignment target `wrap`'s declared type
+        // `Wrapper<Payload>?`, so the compiler types the closure param `p` as `Payload`. The
+        // syntactic resolver did not: `calleeCallable` ignores a constructor call (a type is not a
+        // func/method), so `p` stayed untyped and `p.alpha`/`p.beta` desynced while Payload.alpha /
+        // .beta renamed — and shield 1b (the same-named closure param `p` is an un-renamed namesake)
+        // blocks the revert, so the desync ships as a red build.
+        let r = try runPipeline("""
+        struct Payload {
+            let alpha: Int
+            let beta: String
+        }
+        struct Wrapper<T> {
+            private var handler: ((T) -> Void)?
+            init(_ handler: @escaping (T) -> Void) { self.handler = handler }
+        }
+        final class Owner {
+            private var wrap: Wrapper<Payload>?
+            func build() {
+                wrap = Wrapper { [weak self] p in
+                    _ = self
+                    _ = p.alpha
+                    _ = p.beta
+                }
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("let alpha"), "Payload.alpha must rename:\n\(r)")
+        XCTAssertFalse(r.contains("let beta"), "Payload.beta must rename:\n\(r)")
+        let alphaObf = try firstGroup(#"let (\w+): Int"#, in: r)
+        let betaObf = try firstGroup(#"let (\w+): String"#, in: r)
+        XCTAssertTrue(r.contains("p.\(alphaObf)"), "p.alpha must resolve to Payload.alpha's obf:\n\(r)")
+        XCTAssertTrue(r.contains("p.\(betaObf)"), "p.beta must resolve to Payload.beta's obf:\n\(r)")
+    }
+
+    func testGenericInitClosure_paramTypedFromBindingAnnotation_memberResolves() throws {
+        // Same substitution, but the generic argument comes from a WRITTEN binding annotation
+        // (`let w: Wrapper<Payload> = Wrapper { … }`) rather than an assignment target.
+        let r = try runPipeline("""
+        struct Payload { let alpha: Int }
+        struct Wrapper<T> {
+            init(_ handler: @escaping (T) -> Void) {}
+        }
+        final class Owner {
+            func build() {
+                let w: Wrapper<Payload> = Wrapper { p in _ = p.alpha }
+                _ = w
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("let alpha"), "Payload.alpha must rename:\n\(r)")
+        let alphaObf = try firstGroup(#"let (\w+): Int"#, in: r)
+        XCTAssertTrue(r.contains("p.\(alphaObf)"), "p.alpha must resolve to Payload.alpha's obf:\n\(r)")
+    }
+
+    func testGenericInitClosure_explicitGenericArgOnCall_memberResolves() throws {
+        // The generic argument is written explicitly on the call (`Wrapper<Payload> { … }`), so no
+        // context walk is needed — the substitution reads it straight off the constructor.
+        let r = try runPipeline("""
+        struct Payload { let alpha: Int }
+        struct Wrapper<T> {
+            init(_ handler: @escaping (T) -> Void) {}
+        }
+        let w = Wrapper<Payload> { p in _ = p.alpha }
+        """)
+        XCTAssertFalse(r.contains("let alpha"), "Payload.alpha must rename:\n\(r)")
+        let alphaObf = try firstGroup(#"let (\w+): Int"#, in: r)
+        XCTAssertTrue(r.contains("p.\(alphaObf)"), "p.alpha must resolve to Payload.alpha's obf:\n\(r)")
+    }
+
+    func testGenericInitClosure_multipleGenericParams_picksCorrectPositionalArg() throws {
+        // Guard-rail: a two-parameter generic type whose init closure input is the SECOND generic
+        // parameter (`B`). The closure param must be typed from the SECOND generic argument
+        // (`Second`), not the first — proving the substitution is positional, not "first arg wins".
+        let r = try runPipeline("""
+        struct First { let fieldA: String }
+        struct Second { let fieldB: Int }
+        struct Pair<A, B> {
+            init(_ handler: @escaping (B) -> Void) {}
+        }
+        final class Owner {
+            func build() {
+                let p: Pair<First, Second> = Pair { v in _ = v.fieldB }
+                _ = p
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("let fieldB"), "Second.fieldB must rename:\n\(r)")
+        // fieldB is the only `: Int` stored property, so this uniquely names Second.fieldB's obf.
+        let fieldBObf = try firstGroup(#"let (\w+): Int"#, in: r)
+        XCTAssertTrue(r.contains("v.\(fieldBObf)"),
+                      "v.fieldB must resolve to Second.fieldB's obf (v typed as the 2nd generic arg):\n\(r)")
+    }
+
+    func testGenericInitClosure_noContext_doesNotMistype() throws {
+        // Guard-rail: with NO way to determine the generic argument (no annotation, no assignment
+        // target, no explicit args), the closure param must stay untyped — never guessed. The
+        // member `alpha` then survives at the use-site, so RollbackPass reverts its declaration:
+        // green under-obfuscation, never a wrong rename.
+        let r = try runPipeline("""
+        struct Payload { let alpha: Int }
+        struct Wrapper<T> {
+            init(_ handler: @escaping (T) -> Void) {}
+        }
+        func sink(_ w: Wrapper<Payload>) {}
+        sink(Wrapper { p in _ = p.alpha })
+        """)
+        // The generic argument cannot be determined (a function-call argument context is not
+        // modelled), so the closure param stays untyped and the use-site keeps the ORIGINAL member
+        // name. If the fix wrongly guessed `p: Payload`, `p.alpha` would be rewritten to Payload's
+        // obf and this assertion catches it.
+        XCTAssertTrue(r.contains("p.alpha"),
+                      "no determinable generic arg → p stays untyped, use-site keeps original member:\n\(r)")
+    }
+
 }
