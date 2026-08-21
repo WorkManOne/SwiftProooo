@@ -603,6 +603,44 @@ public final class TypeResolver {
         return nil
     }
 
+    /// The Element type pinned by a WRITTEN annotation on the binding a HOF call initializes, used
+    /// only when forward typing of the receiver's Element failed (B-FIX-60). `guard let x: E =
+    /// seq.first(where:)` pins E even when `seq` cannot be typed. Only the IMMEDIATE written context
+    /// is read — the call must BE the initializer, not nested in a larger expression — so an
+    /// annotation that types an OUTER expression is never borrowed (same discipline as
+    /// `expectedResultType`). The annotation is written at the use-site, so it resolves in `scope`.
+    private func hofElementFromBindingAnnotation(
+        of call: FunctionCallExprSyntax, shape: HOFRegistry.ResultShape, in scope: Scope
+    ) -> (name: String, scope: Scope)? {
+        guard let annotation = bindingAnnotationName(initializedBy: call) else { return nil }
+        switch shape {
+        case .optionalElement:
+            // `guard let x: E` unwraps, so the annotation is E; `let x: E?` keeps the `?`. Strip it
+            // for both — a no-op for the unwrapped form.
+            let elem = Self.unwrapOptionalName(annotation)
+            return elem.isEmpty ? nil : (elem, scope)
+        case .arrayElement:
+            // `let x: [E] = seq.filter { … }`. Reject a dictionary — its element is a tuple, not `E`.
+            guard annotation.hasPrefix("["), annotation.hasSuffix("]") else { return nil }
+            let inner = String(annotation.dropFirst().dropLast()).trimmingCharacters(in: .whitespaces)
+            guard !inner.isEmpty, Self.topLevelIndex(of: ":", in: inner) == nil else { return nil }
+            return (inner, scope)
+        }
+    }
+
+    /// The written type annotation on the `let`/`var`/`guard let`/`if let`/`while let` binding whose
+    /// initializer is EXACTLY `call` (not a larger expression containing it). Mirrors the immediate-
+    /// context walk of `ResolutionPass.expectedResultType`.
+    private func bindingAnnotationName(initializedBy call: FunctionCallExprSyntax) -> String? {
+        guard let initClause = call.parent?.as(InitializerClauseSyntax.self),
+              initClause.value.id == call.id else { return nil }
+        if let ob = initClause.parent?.as(OptionalBindingConditionSyntax.self),
+           let annotation = ob.typeAnnotation { return WrittenTypeName.of(annotation.type) }
+        if let pb = initClause.parent?.as(PatternBindingSyntax.self),
+           let annotation = pb.typeAnnotation { return WrittenTypeName.of(annotation.type) }
+        return nil
+    }
+
     /// Look up the HOF in the registry by callee method name, verify closureArgIndex matches,
     /// extract the closure-param type per `closureParamSources[paramIndex]`.
     ///
@@ -628,7 +666,20 @@ public final class TypeResolver {
                     return t
                 }
                 if paramIndex < sig.closureParamSources.count {
-                    return resolveSource(sig.closureParamSources[paramIndex], call: call, receiver: receiver, in: scope)
+                    let source = sig.closureParamSources[paramIndex]
+                    if let t = resolveSource(source, call: call, receiver: receiver, in: scope) {
+                        return t
+                    }
+                    // Forward typing of the receiver's Element failed — the collection is reached
+                    // through a type we cannot resolve (`self.engine.snapshot().first(where:)`, engine
+                    // external). For a HOF whose RESULT element equals its `.element` parameter, the
+                    // element is still pinned by a WRITTEN annotation on the binding the whole call
+                    // initializes (`guard let x: S2 = …first(where:)`), so fall back to it (B-FIX-60).
+                    if case .element = source,
+                       let shape = HOFRegistry.resultShape(forMethod: methodName),
+                       let t = hofElementFromBindingAnnotation(of: call, shape: shape, in: scope) {
+                        return t
+                    }
                 }
             }
         }

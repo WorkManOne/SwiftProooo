@@ -40,6 +40,23 @@ public enum HOFRegistry {
         all.first(where: { $0.methodName == methodName })
     }
 
+    /// How a HOF's RESULT relates to its `.element` closure parameter — for the family where the two
+    /// are the SAME type, so a written annotation on the binding the call initializes pins the
+    /// element when the receiver cannot be typed forward (B-FIX-60):
+    ///   - `.optionalElement`: result is `Element?` (`first(where:)` / `last(where:)` / `min` / `max`)
+    ///   - `.arrayElement`:    result is `[Element]` (`filter`)
+    /// Deliberately NARROW: a HOF whose result element differs from its closure element (`map`,
+    /// `firstIndex` → `Index?`, `reduce`) has NO entry, so the annotation is never mis-applied.
+    public enum ResultShape: Sendable { case optionalElement, arrayElement }
+
+    public static func resultShape(forMethod methodName: String) -> ResultShape? {
+        switch methodName {
+        case "first", "last", "min", "max": return .optionalElement
+        case "filter":                      return .arrayElement
+        default:                            return nil
+        }
+    }
+
     /// All known HOF signatures. Order doesn't matter — lookup is by name.
     /// We don't store receiver type here because Swift overloads HOF names across multiple
     /// conformances (`Sequence.map` AND `Optional.map` exist); element-type extraction is

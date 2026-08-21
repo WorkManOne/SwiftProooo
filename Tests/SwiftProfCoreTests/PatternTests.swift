@@ -7530,4 +7530,106 @@ final class PatternTests: XCTestCase {
                       "the read must resolve through the local's REAL type (Other):\n\(r)")
     }
 
+    // MARK: - B-FIX-60: HOF closure element from the result binding annotation
+
+    func testHOFFirstWhere_receiverUntyped_elementTypedFromBindingAnnotation() throws {
+        // `.first(where:)` on a receiver that cannot be typed forward (its collection is reached
+        // through an EXTERNAL type) — the closure `$0` is pinned by the WRITTEN annotation on the
+        // binding the whole call initializes (`guard let found: S2 = …first(where:)`), because
+        // `.first(where:)`'s result element equals its closure element. Without it `$0.member` stayed
+        // original while the struct member renamed — a desync that ships red where a shield blocks the
+        // revert (reverts green here, an under-obfuscation). B-FIX-60.
+        let r = try runPipeline("""
+        protocol P12 {}
+        struct S3 {}
+        enum E4 {
+            struct S2: P12 {
+                let ident: Int
+                let bravo: S3?
+                var flag: Bool
+            }
+        }
+        final class Service {
+            typealias S2 = E4.S2
+            var engine = ExternalEngine()
+            func run(_ target: Int) {
+                guard let found: S2 = self.engine.snapshot().first(where: {
+                    let cast = $0.bravo as? any P12
+                    return $0.ident == target
+                }) else { return }
+                _ = found
+            }
+        }
+        """)
+        // The struct members rename and stay renamed (no RollbackPass revert)…
+        XCTAssertFalse(r.contains("let bravo"), "S2.bravo must rename:\n\(r)")
+        XCTAssertFalse(r.contains("let ident"), "S2.ident must rename:\n\(r)")
+        // …because the `$0` use-sites now resolve to those obfs.
+        let bravoObf = try firstGroup(#"let (\w+): \w+\?"#, in: r)
+        let identObf = try firstGroup(#"let (\w+): Int"#, in: r)
+        XCTAssertTrue(r.contains("$0.\(bravoObf)"), "$0.bravo must resolve to S2.bravo's obf:\n\(r)")
+        XCTAssertTrue(r.contains("$0.\(identObf)"), "$0.ident must resolve to S2.ident's obf:\n\(r)")
+    }
+
+    func testHOFFirstWhere_throughUntypedLocal_namedClosureParam_elementFromAnnotation() throws {
+        // The reported two-step form: `var f3 = self.p19.f3()` (f3 untypeable, engine external) then
+        // `f3.items.first(where: { row in … })` with a NAMED closure parameter. Both the local-var
+        // receiver and the named parameter funnel through the same inference, so the annotation
+        // fallback applies.
+        let r = try runPipeline("""
+        struct S3 {}
+        enum E4 { struct S2 { let bravo: S3?; var flag: Bool } }
+        final class Service {
+            typealias S2 = E4.S2
+            var engine = ExternalEngine()
+            func run() {
+                var f3 = self.engine.snapshot()
+                guard let found: S2 = f3.items.first(where: { row in row.flag }) else { return }
+                _ = found
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("var flag"), "S2.flag must rename:\n\(r)")
+        let flagObf = try firstGroup(#"var (\w+): Bool"#, in: r)
+        XCTAssertTrue(r.contains("row.\(flagObf)"), "the named closure param resolves via the annotation:\n\(r)")
+    }
+
+    func testHOFFilter_receiverUntyped_elementFromArrayAnnotation() throws {
+        // `.filter` returns `[Element]`, so a `[S2]` annotation pins the element the same way.
+        let r = try runPipeline("""
+        enum E4 { struct S2 { var flag: Bool } }
+        final class Service {
+            typealias S2 = E4.S2
+            var engine = ExternalEngine()
+            func run() {
+                let found: [S2] = self.engine.snapshot().filter { $0.flag }
+                _ = found
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("var flag"), "S2.flag must rename:\n\(r)")
+        let flagObf = try firstGroup(#"var (\w+): Bool"#, in: r)
+        XCTAssertTrue(r.contains("$0.\(flagObf)"), "$0.flag resolves via the [S2] annotation:\n\(r)")
+    }
+
+    func testHOFMap_resultElementDiffers_annotationNotBorrowed() throws {
+        // The fail-closed guard: `.map`'s RESULT element is not its closure element, so a `[Other]`
+        // annotation must NOT type `$0`. With the receiver untypeable, `$0` stays untyped and
+        // `$0.value` keeps its original name (a missed rename), never a WRONG rename to Other.value.
+        let r = try runPipeline("""
+        struct Other { let value: Int }
+        enum E4 { struct S2 { var flag: Bool } }
+        final class Service {
+            var engine = ExternalEngine()
+            func run() {
+                let mapped: [Other] = self.engine.snapshot().map { Other(value: $0.value) }
+                _ = mapped
+            }
+        }
+        """)
+        // `$0.value` must NOT be rewritten to Other.value's obf — the receiver is untypeable and
+        // `.map` has no annotation-invertible result shape, so the use-site stays original.
+        XCTAssertTrue(r.contains("$0.value"), "$0.value must stay unresolved (fail closed):\n\(r)")
+    }
+
 }
