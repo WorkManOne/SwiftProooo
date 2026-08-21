@@ -803,6 +803,20 @@ private final class DeclVisitor: SyntaxVisitor {
                 if let first = name.first, first.isUppercase { return name }
             }
         }
+        // `x as? T` / `x as! T` / `x as T` — the local's static type is T (unwrapped for the same
+        // reason an annotation is: member access is what consumes it). It raw-parses as a SequenceExpr
+        // of exactly `[expr, UnresolvedAsExpr, TypeExpr]`; a LONGER sequence means the cast is embedded
+        // in a bigger expression (`x as? T ?? y`, `x as? T == z`) whose result type is not T, so it is
+        // skipped (fail closed). Without this a `let a = x as? T; a?.member` local was untyped and the
+        // member read stayed original while its declaration renamed — a desync that ships red when the
+        // member is a protocol requirement its witness keeps renamed (B-FIX-61).
+        if let seq = expr.as(SequenceExprSyntax.self) {
+            let elems = Array(seq.elements)
+            if elems.count == 3, elems[1].is(UnresolvedAsExprSyntax.self),
+               let typeExpr = elems[2].as(TypeExprSyntax.self) {
+                return WrittenTypeName.of(typeExpr.type)
+            }
+        }
         return nil
     }
 

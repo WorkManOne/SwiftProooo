@@ -7632,4 +7632,60 @@ final class PatternTests: XCTestCase {
         XCTAssertTrue(r.contains("$0.value"), "$0.value must stay unresolved (fail closed):\n\(r)")
     }
 
+    // MARK: - B-FIX-61: a local's type is inferred from an `as?` / `as!` cast
+
+    func testAsCast_localTypedFromCast_structMemberResolves() throws {
+        // `let b = x as? Conc` — the local's static type is Conc, so `b?.member` must resolve to
+        // Conc.member. `inferTypeFromInitializer` did not model the `as?` cast (a SequenceExpr of
+        // `[expr, UnresolvedAsExpr, TypeExpr]`), so the local was untyped and the member read
+        // desynced: the member's declaration renamed, the use-site did not. B-FIX-61.
+        let r = try runPipeline("""
+        struct Conc { var member: Int }
+        final class C {
+            func f(_ x: Any) -> Int? {
+                let b = x as? Conc
+                return b?.member
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("var member"), "Conc.member must rename:\n\(r)")
+        let memberObf = try firstGroup(#"var (\w+): Int"#, in: r)
+        XCTAssertTrue(r.contains("?.\(memberObf)"), "b?.member must resolve to Conc.member's obf:\n\(r)")
+    }
+
+    func testAsCast_localTypedFromExistentialCast_protocolMemberResolves() throws {
+        // The reported shape: `let p = x as? any P; p?.member`, where the protocol requirement renames
+        // (kept by its witness), so the surviving `p?.member` shipped a red build.
+        let r = try runPipeline("""
+        protocol P12 { var member: Int { get } }
+        struct Conc: P12 { var member: Int }
+        final class C {
+            func f(_ x: Any) -> Int? {
+                let p = x as? any P12
+                return p?.member
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("var member: Int { get }"), "P12.member requirement must rename:\n\(r)")
+        let memberObf = try firstGroup(#"var (\w+): Int \{ get \}"#, in: r)
+        XCTAssertTrue(r.contains("?.\(memberObf)"), "p?.member must resolve to P12.member's obf:\n\(r)")
+    }
+
+    func testAsCast_forceCast_memberResolves() throws {
+        // The `as!` force-cast form, non-optional receiver.
+        let r = try runPipeline("""
+        struct Conc { var member: Int }
+        final class C {
+            func f(_ x: Any) -> Int {
+                let b = x as! Conc
+                return b.member
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("var member"), "Conc.member must rename:\n\(r)")
+        let memberObf = try firstGroup(#"var (\w+): Int"#, in: r)
+        XCTAssertTrue(r.contains("b.\(memberObf)") || r.contains(".\(memberObf)"),
+                      "b.member must resolve to Conc.member's obf:\n\(r)")
+    }
+
 }
