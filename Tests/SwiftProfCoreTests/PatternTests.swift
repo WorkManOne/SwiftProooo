@@ -7806,4 +7806,181 @@ final class PatternTests: XCTestCase {
                       "no determinable generic arg → p stays untyped, use-site keeps original member:\n\(r)")
     }
 
+    // MARK: - Generic member/return substitution through a typed receiver (B-FIX-63)
+
+    func testGenericValueMember_propertyTypedAsGenericParam_chainedMemberResolves() throws {
+        // A stored property whose type IS the generic parameter (`let value: Element`) accessed through
+        // a value with a CONCRETE generic argument (`box: Container<Payload>`) has the static type of
+        // that argument — `box.value` is `Payload`, so `box.value.payloadField` must resolve to
+        // Payload.payloadField. The base type resolves (B-FIX-14) but the element is the placeholder
+        // `Element` (an empty generic-param typealias), so before substitution `box.value` typed to
+        // nothing and `payloadField` stayed original while the member declaration renamed.
+        let r = try runPipeline("""
+        struct Payload { let payloadField: String }
+        struct Container<Element> { let value: Element }
+        func run(_ box: Container<Payload>) -> String { return box.value.payloadField }
+        """)
+        XCTAssertFalse(r.contains("payloadField"),
+                       "Payload.payloadField decl AND use must resolve to one obf:\n\(r)")
+        let fieldObf = try firstGroup(#"let (\w+): String"#, in: r)
+        XCTAssertTrue(r.contains(".\(fieldObf)"),
+                      "box.value.payloadField must rewrite to Payload.payloadField's obf:\n\(r)")
+    }
+
+    func testGenericMethodReturn_returnTypedAsGenericParam_chainedMemberResolves() throws {
+        // A method whose RETURN type is the generic parameter (`func get() -> Item`) called on a value
+        // with a concrete argument (`s: Store<Payload>`) yields that argument — `s.get()` is `Payload`,
+        // so `s.get().payloadField` must resolve. The return type name is the placeholder `Item`, so
+        // before substitution `s.get()` typed to nothing.
+        let r = try runPipeline("""
+        struct Payload { let payloadField: String }
+        struct Store<Item> { let item: Item; func get() -> Item { return item } }
+        func run(_ s: Store<Payload>) -> String { return s.get().payloadField }
+        """)
+        XCTAssertFalse(r.contains("payloadField"),
+                       "Payload.payloadField decl AND use must resolve to one obf:\n\(r)")
+        let fieldObf = try firstGroup(#"let (\w+): String"#, in: r)
+        XCTAssertTrue(r.contains(".\(fieldObf)"),
+                      "s.get().payloadField must rewrite to Payload.payloadField's obf:\n\(r)")
+    }
+
+    func testGenericEnumPayload_userEnumCasePayloadTypedAsGenericParam_memberResolves() throws {
+        // A USER generic enum whose case payload IS the generic parameter (`case filled(Wrapped)`)
+        // matched on a value with a concrete argument (`b: Boxed<Payload>`) binds the payload as that
+        // argument — `case .filled(let p)` gives `p` the type `Payload`. The associated type recorded
+        // for the case is the placeholder `Wrapped`, so before substitution `p` typed to nothing and
+        // `p.payloadField` stayed original. This generalizes the Result-only B-FIX-57 to user enums.
+        let r = try runPipeline("""
+        struct Payload { let payloadField: String }
+        enum Boxed<Wrapped> { case filled(Wrapped); case empty }
+        func run(_ b: Boxed<Payload>) -> String {
+            switch b {
+            case .filled(let p): return p.payloadField
+            case .empty: return ""
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("payloadField"),
+                       "Payload.payloadField decl AND use must resolve to one obf:\n\(r)")
+        let fieldObf = try firstGroup(#"let (\w+): String"#, in: r)
+        XCTAssertTrue(r.contains("p.\(fieldObf)"),
+                      "case .filled(let p); p.payloadField must rewrite to Payload's obf:\n\(r)")
+    }
+
+    func testGenericValueMember_multipleParams_picksCorrectPositionalArg() throws {
+        // Guard-rail: a two-parameter generic type accessed through a member typed as the SECOND
+        // parameter (`let right: B`) must substitute the SECOND concrete argument (`Second`), proving
+        // the substitution is positional, not "first argument wins".
+        let r = try runPipeline("""
+        struct First { let fieldA: Int }
+        struct Second { let fieldB: String }
+        struct Pair<A, B> { let left: A; let right: B }
+        func run(_ p: Pair<First, Second>) -> String { return p.right.fieldB }
+        """)
+        XCTAssertFalse(r.contains("fieldB"), "Second.fieldB decl AND use must resolve to one obf:\n\(r)")
+        // fieldB is the only `: String` stored property, so this names Second.fieldB's obf uniquely.
+        let fieldBObf = try firstGroup(#"let (\w+): String"#, in: r)
+        XCTAssertTrue(r.contains(".\(fieldBObf)"),
+                      "p.right.fieldB must resolve to the 2nd generic arg (Second.fieldB):\n\(r)")
+    }
+
+    func testGenericValueMember_concreteMember_resolvesNormallyNotViaSubstitution() throws {
+        // Non-regression guard: a member with a CONCRETE type (`let fixed: Payload`, not the generic
+        // parameter) must resolve exactly as before — substitution declines (the member type is not in
+        // the type's parameter list) and the ordinary member resolution answers. Proves the new branch
+        // never disturbs a member that already resolved.
+        let r = try runPipeline("""
+        struct Payload { let payloadField: String }
+        struct Container<Element> { let value: Element; let fixed: Payload }
+        func run(_ box: Container<Int>) -> String { return box.fixed.payloadField }
+        """)
+        XCTAssertFalse(r.contains("payloadField"),
+                       "a concrete member must still resolve (substitution must not interfere):\n\(r)")
+    }
+
+    func testGenericValueMember_noRecoverableArgument_staysUntyped() throws {
+        // Fail-closed guard: the member type IS the generic parameter, but the receiver (`self` inside
+        // the type) carries NO concrete argument, so the argument is undeterminable. The substitution
+        // must decline (never guess) — `self.leak()` stays untyped and `payloadField` survives, so
+        // RollbackPass reverts its declaration (green under-obfuscation, never a wrong rename).
+        let r = try runPipeline("""
+        struct Payload { let payloadField: String }
+        struct Container<Element> {
+            let value: Element
+            func leak() -> Element { return value }
+            func run() { _ = self.leak().payloadField }
+        }
+        """)
+        XCTAssertTrue(r.contains("payloadField"),
+                      "no recoverable concrete arg → stays untyped, use-site keeps original:\n\(r)")
+    }
+
+    func testGenericEnumPayload_concretePayload_resolvesNormally() throws {
+        // Non-regression guard for the enum path: a NON-generic enum with a concrete payload
+        // (`case one(Payload)`) must resolve exactly as the local-enum path always did — substitution
+        // is skipped (the payload type is not a generic parameter of a generic enum).
+        let r = try runPipeline("""
+        struct Payload { let payloadField: String }
+        enum Wrap { case one(Payload) }
+        func run(_ w: Wrap) -> String { switch w { case .one(let p): return p.payloadField } }
+        """)
+        XCTAssertFalse(r.contains("payloadField"),
+                       "concrete enum payload must still resolve (substitution must not interfere):\n\(r)")
+    }
+
+    // MARK: - Dictionary mapValues / compactMapValues result element (B-FIX-64)
+
+    func testDictionaryMapValues_resultValueTypedFromClosureReturn_chainedMemberResolves() throws {
+        // `dict.mapValues { … }` yields `[K: R]` where R is the type the closure RETURNS, not the
+        // receiver's value — the Dictionary residual B-FIX-56 left open. A member reached through the
+        // result's values (`.values.first?.payloadField`) must resolve to R's member. Before this the
+        // mapValues result typed to nothing and `payloadField` stayed original while it renamed.
+        let r = try runPipeline("""
+        struct Payload { let payloadField: String }
+        func run(_ d: [String: Int]) -> String? {
+            return d.mapValues { _ in Payload() }.values.first?.payloadField
+        }
+        """)
+        XCTAssertFalse(r.contains("payloadField"),
+                       "Payload.payloadField decl AND use must resolve to one obf:\n\(r)")
+        let fieldObf = try firstGroup(#"let (\w+): String"#, in: r)
+        XCTAssertTrue(r.contains(".\(fieldObf)"),
+                      "mapValues result value member must rewrite to Payload.payloadField's obf:\n\(r)")
+    }
+
+    func testDictionaryCompactMapValues_resultValueTypedFromClosureReturn_chainedMemberResolves() throws {
+        // compactMapValues yields `[K: R]` where R is the closure's NON-optional return (a `return nil`
+        // is the filter, skipped by `closureReturnType`). Same value-chain must resolve.
+        let r = try runPipeline("""
+        struct Payload { let payloadField: String }
+        func run(_ d: [String: Int]) -> String? {
+            return d.compactMapValues { v -> Payload? in
+                if v > 0 { return Payload() }
+                return nil
+            }.values.first?.payloadField
+        }
+        """)
+        XCTAssertFalse(r.contains("payloadField"),
+                       "Payload.payloadField decl AND use must resolve to one obf:\n\(r)")
+        let fieldObf = try firstGroup(#"let (\w+): String"#, in: r)
+        XCTAssertTrue(r.contains(".\(fieldObf)"),
+                      "compactMapValues result value member must rewrite to Payload's obf:\n\(r)")
+    }
+
+    func testDictionaryMapValues_optionalMapNotMistakenForDictionary() throws {
+        // Fail-closed guard: `mapValues` is a Dictionary member. An Optional/array receiver has no
+        // `mapValues`, so the dictionary branch declines when the key can't be parsed — the value
+        // member stays untyped rather than being typed against a wrong `[K: R]`. Here the receiver is
+        // a plain array, whose `.map` is the SEQUENCE case and yields `[Payload]` (unaffected), while a
+        // non-dictionary `mapValues` would find no key and decline.
+        let r = try runPipeline("""
+        struct Payload { let payloadField: String }
+        func run(_ xs: [Int]) -> String? {
+            return xs.map { _ in Payload() }.first?.payloadField
+        }
+        """)
+        XCTAssertFalse(r.contains("payloadField"),
+                       "array .map result element must still resolve (sequence case unaffected):\n\(r)")
+    }
+
 }

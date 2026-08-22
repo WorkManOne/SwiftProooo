@@ -226,6 +226,13 @@ public final class TypeResolver {
                 guard let memberSym = baseScope.member(named: memberName) else { return nil }
                 if memberSym.kind.isTypeLike { return unwrapTypealias(memberSym, in: scope) }
                 if let typeName = table.declaredType[memberSym.id] {
+                    // The member's type may BE the base's generic parameter (`let value: Element` on a
+                    // `Container<Payload>` receiver) — substitute the concrete argument the receiver
+                    // carries (B-FIX-63). Fires only when the type is exactly a parameter, so an
+                    // ordinary member type falls through to the resolution below unchanged.
+                    if let sub = substitutedGenericMemberType(typeName, receiver: base, in: scope) {
+                        return typeSymbol(forQualifiedName: sub.name, in: sub.scope)
+                    }
                     // Declaring scope, not use-site (see the DeclRef branch above): a member typed as
                     // a sibling nested type (`var p2: S3` inside `enum E1`) only resolves from E1's
                     // scope.
@@ -919,6 +926,41 @@ public final class TypeResolver {
         return (base, args)
     }
 
+    /// Substitute a member's written type NAME with the receiver's concrete generic argument, when
+    /// that member type is EXACTLY one of the receiver base type's generic parameters (B-FIX-63).
+    /// This is the value/return-position twin of B-FIX-62's init-closure substitution:
+    /// `box: Container<Payload>` makes `box.value` (declared `let value: Element`) the type `Payload`,
+    /// and `s: Store<Payload>` makes `s.get()` (declared `-> Item`) the type `Payload` — the compiler
+    /// substitutes the generic parameter with the concrete argument, so SwiftProf must too or a member
+    /// reached through the result desyncs while the concrete type's member renames. The same primitive
+    /// serves a generic ENUM payload (`case .filled(let p)` on `Boxed<Payload>`, from ResolutionPass).
+    ///
+    /// The base type supplies the ORDERED parameter names (`genericParameterNames`, B-FIX-62); the
+    /// receiver supplies the concrete arguments through its WRITTEN type (`declaredType` keeps the
+    /// `<…>` clause, and `receiverTypeInfo` hands it back with the scope it was written in, B-FIX-23).
+    /// Fail-closed at every step, because a wrong substitution is a wrong rename RollbackPass cannot
+    /// catch:
+    ///   - the receiver must resolve to a LOCAL generic type carrying recorded parameter names;
+    ///   - `memberType` must BE one of those parameters — a compound like `[T]` / `T?` / `Dict<K,V>`
+    ///     is NOT modelled, so it returns nil and the member keeps its own stored type;
+    ///   - the receiver's written type must carry a generic clause whose base matches and whose arity
+    ///     equals the parameter count, else the argument is undeterminable and nothing is substituted.
+    /// Because it fires ONLY when the member type is a bare generic parameter (which otherwise resolves
+    /// to an empty placeholder typealias, i.e. nil), it is strictly additive: it never changes a member
+    /// whose type already resolved.
+    func substitutedGenericMemberType(_ memberType: String, receiver: ExprSyntax, in scope: Scope)
+        -> (name: String, scope: Scope)? {
+        guard let baseSym = typeSymbol(of: receiver, in: scope),
+              let paramNames = table.genericParameterNames[baseSym.id],
+              let pos = paramNames.firstIndex(of: memberType) else { return nil }
+        guard let raw = receiverTypeInfo(of: receiver, in: scope) else { return nil }
+        let expanded = expandedTypeName(raw.name, in: raw.declScope)
+        guard let split = Self.splitGenericArguments(of: expanded.name),
+              split.base == baseSym.name, split.args.count == paramNames.count,
+              pos < split.args.count else { return nil }
+        return (split.args[pos], expanded.scope)
+    }
+
     /// The type of closure parameter `paramIndex` when the closure DESTRUCTURES a tuple element
     /// (B-FIX-38): the HOF hands the closure ONE value, the closure names several, and each name
     /// binds one component — `rows.enumerated().forEach { offset, row in … }`,
@@ -1121,6 +1163,11 @@ public final class TypeResolver {
                let baseScope = canonicalInnerScope(of: baseSym),
                let memberSym = baseScope.member(named: memberName),
                let t = table.declaredType[memberSym.id] {
+                // Substitute a generic-parameter-typed member with the receiver's concrete argument
+                // (B-FIX-63), the same substitution the member branch of `typeSymbol(of:)` applies.
+                if let sub = substitutedGenericMemberType(t, receiver: base, in: scope) {
+                    return (name: sub.name, declScope: sub.scope)
+                }
                 return (t, memberSym.scope ?? scope)
             }
             // Stdlib collection member (`items.first`, `dict.values`) — the receiver names no
@@ -1146,6 +1193,14 @@ public final class TypeResolver {
             }
             if let callee = calleeCallable(for: call, in: scope),
                let ret = table.functionReturnType[callee.id] {
+                // A generic method's return may BE the receiver base's generic parameter
+                // (`func get() -> Item` on a `Store<Payload>` receiver) — substitute the concrete
+                // argument (B-FIX-63). Only for a `receiver.method()` call: a free function has no
+                // receiver to carry the argument, so it declines naturally.
+                if let m = call.calledExpression.as(MemberAccessExprSyntax.self), let recv = m.base,
+                   let sub = substitutedGenericMemberType(ret, receiver: recv, in: scope) {
+                    return (name: sub.name, declScope: sub.scope)
+                }
                 return (ret, callee.scope ?? scope)
             }
         }
@@ -1174,10 +1229,27 @@ public final class TypeResolver {
         guard let member = call.calledExpression.as(MemberAccessExprSyntax.self),
               let receiver = member.base else { return nil }
         let method = Self.stripBackticks(member.declName.baseName.text)
-        guard method == "map" || method == "compactMap" || method == "flatMap" else { return nil }
-        // Sequence receiver only (not Optional.map / Optional.flatMap).
+        let isDictMap = (method == "mapValues" || method == "compactMapValues")
+        let isSeqMap = (method == "map" || method == "compactMap" || method == "flatMap")
+        guard isDictMap || isSeqMap else { return nil }
         guard let recvInfo = receiverTypeInfo(of: receiver, in: scope) else { return nil }
         let recvExpanded = expandedTypeName(recvInfo.name, in: recvInfo.declScope)
+        // Dictionary `mapValues`/`compactMapValues`: result is `[K: R]` — the SAME keys, a NEW value
+        // that is the type the closure RETURNS, not the receiver's Value (the Dictionary residual
+        // B-FIX-56 left open, closed as B-FIX-64). The `dictionaryKeyType` guard both extracts the key
+        // and confirms the receiver really is a Dictionary, so a user type with a `mapValues` method
+        // declines here and falls through to the callee path. The key is qualified in the receiver's
+        // scope and the value in the closure's scope (B-FIX-23), and the tuple carries the closure
+        // scope so the value-chain (`…mapValues { … }.values.first?.m`) that motivates this resolves.
+        if isDictMap {
+            guard let key = Self.dictionaryKeyType(from: recvExpanded.name),
+                  let closure = Self.closureArgument(of: call, at: 0),
+                  let ret = closureReturnType(of: closure, in: scope) else { return nil }
+            let keyQualified = typeSymbol(forQualifiedName: key, in: recvExpanded.scope)
+                .map { TypeInferencePass.qualifiedName(of: $0) } ?? key
+            return ("[\(keyQualified): \(TypeInferencePass.qualifiedName(of: ret))]", ret.scope ?? scope)
+        }
+        // Sequence receiver only (not Optional.map / Optional.flatMap).
         guard CollectionMemberRegistry.sequenceElement(of: recvExpanded.name) != nil else { return nil }
         guard let closure = Self.closureArgument(of: call, at: 0),
               let ret = closureReturnType(of: closure, in: scope) else { return nil }

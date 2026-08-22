@@ -696,6 +696,18 @@ private final class ResolutionVisitor: SyntaxVisitor {
             let caseScope = caseSym.scope ?? currentScope
             for (binding, type) in zip(bindings, types) {
                 guard let binding, let type else { continue }
+                // The associated type may BE the enum's generic parameter (`case filled(Wrapped)` on a
+                // `Boxed<Payload>` subject) — substitute the concrete argument the subject carries
+                // (B-FIX-63), the payload twin of the value/return substitution and the general form of
+                // the Result-only B-FIX-57. Falls through for a concrete associated type, so a
+                // non-generic enum resolves exactly as before.
+                if let sub = typeResolver.substitutedGenericMemberType(type, receiver: subject,
+                                                                       in: currentScope) {
+                    let resolved = typeResolver.typeSymbol(forQualifiedName: sub.name, in: sub.scope)
+                    let bound = resolved.map { ($0.name, $0.scope ?? sub.scope) } ?? (sub.name, sub.scope)
+                    shadowBindingTypeFrames.bind(binding, visibleIn: extent, (name: bound.0, scope: bound.1))
+                    continue
+                }
                 // The associated type is WRITTEN in the enum's own scope, so that is where it resolves.
                 // Storing the pair keeps that fact with the name instead of qualifying the string and
                 // hoping the qualified form resolves from wherever it is read (B-FIX-35).
