@@ -101,6 +101,12 @@ public final class TypeResolver {
         if let awaitExpr = expr.as(AwaitExprSyntax.self) {
             return typeSymbol(of: awaitExpr.expression, in: scope)
         }
+        // `x as? T` / `x as! T` / `x as T` — the cast RESULT type is T, resolved at the use-site scope
+        // (the target is written there). Returns nil for an EXTERNAL target (no local Symbol), exactly
+        // as any external type does — `declaredTypeName` recovers the name instead. B-FIX-65.
+        if let castName = Self.castTargetTypeName(of: expr) {
+            return typeSymbol(forQualifiedName: castName, in: scope)
+        }
         // `base[args]` — the subscript RESULT type (so `arr[i].member` / `dict[k]?.member` /
         // `grid[i].member` resolve). See `subscriptResultType`.
         if let sub = expr.as(SubscriptCallExprSyntax.self) {
@@ -267,6 +273,10 @@ public final class TypeResolver {
         if let force = expr.as(ForceUnwrapExprSyntax.self) { return declaredTypeName(of: force.expression, in: scope) }
         if let tryE = expr.as(TryExprSyntax.self) { return declaredTypeName(of: tryE.expression, in: scope) }
         if let awaitE = expr.as(AwaitExprSyntax.self) { return declaredTypeName(of: awaitE.expression, in: scope) }
+        // `x as? T` / `x as! T` / `x as T` — the cast target, recovered directly so an EXTERNAL target
+        // (`x as? URL`) still names a type for overload disambiguation (B-FIX-65). The unwrapped
+        // (bare) name matches the `declaredType` convention.
+        if let castName = Self.castTargetTypeName(of: expr) { return Self.unwrapOptionalName(castName) }
         if let call = expr.as(FunctionCallExprSyntax.self) {
             // `Foo(...)` constructor → "Foo".
             if let callee = call.calledExpression.as(DeclReferenceExprSyntax.self) {
@@ -401,6 +411,29 @@ public final class TypeResolver {
         var n = s
         while n.hasSuffix("?") || n.hasSuffix("!") { n = String(n.dropLast()) }
         return n
+    }
+
+    /// The WRITTEN type name a `x as? T` / `x as! T` / `x as T` expression evaluates to, or nil.
+    ///
+    /// The static type of such a cast is T (unwrapped for the same reason an annotation is — member
+    /// access is what consumes it), so a value produced by a cast types exactly as if annotated. The
+    /// cast raw-parses (no operator folding) as a `SequenceExpr` of exactly `[expr, UnresolvedAsExpr,
+    /// TypeExpr]`; a LONGER sequence means the cast is embedded in a bigger expression (`x as? T ?? y`,
+    /// `x as? T == z`) whose result type is not T, so it is skipped (fail closed — a wrong type is a
+    /// wrong rename RollbackPass cannot catch).
+    ///
+    /// This is the expression-typing twin of `DeclarationPass.inferTypeFromInitializer`'s cast branch
+    /// (B-FIX-61), which types a PLAIN `let a = x as? T`. Placing it in the three central
+    /// expression-typing helpers below (`typeSymbol(of:)`, `declaredTypeName(of:)`,
+    /// `receiverTypeInfo(of:)`) is what makes an OPTIONAL binding (`guard/if/while let a = x as? T`,
+    /// typed by `bindingType` → `typeSymbol(of:)`) resolve too, plus every other cast-in-expression
+    /// site — one invariant, one place, instead of a per-consumer copy (B-FIX-65).
+    static func castTargetTypeName(of expr: ExprSyntax) -> String? {
+        guard let seq = expr.as(SequenceExprSyntax.self) else { return nil }
+        let elems = Array(seq.elements)
+        guard elems.count == 3, elems[1].is(UnresolvedAsExprSyntax.self),
+              let typeExpr = elems[2].as(TypeExprSyntax.self) else { return nil }
+        return WrittenTypeName.of(typeExpr.type)
     }
 
     /// If `sym` is a typealias whose RHS resolves to another type Symbol, follow the chain to the
@@ -1137,6 +1170,9 @@ public final class TypeResolver {
         if let force = expr.as(ForceUnwrapExprSyntax.self) { return receiverTypeInfo(of: force.expression, in: scope) }
         if let tryE = expr.as(TryExprSyntax.self) { return receiverTypeInfo(of: tryE.expression, in: scope) }
         if let awaitE = expr.as(AwaitExprSyntax.self) { return receiverTypeInfo(of: awaitE.expression, in: scope) }
+        // `x as? T` / `x as! T` / `x as T` — the cast target, resolved at the use-site scope where it
+        // is written (B-FIX-65). Lets a member reached directly off a cast (`(x as? T)?.member`) type.
+        if let castName = Self.castTargetTypeName(of: expr) { return (castName, scope) }
         if let ref = expr.as(DeclReferenceExprSyntax.self) {
             let name = Self.stripBackticks(ref.baseName.text)
             // `$x` / `_x` projection / storage — same wrapped type as `x`.

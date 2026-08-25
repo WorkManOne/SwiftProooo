@@ -7688,6 +7688,108 @@ final class PatternTests: XCTestCase {
                       "b.member must resolve to Conc.member's obf:\n\(r)")
     }
 
+    // MARK: - Cast in an OPTIONAL BINDING types the binding (B-FIX-65)
+
+    func testAsCastBinding_guardLet_concreteClassMethodResolves() throws {
+        // The reported BUG 1 shape: `guard let c = x as? Conc else { … }; c.method()`. A guard/if/while
+        // binding is typed by the FLOW-SENSITIVE path (`bindingType`), NOT by
+        // `DeclarationPass.inferTypeFromInitializer` (which B-FIX-61 taught the `as?` cast). That path
+        // delegates to `typeSymbol(of:)`, which had no SequenceExpr cast case — so the binding stayed
+        // untyped and `c.method()` desynced: the method's declaration renamed, the call did not.
+        let r = try runPipeline("""
+        final class Conc {
+            func doThing(flag: Bool = false) {}
+        }
+        final class Caller {
+            func f(_ x: Any) {
+                guard let c = x as? Conc else { return }
+                c.doThing()
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("func doThing"), "Conc.doThing must rename:\n\(r)")
+        let methodObf = try firstGroup(#"func (\w+)\(flag: Bool"#, in: r)
+        XCTAssertTrue(r.contains("c.\(methodObf)()"), "c.doThing() must resolve to Conc.doThing's obf:\n\(r)")
+    }
+
+    func testAsCastBinding_guardLet_existentialProtocolMethodResolves() throws {
+        // The reported BUG 2 shape: `guard let h = x as? P else { … }; h.method(par:)`, the protocol
+        // (existential) twin of BUG 1. Same root cause — the binding's cast initializer is not typed —
+        // and the requirement renames (nothing shields it) so the surviving `h.method` ships red.
+        let r = try runPipeline("""
+        protocol Handler: AnyObject {
+            func handle(par: Int)
+        }
+        final class Caller {
+            func f(_ x: AnyObject) {
+                guard let h = x as? Handler else { return }
+                h.handle(par: 1)
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("func handle"), "Handler.handle requirement must rename:\n\(r)")
+        let methodObf = try firstGroup(#"func (\w+)\(par: Int\)"#, in: r)
+        XCTAssertTrue(r.contains("h.\(methodObf)(par:"), "h.handle(par:) must resolve to Handler.handle's obf:\n\(r)")
+    }
+
+    func testAsCastBinding_ifLet_methodResolves() throws {
+        // The `if let` binding form.
+        let r = try runPipeline("""
+        final class Conc {
+            func doThing() {}
+        }
+        final class Caller {
+            func f(_ x: Any) {
+                if let c = x as? Conc {
+                    c.doThing()
+                }
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("func doThing"), "Conc.doThing must rename:\n\(r)")
+        let methodObf = try firstGroup(#"func (\w+)\(\) \{\}"#, in: r)
+        XCTAssertTrue(r.contains("c.\(methodObf)()"), "c.doThing() must resolve:\n\(r)")
+    }
+
+    func testAsCastBinding_whileLet_forceCast_methodResolves() throws {
+        // The `while let` binding form with an `as!` force cast.
+        let r = try runPipeline("""
+        final class Conc {
+            func doThing() {}
+        }
+        final class Caller {
+            func f(_ it: AnyIterator<Any>) {
+                while let c = it.next() as! Conc? {
+                    c.doThing()
+                }
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("func doThing"), "Conc.doThing must rename:\n\(r)")
+        let methodObf = try firstGroup(#"func (\w+)\(\) \{\}"#, in: r)
+        XCTAssertTrue(r.contains("c.\(methodObf)()"), "c.doThing() must resolve:\n\(r)")
+    }
+
+    func testAsCastBinding_embeddedInLargerExpression_staysFailClosed() throws {
+        // Guard-rail: a cast embedded in a LARGER expression (`(x as? Conc) ?? fallback`) is a 5-element
+        // sequence whose result type is not necessarily the cast target, so it is NOT typed — the
+        // member stays original (a revert, green) rather than being mistyped (a wrong rename). Here the
+        // member survives and RollbackPass reverts `Conc.member`, so both keep the original name.
+        let r = try runPipeline("""
+        final class Conc {
+            var member: Int = 0
+        }
+        final class Caller {
+            func f(_ x: Any, _ fallback: Conc) -> Int {
+                guard let c = (x as? Conc) ?? fallback as Conc? else { return 0 }
+                return c.member
+            }
+        }
+        """)
+        // The member read is not typed through the embedded cast, so `member` is not renamed here.
+        XCTAssertTrue(r.contains("c.member"), "embedded-cast binding member must stay fail-closed:\n\(r)")
+    }
+
     // MARK: - Closure param typed by generic substitution on a user type's initializer (B-FIX-62)
 
     func testGenericInitClosure_paramTypedFromAssignmentTargetGenericArg_memberResolves() throws {
