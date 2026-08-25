@@ -7790,6 +7790,78 @@ final class PatternTests: XCTestCase {
         XCTAssertTrue(r.contains("c.member"), "embedded-cast binding member must stay fail-closed:\n\(r)")
     }
 
+    // MARK: - Shorthand `.case` argument to a closure/function-typed CALLEE (B-FIX-66)
+
+    func testShorthandArgToClosureTypedParam_caseResolvesAndRenames() throws {
+        // The reported adjacent edge case: `completion(.ok)` where `completion: (Status) -> Void`. The
+        // callee is a VALUE of function type, which has no `functionParamTypes` entry, so
+        // `resolveCalleeParamType` could not type the shorthand — `Status.ok` stayed original and
+        // RollbackPass reverted it (coverage loss; red under a shield). Now typed via `valueClosureInput`.
+        let r = try runPipeline("""
+        enum Status { case ok, bad }
+        final class Svc {
+            func run(completion: (Status) -> Void) {
+                completion(.ok)
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("case ok"), "Status.ok must rename:\n\(r)")
+        let caseObf = try firstGroup(#"case (\w+), "#, in: r)
+        XCTAssertTrue(r.contains("completion(.\(caseObf))"),
+                      "completion(.ok) must follow Status.ok's obf:\n\(r)")
+    }
+
+    func testShorthandArgToClosureTypedParam_payloadCaseResolves() throws {
+        // The shorthand-with-payload form: `handler(.tap(x: 1))`.
+        let r = try runPipeline("""
+        enum Event { case tap(x: Int), other }
+        final class Svc {
+            func run(handler: (Event) -> Void) {
+                handler(.tap(x: 1))
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("case tap"), "Event.tap must rename:\n\(r)")
+        let caseObf = try firstGroup(#"case (\w+)\(x: Int\)"#, in: r)
+        XCTAssertTrue(r.contains("handler(.\(caseObf)(x:"),
+                      "handler(.tap(x:)) must follow Event.tap's obf:\n\(r)")
+    }
+
+    func testShorthandArgToClosureTypedProperty_memberAccessCallee_resolves() throws {
+        // The member-access callee form: `self.onChange(.ok)`, where `onChange` is a function-typed
+        // PROPERTY (absent from the callable-candidate set). Typed via `valueClosureInput`.
+        let r = try runPipeline("""
+        enum Status { case ok, bad }
+        final class Svc {
+            let onChange: (Status) -> Void = { _ in }
+            func fire() {
+                self.onChange(.ok)
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("case ok"), "Status.ok must rename:\n\(r)")
+        let caseObf = try firstGroup(#"case (\w+), "#, in: r)
+        XCTAssertTrue(r.contains(".\(caseObf))"), "self.onChange(.ok) must follow Status.ok's obf:\n\(r)")
+    }
+
+    func testShorthandArgToTypealiasClosureParam_caseResolves() throws {
+        // The callee's function type reached through a typealias (`completion: Handler`,
+        // `typealias Handler = (Status) -> Void`) — inputs come from `typealiasClosureInput` (B-FIX-55).
+        let r = try runPipeline("""
+        typealias Handler = (Status) -> Void
+        enum Status { case ok, bad }
+        final class Svc {
+            func run(completion: Handler) {
+                completion(.ok)
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("case ok"), "Status.ok must rename:\n\(r)")
+        let caseObf = try firstGroup(#"case (\w+), "#, in: r)
+        XCTAssertTrue(r.contains("completion(.\(caseObf))"),
+                      "completion(.ok) via typealias must follow Status.ok's obf:\n\(r)")
+    }
+
     // MARK: - Closure param typed by generic substitution on a user type's initializer (B-FIX-62)
 
     func testGenericInitClosure_paramTypedFromAssignmentTargetGenericArg_memberResolves() throws {

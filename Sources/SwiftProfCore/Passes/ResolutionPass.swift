@@ -2707,9 +2707,14 @@ private final class ResolutionVisitor: SyntaxVisitor {
             // even when it's an extension / cross-module method not visible in the scope chain —
             // otherwise a shorthand `.case` argument can't learn its contextual enum type and is
             // left un-renamed while the enum case itself was renamed (`has no member` breakage).
-            if let sym = resolveCall(name: name, call: call) ?? currentScope.lookup(name: name),
-               let type = declaredParamType(of: sym, call: call, argIndex: argIndex) {
-                return ContextualType(name: type, scope: sym.scope)
+            if let sym = resolveCall(name: name, call: call) ?? currentScope.lookup(name: name) {
+                if let type = declaredParamType(of: sym, call: call, argIndex: argIndex) {
+                    return ContextualType(name: type, scope: sym.scope)
+                }
+                // The callee is a VALUE of function type (a closure/function-typed parameter, local or
+                // property — `completion(.c2)` where `completion: (E1) -> Void`), which has no
+                // `functionParamTypes` entry. Its input at this argument types the shorthand (B-FIX-66).
+                if let ctx = closureValueInputType(of: sym, at: argIndex) { return ctx }
             }
             // CONSTRUCTOR call. A type name is not a callable, so neither branch above can see it
             // and the argument had NO context at all — the single widest hole in contextual `.case`
@@ -2768,7 +2773,38 @@ private final class ResolutionVisitor: SyntaxVisitor {
             if let agreed = agreedParamType(cands, call: call, argIndex: argIndex) {
                 return ContextualType(name: agreed, scope: cands.first?.scope)
             }
+            // `self.handler(.ok)` / `obj.handler(.ok)` — the member is a function-typed PROPERTY, not a
+            // callable declaration, so it is absent from `cands`. Its input types come from
+            // `valueClosureInput`, keyed by the property's own id (B-FIX-66).
+            if let member = scope.members(named: methodName).first(where: { !Self.isCallable($0.kind) }),
+               let ctx = closureValueInputType(of: member, at: argIndex) {
+                return ctx
+            }
             return nil
+        }
+        return nil
+    }
+
+    /// The parameter TYPE at `argIndex` of a callee that is a VALUE of function type (a
+    /// closure/function-typed parameter, local or property — `completion(.c2)` where
+    /// `completion: (E1) -> Void`). Function types carry no argument labels, so the call's arguments
+    /// are positional and `argIndex` maps directly to the input position. Handles a direct function
+    /// type (`valueClosureInput`) and a `typealias` to one (`typealiasClosureInput`). The input name is
+    /// written in the value's (or the alias's) declaring scope, so it is returned with that scope
+    /// (B-FIX-23). Fail-closed: no recorded inputs, an out-of-range index, or an empty (unreducible)
+    /// input name yields nil, so a shorthand stays un-renamed rather than typed to a guessed enum.
+    /// B-FIX-66.
+    private func closureValueInputType(of sym: Symbol, at argIndex: Int) -> ContextualType? {
+        if let inputs = table.valueClosureInput[sym.id], argIndex < inputs.count, !inputs[argIndex].isEmpty {
+            return ContextualType(name: inputs[argIndex], scope: sym.scope)
+        }
+        // `completion: Handler`, `typealias Handler = (E1) -> Void` — the written type is the alias
+        // name (recorded in `declaredType`), whose inputs live in `typealiasClosureInput` (B-FIX-55).
+        if let typeName = table.declaredType[sym.id],
+           let aliasSym = typeResolver.typeSymbol(forQualifiedName: typeName, in: sym.scope ?? currentScope),
+           let inputs = table.typealiasClosureInput[aliasSym.id], argIndex < inputs.count,
+           !inputs[argIndex].isEmpty {
+            return ContextualType(name: inputs[argIndex], scope: aliasSym.scope)
         }
         return nil
     }

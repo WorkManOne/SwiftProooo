@@ -641,8 +641,9 @@ private final class DeclVisitor: SyntaxVisitor {
         for (paramIndex, param) in params.enumerated() {
             paramTypes.append(WrittenTypeName.of(param.type))
             paramHasDefault.append(param.defaultValue != nil)
-            if let inputs = Self.closureInputTypeNames(of: param.type) {
-                closureInputs[paramIndex] = inputs
+            let closureInput = Self.closureInputTypeNames(of: param.type)
+            if let closureInput {
+                closureInputs[paramIndex] = closureInput
             }
             // External label is `firstName` ("_" when there's no call-site label, or the
             // declared label otherwise). Used for overload resolution by argument labels.
@@ -669,6 +670,10 @@ private final class DeclVisitor: SyntaxVisitor {
             if param.secondName != nil {
                 table.renameableParameters.insert(sym.id)
             }
+            // A function-typed parameter (`completion: (E1) -> Void`) called as a callee reads its
+            // input types from `valueClosureInput`, keyed by its OWN id (B-FIX-66). `declaredType` is
+            // nil for it (`WrittenTypeName.of` reduces no function type), so this is the only carrier.
+            if let closureInput { table.valueClosureInput[sym.id] = closureInput }
         }
         table.functionParamTypes[funcId] = paramTypes
         table.functionParamLabels[funcId] = paramLabels
@@ -698,6 +703,14 @@ private final class DeclVisitor: SyntaxVisitor {
                 let sym = makeSymbol(name: ident.identifier.text, kind: kind, identifierToken: ident.identifier)
                 if isOverride { table.overrideMemberIds.insert(sym.id) }
                 if !isStatic, Self.isStoredBinding(binding) { table.storedPropertyIds.insert(sym.id) }
+                // A function-typed property/local (`let completion: (E1) -> Void`) records its input
+                // types under its own id so a call through it as a callee can type a shorthand argument
+                // (B-FIX-66). `WrittenTypeName.of` reduces no function type, so the annotation branch
+                // below records no `declaredType` for it — this is the only carrier.
+                if let annotation = binding.typeAnnotation,
+                   let closureInput = Self.closureInputTypeNames(of: annotation.type) {
+                    table.valueClosureInput[sym.id] = closureInput
+                }
                 if let annotation = binding.typeAnnotation,
                    let typeName = WrittenTypeName.of(annotation.type) {
                     table.declaredType[sym.id] = typeName

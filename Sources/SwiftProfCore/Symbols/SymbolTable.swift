@@ -43,6 +43,15 @@ public final class SymbolTable {
     /// declared signature — generalizing HOF closure-param inference beyond the hardcoded stdlib
     /// registry (B-FIX-2). E.g. `func transform(_ f: (Item) -> Int)` records `[0: ["Item"]]`.
     public internal(set) var functionParamClosureInput: [Int: [Int: [String]]] = [:]
+    /// For a VALUE (parameter / property / local) whose written type IS a FUNCTION type
+    /// (`completion: (E1) -> Void`), the closure's input type names, keyed by that value symbol's OWN
+    /// id. `functionParamClosureInput` is keyed by the OWNING callable + parameter index (for typing a
+    /// closure ARGUMENT), which cannot answer "what does THIS value, called as a callee, take". So when
+    /// the callee of a call is a function-typed value (`completion(.c2)`), its parameter TYPE at a
+    /// shorthand `.case` argument is read from here. Function types carry no argument labels, so the
+    /// call's arguments are positional and the argument index maps directly to the input position.
+    /// Input names are WRITTEN in the value's declaring scope (carry `Symbol.scope` when reading). B-FIX-66.
+    public internal(set) var valueClosureInput: [Int: [String]] = [:]
     /// For a `typealias` whose underlying type is a FUNCTION type (`typealias Handler = (En1) -> Void`),
     /// the closure's input type names, keyed by the typealias symbol id. `functionParamClosureInput`
     /// only sees a LITERAL `FunctionTypeSyntax` on the parameter, so a `func f(_ h: Handler)` records
