@@ -8906,4 +8906,79 @@ final class PatternTests: XCTestCase {
                        "an enum-case payload must still resolve via the enum branch:\n\(r)")
     }
 
+    // MARK: - B-FIX-80: tuple checked-cast pattern bindings (`case let (x, y) as (A, B)`)
+
+    /// `switch any { case let (a, b) as (Alpha, Beta): a.member(); b.member() }` — each leaf takes
+    /// the cast target's component type at its position, so both members resolve.
+    func testTupleAsPattern_switchCaseLet_componentMembersResolve() throws {
+        let r = try runPipeline("""
+        struct Alpha { func alphaTag() -> String { return "a" } }
+        struct Beta { func betaTag() -> String { return "b" } }
+        final class Handler {
+            func run(_ any: Any) {
+                switch any {
+                case let (a, b) as (Alpha, Beta):
+                    _ = a.alphaTag()
+                    _ = b.betaTag()
+                default:
+                    break
+                }
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("alphaTag"), "first cast-tuple leaf member must rename:\n\(r)")
+        XCTAssertFalse(r.contains("betaTag"), "second cast-tuple leaf member must rename:\n\(r)")
+    }
+
+    /// The `if case let (x, y) as (A, B) = any` condition form.
+    func testTupleAsPattern_ifCaseLet_componentMembersResolve() throws {
+        let r = try runPipeline("""
+        struct Alpha { func alphaTag() -> String { return "a" } }
+        struct Beta { func betaTag() -> String { return "b" } }
+        final class Handler {
+            func run(_ any: Any) {
+                if case let (a, b) as (Alpha, Beta) = any {
+                    _ = a.alphaTag()
+                    _ = b.betaTag()
+                }
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("alphaTag"), "if-case cast-tuple first leaf member must rename:\n\(r)")
+        XCTAssertFalse(r.contains("betaTag"), "if-case cast-tuple second leaf member must rename:\n\(r)")
+    }
+
+    /// A wildcard component `case let (_, b) as (Alpha, Beta)` — `_` occupies a position but binds
+    /// nothing, so `b` still takes component 1 (`Beta`) and its member resolves.
+    func testTupleAsPattern_wildcardComponent_typesRemainingLeaf() throws {
+        let r = try runPipeline("""
+        struct Alpha { func alphaTag() -> String { return "a" } }
+        struct Beta { func betaTag() -> String { return "b" } }
+        final class Handler {
+            func run(_ any: Any) {
+                if case let (_, b) as (Alpha, Beta) = any {
+                    _ = b.betaTag()
+                }
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("betaTag"), "leaf after a wildcard must still take its component:\n\(r)")
+    }
+
+    /// Guard-rail: the single-identifier cast pattern (`case let x as Alpha`, B-FIX-67) is unaffected —
+    /// the tuple recognizer returns false for a non-tuple binding and the B-FIX-67 path types `x`.
+    func testTupleAsPattern_singleIdentifierCast_stillResolves() throws {
+        let r = try runPipeline("""
+        struct Alpha { func alphaTag() -> String { return "a" } }
+        final class Handler {
+            func run(_ any: Any) {
+                if case let x as Alpha = any {
+                    _ = x.alphaTag()
+                }
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("alphaTag"), "single-identifier cast pattern must still resolve:\n\(r)")
+    }
+
 }

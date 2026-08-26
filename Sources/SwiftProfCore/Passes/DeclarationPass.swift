@@ -537,6 +537,10 @@ private final class DeclVisitor: SyntaxVisitor {
             // ExpressionPattern → SequenceExpr[ PatternExpr(x), UnresolvedAsExpr, TypeExpr(Foo) ].
             if let asBinding = Self.asPatternBinding(expr.expression) {
                 registerLocalBinding(asBinding.token, type: asBinding.type, visibleIn: visibleIn)
+            } else if registerTupleAsPatternBinding(expr.expression, visibleIn: visibleIn) {
+                // `case let (x, y) as (A, B)` — a TUPLE checked-cast pattern (B-FIX-80). Handled: each
+                // leaf was registered WITH its cast-target component type, so the generic collector
+                // below (which would register them untyped) must be skipped.
             } else {
                 registerBindingRefs(in: expr.expression, visibleIn: visibleIn)
             }
@@ -564,6 +568,68 @@ private final class DeclVisitor: SyntaxVisitor {
               let typeExpr = elements[2].as(TypeExprSyntax.self)
         else { return nil }
         return (ident.identifier, typeExpr.type)
+    }
+
+    /// The TUPLE sibling of `asPatternBinding` (B-FIX-80): a checked-cast pattern whose binding is a
+    /// TUPLE, `case let (x, y) as (A, B)` (and `if/guard/while case`, `switch case`). It raw-parses as
+    /// `SequenceExpr[ TupleExpr(bindings), UnresolvedAsExpr, TypeExpr(TupleType) ]` (confirmed by AST
+    /// dump). Register each identifier leaf of the binding tuple WITH the cast target's component type
+    /// at the same POSITION (ground truth — a written cast target), so a member reached through the
+    /// leaf (`x.member()`) resolves to that type. `registerLocalBinding` stores a scalar component into
+    /// `declaredType` and a nested-tuple component into `tupleDeclaredType`, so both scalar and nested
+    /// targets are typed. Returns true when it handled the pattern (the caller then SKIPS the generic
+    /// collector); false when the shape is not a tuple cast or does not fully line up, so the generic
+    /// collector still registers the names untyped, exactly as before (a wrong type is a wrong rename).
+    ///
+    /// Collect-then-register: the leaves are gathered first and registered only if the WHOLE structure
+    /// lines up, so a partial match never registers a leaf that the fall-back collector would register
+    /// again (a double registration).
+    private func registerTupleAsPatternBinding(_ expr: ExprSyntax,
+                                               visibleIn: ConditionBindingExtent.Visibility?) -> Bool {
+        guard let seq = expr.as(SequenceExprSyntax.self) else { return false }
+        let elements = Array(seq.elements)
+        guard elements.count == 3,
+              let bindingTuple = elements[0].as(TupleExprSyntax.self),
+              elements[1].is(UnresolvedAsExprSyntax.self),
+              let typeExpr = elements[2].as(TypeExprSyntax.self),
+              let targetTuple = typeExpr.type.as(TupleTypeSyntax.self) else { return false }
+        var collected: [(token: TokenSyntax, type: TypeSyntax)] = []
+        guard Self.collectTupleAsLeaves(bindingTuple, targetTuple: targetTuple, into: &collected),
+              !collected.isEmpty else { return false }
+        for leaf in collected {
+            registerLocalBinding(leaf.token, type: leaf.type, visibleIn: visibleIn)
+        }
+        return true
+    }
+
+    /// Pair each identifier leaf of a (possibly nested) binding tuple with the cast target's component
+    /// type at the same position. Fail-closed: an arity mismatch, a nested binding whose target is not
+    /// itself a tuple, or a leaf shape we don't model (anything but an identifier or a wildcard) returns
+    /// false and NOTHING is collected — the caller then registers everything untyped. A `_` occupies a
+    /// position (so later leaves keep their index) but binds nothing.
+    private static func collectTupleAsLeaves(_ bindingTuple: TupleExprSyntax, targetTuple: TupleTypeSyntax,
+                                             into out: inout [(token: TokenSyntax, type: TypeSyntax)]) -> Bool {
+        let bindingElems = Array(bindingTuple.elements)
+        let targetElems = Array(targetTuple.elements)
+        guard bindingElems.count == targetElems.count, bindingElems.count > 1 else { return false }
+        for (b, t) in zip(bindingElems, targetElems) {
+            if let nestedBinding = b.expression.as(TupleExprSyntax.self) {
+                guard let nestedTarget = t.type.as(TupleTypeSyntax.self),
+                      collectTupleAsLeaves(nestedBinding, targetTuple: nestedTarget, into: &out) else { return false }
+                continue
+            }
+            // A wildcard `_` in this position parses as a `DiscardAssignmentExpr` (NOT a
+            // `PatternExpr`→`WildcardPattern`) — it occupies its position (so later leaves keep their
+            // index) but binds nothing.
+            if b.expression.is(DiscardAssignmentExprSyntax.self) { continue }
+            guard let patExpr = b.expression.as(PatternExprSyntax.self) else { return false }
+            var p = patExpr.pattern
+            if let vb = p.as(ValueBindingPatternSyntax.self) { p = vb.pattern }
+            if p.is(WildcardPatternSyntax.self) { continue }
+            guard let ident = p.as(IdentifierPatternSyntax.self) else { return false }
+            out.append((ident.identifier, t.type))
+        }
+        return true
     }
 
     /// Under a `let`/`var`, `case let .foo(a, b)` binds `a`/`b`. Depending on the exact source
