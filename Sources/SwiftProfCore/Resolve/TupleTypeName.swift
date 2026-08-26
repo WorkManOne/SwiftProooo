@@ -50,6 +50,26 @@ enum TupleTypeName {
         return out
     }
 
+    /// The type of the leaf reached by walking a tuple type down `path` — a sequence of
+    /// `(index, arity)` steps, one per nesting level, positionally (a tuple pattern destructures by
+    /// position, never by label). A flat pattern (`(let x, let y)`) walks a length-1 path; a nested
+    /// one (`(let a, (let b, let c))`) descends one component level per step (the B-FIX-71 idea,
+    /// reused for the pattern side in B-FIX-79). The same walk `TypeInferencePass.inferTupleComponentType`
+    /// runs over a for-in element, hoisted here so both consumers share it.
+    ///
+    /// Fail-closed at every step: a component count that does not equal the recorded arity there, or
+    /// an index out of range, yields nil — a mis-count would type a binding as the WRONG component,
+    /// which is a wrong rename RollbackPass cannot catch, so refusing costs a rename instead.
+    static func component(at path: [(index: Int, arity: Int)], of typeName: String) -> String? {
+        var current = typeName
+        for step in path {
+            guard let comps = components(of: current),
+                  comps.count == step.arity, step.index >= 0, step.index < comps.count else { return nil }
+            current = comps[step.index]
+        }
+        return current
+    }
+
     /// `offset: Int` → `(label: "offset", type: "Int")`; `Int` → `(nil, "Int")`. Only a TOP-LEVEL
     /// colon is a label separator, so a dictionary component (`[String: Row]`) keeps its colon and
     /// yields no label.

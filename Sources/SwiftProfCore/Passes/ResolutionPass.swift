@@ -685,6 +685,26 @@ private final class ResolutionVisitor: SyntaxVisitor {
     /// passes nil: its frame is popped with its own scope.
     private func recordEnumPayloadBindingTypes(pattern: PatternSyntax, matching subject: ExprSyntax,
                                                visibleIn extent: ConditionBindingExtent.Visibility? = nil) {
+        // A TUPLE pattern (`if case (let x, let y) = t`, `switch t { case (let x, let y): }`,
+        // `guard case let (x, y) = t`, `if case (let x, let y)? = optT`) binds each identifier leaf to
+        // the corresponding COMPONENT of the subject's TUPLE type — the pattern-matching sibling of the
+        // tuple member access in B-FIX-69 (B-FIX-79). The subject's tuple type comes from
+        // `receiverTypeInfo` (a written tuple via `tupleDeclaredType`, B-FIX-78, or a synthesized
+        // `enumerated`/`zip`/dictionary tuple), unwrapped through any `typealias` by `expandedTypeName`.
+        // A tuple pattern is never an enum-case pattern (that is an `ExpressionPattern` wrapping a
+        // FunctionCall, this one wraps a TupleExpr), so this precedes the enum branches. Fail-closed per
+        // leaf: a path that does not line up with the subject's components leaves that leaf untyped.
+        if let leaves = Self.tuplePatternLeaves(of: pattern),
+           let info = typeResolver.receiverTypeInfo(of: subject, in: currentScope) {
+            let expanded = typeResolver.expandedTypeName(info.name, in: info.declScope)
+            for leaf in leaves {
+                guard let component = TupleTypeName.component(at: leaf.path, of: expanded.name) else { continue }
+                let resolved = typeResolver.typeSymbol(forQualifiedName: component, in: expanded.scope)
+                let bound = resolved.map { ($0.name, $0.scope ?? expanded.scope) } ?? (component, expanded.scope)
+                shadowBindingTypeFrames.bind(leaf.name, visibleIn: extent, (name: bound.0, scope: bound.1))
+            }
+            return
+        }
         // LOCAL enum: the case's associated types are recorded and resolve in the enum's own scope.
         if let enumSym = typeResolver.typeSymbol(of: subject, in: currentScope),
            enumSym.kind == .enum,
@@ -749,6 +769,51 @@ private final class ResolutionVisitor: SyntaxVisitor {
             probe = p.parent
         }
         return nil
+    }
+
+    /// The identifier LEAVES of a TUPLE pattern with each leaf's positional PATH from the whole tuple
+    /// down to it (B-FIX-79). A condition/switch tuple pattern raw-parses as an `ExpressionPattern`
+    /// wrapping a `TupleExpr` (confirmed by AST dump) — NOT a `TuplePattern` (that is the for-in form),
+    /// optionally wrapped in a `ValueBindingPattern` (`case let (x, y)`) or carrying a trailing `?`
+    /// (`case (let x, let y)? = optT`, an `OptionalChainingExpr` inside the ExpressionPattern). A
+    /// non-tuple pattern (an enum-case call, a scalar) yields nil so the caller falls through to the
+    /// enum branches. A wildcard `_` or any non-binding element occupies a position but yields no leaf.
+    private static func tuplePatternLeaves(of pattern: PatternSyntax)
+        -> [(name: String, path: [(index: Int, arity: Int)])]? {
+        var inner = pattern
+        if let vb = inner.as(ValueBindingPatternSyntax.self) { inner = vb.pattern }
+        guard let exprPattern = inner.as(ExpressionPatternSyntax.self) else { return nil }
+        var expr = exprPattern.expression
+        if let optional = expr.as(OptionalChainingExprSyntax.self) { expr = optional.expression }
+        guard let tuple = expr.as(TupleExprSyntax.self) else { return nil }
+        var out: [(name: String, path: [(index: Int, arity: Int)])] = []
+        collectTupleExprLeaves(tuple, prefix: [], into: &out)
+        return out.isEmpty ? nil : out
+    }
+
+    /// Recurse over a `TupleExpr`'s elements, recording each identifier leaf with the `(index, arity)`
+    /// path that reaches it. A NESTED element (`(let a, (let b, let c))`) parses as an inner `TupleExpr`
+    /// directly (no `PatternExpr` wrapper), so it is descended; an identifier leaf is a `PatternExpr`
+    /// wrapping either a `ValueBindingPattern`→`IdentifierPattern` (`let x`) or a bare `IdentifierPattern`
+    /// (`case let (x, y)` — the `let` is on the whole tuple). Everything else (a wildcard, a literal
+    /// sub-pattern) still occupies its position so later leaves keep their index.
+    private static func collectTupleExprLeaves(_ tuple: TupleExprSyntax, prefix: [(index: Int, arity: Int)],
+                                               into out: inout [(name: String, path: [(index: Int, arity: Int)])]) {
+        let elements = Array(tuple.elements)
+        let arity = elements.count
+        for (index, element) in elements.enumerated() {
+            let path = prefix + [(index: index, arity: arity)]
+            if let nested = element.expression.as(TupleExprSyntax.self) {
+                collectTupleExprLeaves(nested, prefix: path, into: &out)
+                continue
+            }
+            guard let patExpr = element.expression.as(PatternExprSyntax.self) else { continue }
+            var p = patExpr.pattern
+            if let vb = p.as(ValueBindingPatternSyntax.self) { p = vb.pattern }
+            if let ident = p.as(IdentifierPatternSyntax.self) {
+                out.append((name: TypeResolver.stripBackticks(ident.identifier.text), path: path))
+            }
+        }
     }
 
     /// `(caseName, bindingNames)` of an enum-case pattern with a payload, for both spellings:

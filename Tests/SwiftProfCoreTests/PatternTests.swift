@@ -8807,4 +8807,103 @@ final class PatternTests: XCTestCase {
                        "a plain parameter must still resolve through declaredType:\n\(r)")
     }
 
+    // MARK: - B-FIX-79: tuple-pattern bindings (each leaf takes the subject's tuple component)
+
+    /// `switch pair { case (let idx, let row): row.member() }` — the tuple pattern destructures the
+    /// subject's tuple type, so `row` takes component 1 (`Row`) and its member resolves.
+    func testTuplePattern_switchCase_componentMemberResolves() throws {
+        let r = try runPipeline("""
+        struct Row { func rowTag() -> String { return "t" } }
+        final class Handler {
+            let pair: (offset: Int, element: Row) = (0, Row())
+            func run() {
+                switch pair {
+                case (let idx, let row):
+                    _ = idx
+                    _ = row.rowTag()
+                }
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("rowTag"),
+                       "member through a switch tuple-pattern component must rename:\n\(r)")
+    }
+
+    /// `guard case let (idx, row) = pair` — the PREFIX `let` form (the whole tuple under one
+    /// ValueBindingPattern, bare identifiers inside).
+    func testTuplePattern_guardCaseLetPrefix_componentMemberResolves() throws {
+        let r = try runPipeline("""
+        struct Row { func rowTag() -> String { return "t" } }
+        final class Handler {
+            let pair: (offset: Int, element: Row) = (0, Row())
+            func run() {
+                guard case let (idx, row) = pair else { return }
+                _ = idx
+                _ = row.rowTag()
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("rowTag"),
+                       "member through a guard-case-let tuple component must rename:\n\(r)")
+    }
+
+    /// `if case (let idx, let row)? = optPair` — the OPTIONAL form: an `OptionalChainingExpr` wraps the
+    /// TupleExpr, and the subject's optional tuple type is peeled by `labeledComponents`.
+    func testTuplePattern_ifCaseOptional_componentMemberResolves() throws {
+        let r = try runPipeline("""
+        struct Row { func rowTag() -> String { return "t" } }
+        final class Handler {
+            func run(_ optPair: (offset: Int, element: Row)?) {
+                if case (let idx, let row)? = optPair {
+                    _ = idx
+                    _ = row.rowTag()
+                }
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("rowTag"),
+                       "member through an optional tuple-pattern component must rename:\n\(r)")
+    }
+
+    /// A NESTED tuple pattern (`case (let a, (let b, let c))`) — the leaf `cell` descends two levels
+    /// of the subject's tuple type (the B-FIX-71 path idea on the pattern side).
+    func testTuplePattern_nested_leafComponentMemberResolves() throws {
+        let r = try runPipeline("""
+        struct Cell { func cellTag() -> String { return "t" } }
+        final class Handler {
+            let triple: (Int, (String, Cell)) = (0, ("a", Cell()))
+            func run() {
+                switch triple {
+                case (let a, (let b, let cell)):
+                    _ = a
+                    _ = b
+                    _ = cell.cellTag()
+                }
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("cellTag"),
+                       "member through a nested tuple-pattern leaf must rename:\n\(r)")
+    }
+
+    /// Fail-closed guard-rail: an enum-case pattern (`case .loaded(let row)`) is NOT a tuple pattern,
+    /// so `tuplePatternLeaves` returns nil and the enum branch types the payload exactly as before —
+    /// the tuple branch must not swallow it.
+    func testTuplePattern_enumCasePattern_stillResolvesViaEnumBranch() throws {
+        let r = try runPipeline("""
+        struct Row { func rowTag() -> String { return "t" } }
+        enum State { case loaded(Row) }
+        final class Handler {
+            func run(_ s: State) {
+                switch s {
+                case .loaded(let row):
+                    _ = row.rowTag()
+                }
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("rowTag"),
+                       "an enum-case payload must still resolve via the enum branch:\n\(r)")
+    }
+
 }
