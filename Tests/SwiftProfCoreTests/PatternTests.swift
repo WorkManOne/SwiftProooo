@@ -8554,4 +8554,79 @@ final class PatternTests: XCTestCase {
                        "qualified case use should still rename its declaration:\n\(r)")
     }
 
+    // MARK: - B-FIX-75: initializer-driven inference stores COLLECTION / TUPLE string types
+
+    /// `let xs = rows.filter { … }` — the local's type is `[Row]`, a collection string that names no
+    /// declaration, so step-1 inference (Symbol-only) left it untyped and `xs.first?.member` desynced.
+    func testCompositeLocal_filterResult_chainedMemberResolves() throws {
+        let r = try runPipeline("""
+        struct Row { func title() -> String { return "t" } }
+        func use(_ rows: [Row]) {
+            let xs = rows.filter { _ in true }
+            _ = xs.first?.title()
+        }
+        """)
+        XCTAssertFalse(r.contains("title"),
+                       "member through a collection-typed local must rename:\n\(r)")
+    }
+
+    /// `let ys = rows.sorted { … }` then a for-in over `ys` — the loop variable types off the stored
+    /// `[Row]`.
+    func testCompositeLocal_sortedResult_forInMemberResolves() throws {
+        let r = try runPipeline("""
+        struct Row { func title() -> String { return "t" } }
+        func use(_ rows: [Row]) {
+            let ys = rows.sorted { _, _ in true }
+            for r in ys { _ = r.title() }
+        }
+        """)
+        XCTAssertFalse(r.contains("title"),
+                       "member through a for-in over a collection-typed local must rename:\n\(r)")
+    }
+
+    /// `let pairs = zip(a, b)` bound to a LOCAL, then destructured in a for-in — the local carries the
+    /// `[(A, B)]` string so the tuple machinery types each component.
+    func testCompositeLocal_zipResult_destructuredMemberResolves() throws {
+        let r = try runPipeline("""
+        struct Row { func title() -> String { return "t" } }
+        func use(_ a: [Row], _ b: [Row]) {
+            let pairs = zip(a, b)
+            for (x, y) in pairs { _ = x.title(); _ = y.title() }
+        }
+        """)
+        XCTAssertFalse(r.contains("title"),
+                       "member through a zip-typed local must rename:\n\(r)")
+    }
+
+    /// A TUPLE-typed local (`rows.enumerated().first` → `(offset: Int, element: Row)?`) — its stored
+    /// tuple string lets `pair?.element.member` pick the component.
+    func testCompositeLocal_enumeratedFirst_tupleComponentMemberResolves() throws {
+        let r = try runPipeline("""
+        struct Row { func title() -> String { return "t" } }
+        func use(_ rows: [Row]) {
+            let pair = rows.enumerated().first
+            _ = pair?.element.title()
+        }
+        """)
+        XCTAssertFalse(r.contains("title"),
+                       "member through a tuple-typed local must rename:\n\(r)")
+    }
+
+    /// Fail-closed guard: a local whose initializer is an EXTERNAL scalar (not a chaseable composite)
+    /// is not persisted, so a real external member is left alone (never a wrong rename). The point is
+    /// that the pipeline does not crash or mis-type; the local String's members are stdlib.
+    func testCompositeLocal_externalScalarInitializer_notMistyped() throws {
+        let r = try runPipeline("""
+        struct Row { func title() -> String { return "t" } }
+        func use(_ rows: [Row]) {
+            let name = "literal"
+            _ = name.count
+            _ = rows.first?.title()
+        }
+        """)
+        // The genuine local member (rows.first?.title) still resolves; the String local is inert.
+        XCTAssertFalse(r.contains("title"),
+                       "genuine collection member must still rename while the scalar local is inert:\n\(r)")
+    }
+
 }

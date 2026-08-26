@@ -34,6 +34,17 @@ public final class TypeInferencePass {
                 table.declaredType[sym.id] = name
                 inferred += 1
                 logger.log("[infer-init] \(sym.name)#\(sym.id) → \(name)", verbose: true)
+            } else if let composite = storableCompositeType(of: expr, in: scope) {
+                // `typeSymbol` names only LOCAL declarations, so a local whose initializer types to a
+                // COLLECTION / TUPLE string (`let xs = rows.filter { … }` → `[Row]`,
+                // `let pairs = zip(a, b)` → `[(A, B)]`) was left untyped, and every chain through it
+                // (`xs.first?.m`, a for-in over `pairs`) stayed un-renamed while the member declaration
+                // renamed — the desync class (B-FIX-75). The for-loop path (step 2) already stores such
+                // strings via `receiverTypeInfo`; this gives the initializer path the same reach, gated
+                // to the "chaseable composite" shapes so an external scalar (`URL`) is not persisted.
+                table.declaredType[sym.id] = composite
+                inferred += 1
+                logger.log("[infer-init-composite] \(sym.name)#\(sym.id) → \(composite)", verbose: true)
             } else {
                 logger.log("[infer-init-fail] \(sym.name)#\(sym.id) — could not resolve init expr", verbose: true)
             }
@@ -158,5 +169,25 @@ public final class TypeInferencePass {
     private func leafDeclaredType(of expr: ExprSyntax, in scope: Scope) -> (name: String, scope: Scope)? {
         guard let info = resolver.receiverTypeInfo(of: expr, in: scope) else { return nil }
         return (info.name, info.declScope)
+    }
+
+    /// The WRITTEN type-name string of an initializer expression, but ONLY when that string is a
+    /// "chaseable composite": a collection (`[Row]`, `Set<Row>`, `[K: V]`) or a tuple
+    /// (`(offset: Int, element: Row)`). Such a string names no declaration, so `typeSymbol(of:)`
+    /// returns nil for it and step 1's Symbol-only inference could not persist it (B-FIX-75). Storing
+    /// it lets a chain through the local — `xs.first?.m`, a for-in over `pairs` — resolve, exactly as
+    /// the for-loop path (step 2) already does for the loop variable's SEQUENCE.
+    ///
+    /// Gated to those shapes on purpose: an external SCALAR (`URL`) that `receiverTypeInfo` can also
+    /// name gives no chain to type and is left unstored, keeping the change's surface minimal. The
+    /// string is stored VERBATIM and later resolved in the symbol's OWN declaring scope; a leaf whose
+    /// type is a nested name written in a scope where the local cannot see it stays a residual
+    /// (fail-closed, under-obfuscation) — the same limit every synthesized tuple string already carries.
+    private func storableCompositeType(of expr: ExprSyntax, in scope: Scope) -> String? {
+        guard let info = resolver.receiverTypeInfo(of: expr, in: scope) else { return nil }
+        let name = info.name
+        if CollectionMemberRegistry.collectionKind(of: name) != nil { return name }
+        if TupleTypeName.labeledComponents(of: name) != nil { return name }
+        return nil
     }
 }
