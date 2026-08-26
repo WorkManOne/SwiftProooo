@@ -696,51 +696,102 @@ private final class ResolutionVisitor: SyntaxVisitor {
         // leaf: a path that does not line up with the subject's components leaves that leaf untyped.
         if let leaves = Self.tuplePatternLeaves(of: pattern),
            let info = typeResolver.receiverTypeInfo(of: subject, in: currentScope) {
-            let expanded = typeResolver.expandedTypeName(info.name, in: info.declScope)
-            for leaf in leaves {
-                guard let component = TupleTypeName.component(at: leaf.path, of: expanded.name) else { continue }
-                let resolved = typeResolver.typeSymbol(forQualifiedName: component, in: expanded.scope)
-                let bound = resolved.map { ($0.name, $0.scope ?? expanded.scope) } ?? (component, expanded.scope)
-                shadowBindingTypeFrames.bind(leaf.name, visibleIn: extent, (name: bound.0, scope: bound.1))
-            }
+            recordTupleLeafTypes(leaves, tupleTypeName: info.name, in: info.declScope, visibleIn: extent)
             return
         }
         // LOCAL enum: the case's associated types are recorded and resolve in the enum's own scope.
-        if let enumSym = typeResolver.typeSymbol(of: subject, in: currentScope),
-           enumSym.kind == .enum,
-           let enumScope = innerScope(of: enumSym),
-           let (caseName, bindings) = Self.enumPatternBindings(of: pattern),
-           let caseSym = enumScope.members(named: caseName).first(where: { $0.kind == .enumCase }),
-           let types = table.enumCaseAssociatedTypes[caseSym.id],
-           types.count == bindings.count {
-            let caseScope = caseSym.scope ?? currentScope
-            for (binding, type) in zip(bindings, types) {
-                guard let binding, let type else { continue }
-                // The associated type may BE the enum's generic parameter (`case filled(Wrapped)` on a
-                // `Boxed<Payload>` subject) — substitute the concrete argument the subject carries
-                // (B-FIX-63), the payload twin of the value/return substitution and the general form of
-                // the Result-only B-FIX-57. Falls through for a concrete associated type, so a
-                // non-generic enum resolves exactly as before.
-                if let sub = typeResolver.substitutedGenericMemberType(type, receiver: subject,
-                                                                       in: currentScope) {
-                    let resolved = typeResolver.typeSymbol(forQualifiedName: sub.name, in: sub.scope)
-                    let bound = resolved.map { ($0.name, $0.scope ?? sub.scope) } ?? (sub.name, sub.scope)
-                    shadowBindingTypeFrames.bind(binding, visibleIn: extent, (name: bound.0, scope: bound.1))
-                    continue
-                }
-                // The associated type is WRITTEN in the enum's own scope, so that is where it resolves.
-                // Storing the pair keeps that fact with the name instead of qualifying the string and
-                // hoping the qualified form resolves from wherever it is read (B-FIX-35).
-                let resolved = typeResolver.typeSymbol(forQualifiedName: type, in: caseScope)
-                let info = resolved.map { ($0.name, $0.scope ?? caseScope) } ?? (type, caseScope)
-                shadowBindingTypeFrames.bind(binding, visibleIn: extent,
-                                             (name: info.0, scope: info.1))
-            }
+        if let enumSym = typeResolver.typeSymbol(of: subject, in: currentScope), enumSym.kind == .enum,
+           recordEnumPayloadTypes(pattern: pattern, enumSym: enumSym, substitutionReceiver: subject,
+                                  visibleIn: extent) {
             return
         }
         // Stdlib `Result<Success, Failure>` (B-FIX-57): not in our table and its payloads are generic,
         // so the local path above cannot type `.success(let x)`. Result's shape is fixed, so model it.
         recordResultPayloadBindingTypes(pattern: pattern, matching: subject, visibleIn: extent)
+    }
+
+    /// Bind each tuple-pattern leaf to the component of `tupleTypeName` at its path (B-FIX-79),
+    /// resolved in `scope`. Shared by the condition/switch recorder above and the for-case recorder
+    /// (B-FIX-81). `expandedTypeName` unwraps a `typealias`; a leaf whose component the path cannot
+    /// reach is left untyped (fail-closed).
+    private func recordTupleLeafTypes(_ leaves: [(name: String, path: [(index: Int, arity: Int)])],
+                                      tupleTypeName name: String, in scope: Scope,
+                                      visibleIn extent: ConditionBindingExtent.Visibility?) {
+        let expanded = typeResolver.expandedTypeName(name, in: scope)
+        for leaf in leaves {
+            guard let component = TupleTypeName.component(at: leaf.path, of: expanded.name) else { continue }
+            let resolved = typeResolver.typeSymbol(forQualifiedName: component, in: expanded.scope)
+            let bound = resolved.map { ($0.name, $0.scope ?? expanded.scope) } ?? (component, expanded.scope)
+            shadowBindingTypeFrames.bind(leaf.name, visibleIn: extent, (name: bound.0, scope: bound.1))
+        }
+    }
+
+    /// Record the payload bindings of an enum-case pattern (`case .run(let m)`) from `enumSym`'s case
+    /// associated types. Returns true when it recorded (the caller then stops), false when the pattern
+    /// is not a matching case of this enum (the caller falls through to Result). Shared by the
+    /// condition/switch recorder (which passes the subject expression for B-FIX-63 generic
+    /// substitution) and the for-case recorder (which has no subject expression and passes nil, so a
+    /// generic enum payload stays fail-closed there).
+    private func recordEnumPayloadTypes(pattern: PatternSyntax, enumSym: Symbol,
+                                        substitutionReceiver: ExprSyntax?,
+                                        visibleIn extent: ConditionBindingExtent.Visibility?) -> Bool {
+        guard let enumScope = innerScope(of: enumSym),
+              let (caseName, bindings) = Self.enumPatternBindings(of: pattern),
+              let caseSym = enumScope.members(named: caseName).first(where: { $0.kind == .enumCase }),
+              let types = table.enumCaseAssociatedTypes[caseSym.id],
+              types.count == bindings.count else { return false }
+        let caseScope = caseSym.scope ?? currentScope
+        for (binding, type) in zip(bindings, types) {
+            guard let binding, let type else { continue }
+            // The associated type may BE the enum's generic parameter (`case filled(Wrapped)` on a
+            // `Boxed<Payload>` subject) — substitute the concrete argument the subject carries
+            // (B-FIX-63). Only when a subject expression is available; a for-case element has none.
+            if let receiver = substitutionReceiver,
+               let sub = typeResolver.substitutedGenericMemberType(type, receiver: receiver, in: currentScope) {
+                let resolved = typeResolver.typeSymbol(forQualifiedName: sub.name, in: sub.scope)
+                let bound = resolved.map { ($0.name, $0.scope ?? sub.scope) } ?? (sub.name, sub.scope)
+                shadowBindingTypeFrames.bind(binding, visibleIn: extent, (name: bound.0, scope: bound.1))
+                continue
+            }
+            // The associated type is WRITTEN in the enum's own scope, so that is where it resolves.
+            // Storing the pair keeps that fact with the name instead of qualifying the string (B-FIX-35).
+            let resolved = typeResolver.typeSymbol(forQualifiedName: type, in: caseScope)
+            let info = resolved.map { ($0.name, $0.scope ?? caseScope) } ?? (type, caseScope)
+            shadowBindingTypeFrames.bind(binding, visibleIn: extent, (name: info.0, scope: info.1))
+        }
+        return true
+    }
+
+    /// Type the bindings of a `for case <pattern> in <seq>` (B-FIX-81). The pattern is matched against
+    /// each ELEMENT of the sequence, so the "subject" is the sequence's iteration element — a tuple
+    /// pattern (`for case (_, let cell) in pairs`) destructures the element's tuple, an enum-case
+    /// pattern (`for case .loaded(let row) in states`) takes the case's payload. The bindings live in
+    /// the loop scope, so they are recorded with a nil extent (the frame is popped with the ForStmt
+    /// scope, exactly like a `switch` case). Fail-closed: a non-case loop, an untypeable sequence, or a
+    /// pattern that is neither a tuple nor a matching enum case records nothing. Called from
+    /// `visit(ForStmtSyntax)` AFTER the loop scope's frame is pushed, so the bindings land in it.
+    private func recordForCasePatternBindingTypes(_ node: ForStmtSyntax) {
+        guard node.caseKeyword != nil, let element = forCaseElementType(of: node.sequence) else { return }
+        if let leaves = Self.tuplePatternLeaves(of: node.pattern) {
+            recordTupleLeafTypes(leaves, tupleTypeName: element.name, in: element.scope, visibleIn: nil)
+            return
+        }
+        if let enumSym = typeResolver.typeSymbol(forQualifiedName: element.name, in: element.scope),
+           enumSym.kind == .enum {
+            _ = recordEnumPayloadTypes(pattern: node.pattern, enumSym: enumSym,
+                                       substitutionReceiver: nil, visibleIn: nil)
+        }
+    }
+
+    /// The iteration ELEMENT type of a for-in/for-case sequence as a (name, scope) pair:
+    /// `CollectionMemberRegistry.iterationElement` over the sequence's written type (`receiverTypeInfo`
+    /// + `expandedTypeName` unwrapping a `typealias`), so `[LoadState]` → `LoadState` and
+    /// `[(Int, Cell)]` → `(Int, Cell)`. Fail-closed on an untypeable sequence.
+    private func forCaseElementType(of sequence: ExprSyntax) -> (name: String, scope: Scope)? {
+        guard let info = typeResolver.receiverTypeInfo(of: sequence, in: currentScope) else { return nil }
+        let expanded = typeResolver.expandedTypeName(info.name, in: info.declScope)
+        guard let element = CollectionMemberRegistry.iterationElement(of: expanded.name) else { return nil }
+        return (element, expanded.scope)
     }
 
     /// `switch r { case .success(let x): … }` where `r : Result<Success, Failure>` (stdlib, commonly
@@ -979,7 +1030,13 @@ private final class ResolutionVisitor: SyntaxVisitor {
     override func visitPost(_ node: CatchClauseSyntax) { exitInnerScope(of: node) }
     // The loop VARIABLE's scope — the statement, not the body, since it is declared before the brace
     // and is also in scope in the `where` clause (B-FIX-44).
-    override func visit(_ node: ForStmtSyntax) -> SyntaxVisitorContinueKind { enterInnerScope(of: node); return .visitChildren }
+    override func visit(_ node: ForStmtSyntax) -> SyntaxVisitorContinueKind {
+        enterInnerScope(of: node)
+        // Type a `for case <pattern> in <seq>`'s bindings from the sequence's element (B-FIX-81) —
+        // after the scope's frame is pushed, so they land in it.
+        recordForCasePatternBindingTypes(node)
+        return .visitChildren
+    }
     override func visitPost(_ node: ForStmtSyntax) { exitInnerScope(of: node) }
 
     // MARK: - Function calls (handles memberwise-init argument labels)
@@ -2646,9 +2703,9 @@ private final class ResolutionVisitor: SyntaxVisitor {
             }
             // Switch case pattern: contextual type is the switch subject's type. Also covers the
             // `if/guard/while case .x = e` (MatchingPatternCondition) and `for case .x in seq`
-            // forms — context = the matched value's type. If we cannot resolve it, return nil —
-            // never fall through to outer contexts (the enclosing var/return type is NOT the same
-            // as the matched subject's type).
+            // (ForStmt, peeled one element level) forms — context = the matched value's type. If we
+            // cannot resolve it, return nil — never fall through to outer contexts (the enclosing
+            // var/return type is NOT the same as the matched subject's type).
             if node.is(SwitchCaseItemSyntax.self) || node.is(ExpressionPatternSyntax.self) {
                 var probe = node.parent
                 while let p = probe {
@@ -2657,6 +2714,17 @@ private final class ResolutionVisitor: SyntaxVisitor {
                     }
                     if let mc = p.as(MatchingPatternConditionSyntax.self) {
                         return resolveExpressionContext(mc.initializer.value, peels: peels)
+                    }
+                    // `for case .loaded(let row) in states` (B-FIX-81) — the pattern is matched against
+                    // each ELEMENT of the sequence, so the shorthand's context is the sequence's element
+                    // type. `forCaseElementType` gets it via `receiverTypeInfo` (NOT `typeSymbol`, which
+                    // answers nil for a collection value, B-FIX-28, so `resolveExpressionContext` cannot).
+                    // Without this the case name stays original while the case declaration renames →
+                    // `type 'T' has no member 'loaded'`.
+                    if let forStmt = p.as(ForStmtSyntax.self), forStmt.caseKeyword != nil {
+                        guard let element = forCaseElementType(of: forStmt.sequence),
+                              let name = Self.peeled(element.name, through: peels) else { return nil }
+                        return ContextualType(name: name, scope: element.scope)
                     }
                     probe = p.parent
                 }

@@ -8981,4 +8981,60 @@ final class PatternTests: XCTestCase {
         XCTAssertFalse(r.contains("alphaTag"), "single-identifier cast pattern must still resolve:\n\(r)")
     }
 
+    // MARK: - B-FIX-81: for-case pattern bindings (payload/component types + case-name shorthand)
+
+    /// `for case (_, let cell) in pairs` where `pairs: [(Int, Cell)]` — the pattern destructures the
+    /// sequence's ELEMENT tuple, so `cell` takes component 1 and its member resolves.
+    func testForCaseTuple_componentMemberResolves() throws {
+        let r = try runPipeline("""
+        struct Cell { func cellTag() -> String { return "c" } }
+        final class Handler {
+            func run(_ pairs: [(Int, Cell)]) {
+                for case (_, let cell) in pairs {
+                    _ = cell.cellTag()
+                }
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("cellTag"),
+                       "member through a for-case tuple component must rename:\n\(r)")
+    }
+
+    /// `for case .loaded(let row) in states` — BOTH the payload type (`row.member()`) and the case-name
+    /// shorthand (`.loaded`) must rewrite; a surviving `.loaded` is `type 'T' has no member 'loaded'`.
+    func testForCaseEnum_payloadAndCaseNameResolve() throws {
+        let r = try runPipeline("""
+        struct Row { func rowTag() -> String { return "r" } }
+        enum LoadState { case loaded(Row) }
+        final class Handler {
+            func run(_ states: [LoadState]) {
+                for case .loaded(let row) in states {
+                    _ = row.rowTag()
+                }
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("rowTag"),
+                       "for-case enum payload member must rename:\n\(r)")
+        XCTAssertFalse(r.contains("loaded"),
+                       "for-case enum case name (decl + shorthand) must rename:\n\(r)")
+    }
+
+    /// Guard-rail: a plain `for x in seq` (no `case`) is unaffected — its element typing goes through
+    /// the existing TypeInferencePass path, not the for-case recorder.
+    func testForCasePlainForIn_stillResolves() throws {
+        let r = try runPipeline("""
+        struct Row { func rowTag() -> String { return "r" } }
+        final class Handler {
+            func run(_ rows: [Row]) {
+                for row in rows {
+                    _ = row.rowTag()
+                }
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("rowTag"),
+                       "a plain for-in loop variable member must still resolve:\n\(r)")
+    }
+
 }
