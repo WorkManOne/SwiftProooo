@@ -289,17 +289,44 @@ private final class DeclVisitor: SyntaxVisitor {
     private func registerAccessorValueBinding(bodyOf block: CodeBlockSyntax) {
         guard let accessor = block.parent?.as(AccessorDeclSyntax.self), accessor.body == block else { return }
         let type = Self.accessorValueType(of: accessor)
+        // When the owning property's type is INFERRED (no written annotation, so `type == nil`), link
+        // the binding to the owner property; TypeInferencePass transfers the resolved type once the
+        // initializer is typed (B3). A written accessor type is carried directly and needs no link.
+        let ownerId = type == nil ? ownerPropertyId(of: accessor) : nil
         if let explicit = accessor.parameters?.name {
             registerLocalBinding(explicit, type: type)
-            return
+        } else {
+            let implicit: String
+            switch accessor.accessorSpecifier.text {
+            case "set", "willSet", "init": implicit = "newValue"
+            case "didSet": implicit = "oldValue"
+            default: return                  // get / _read / _modify introduce no value parameter
+            }
+            registerLocalBinding(name: implicit, at: accessor.accessorSpecifier, type: type)
         }
-        let implicit: String
-        switch accessor.accessorSpecifier.text {
-        case "set", "willSet", "init": implicit = "newValue"
-        case "didSet": implicit = "oldValue"
-        default: return                  // get / _read / _modify introduce no value parameter
+        if let ownerId, let bindingSym = currentScope.symbols.last {
+            table.accessorBindingOwner[bindingSym.id] = ownerId
         }
-        registerLocalBinding(name: implicit, at: accessor.accessorSpecifier, type: type)
+    }
+
+    /// The id of the property symbol whose accessor this is — matched by the property identifier's
+    /// offset in an enclosing scope (the property was registered by `visit(VariableDeclSyntax)` before
+    /// the accessor body was descended into). Used only to transfer an INFERRED property type to the
+    /// accessor's value binding (B3); a subscript accessor always has a written return type, so it
+    /// never reaches here.
+    private func ownerPropertyId(of accessor: AccessorDeclSyntax) -> Int? {
+        guard let owner = accessor.parent?.parent?.as(AccessorBlockSyntax.self)?.parent,
+              let binding = owner.as(PatternBindingSyntax.self),
+              let ident = binding.pattern.as(IdentifierPatternSyntax.self) else { return nil }
+        let offset = ident.identifier.positionAfterSkippingLeadingTrivia.utf8Offset
+        var scope: Scope? = currentScope
+        while let s = scope {
+            if let sym = s.symbols.first(where: { $0.kind == .property && $0.declOffset == offset }) {
+                return sym.id
+            }
+            scope = s.parent
+        }
+        return nil
     }
 
     /// The accessor value's type: the WRITTEN annotation of the property it accesses (`var row: Row
@@ -483,10 +510,39 @@ private final class DeclVisitor: SyntaxVisitor {
         } else if let tuple = pattern.as(TuplePatternSyntax.self) {
             for el in tuple.elements { registerBindingSubpattern(el.pattern, visibleIn: visibleIn) }
         } else if let expr = pattern.as(ExpressionPatternSyntax.self) {
-            registerBindingRefs(in: expr.expression, visibleIn: visibleIn)
+            // `let x as Foo` (checked-cast PATTERN) — bind `x` with the cast target as its type, so a
+            // member read through it (`x.member()`) resolves to Foo's member (B1). All three matching
+            // positions (switch case, catch, if/guard/while-case) parse it identically:
+            // ExpressionPattern → SequenceExpr[ PatternExpr(x), UnresolvedAsExpr, TypeExpr(Foo) ].
+            if let asBinding = Self.asPatternBinding(expr.expression) {
+                registerLocalBinding(asBinding.token, type: asBinding.type, visibleIn: visibleIn)
+            } else {
+                registerBindingRefs(in: expr.expression, visibleIn: visibleIn)
+            }
         } else if let vb = pattern.as(ValueBindingPatternSyntax.self) {
             registerBindingSubpattern(vb.pattern, visibleIn: visibleIn)
         }
+    }
+
+    /// Recognise a checked-cast PATTERN `x as T` (`case let x as T`, `catch let e as T`,
+    /// `if case let y as T = …`) — the pattern-position sibling of `TypeResolver.castTargetTypeName`.
+    /// It raw-parses (no operator folding) as a `SequenceExpr` of EXACTLY
+    /// `[ PatternExpr(IdentifierPattern), UnresolvedAsExpr, TypeExpr ]`; anything else (a tuple
+    /// binding `let (a, b) as T`, a longer sequence) fails closed and falls back to the generic
+    /// binding-ref collector, which still registers the names, just untyped. Pattern casts are
+    /// always plain `as` (never `as?`/`as!`), so the target is the binding's non-optional type;
+    /// `registerLocalBinding` stores it via `WrittenTypeName.of`, resolved later in the binding's
+    /// own declaring scope (B-FIX-23), exactly like any written annotation.
+    private static func asPatternBinding(_ expr: ExprSyntax) -> (token: TokenSyntax, type: TypeSyntax)? {
+        guard let seq = expr.as(SequenceExprSyntax.self) else { return nil }
+        let elements = Array(seq.elements)
+        guard elements.count == 3,
+              let patExpr = elements[0].as(PatternExprSyntax.self),
+              let ident = patExpr.pattern.as(IdentifierPatternSyntax.self),
+              elements[1].is(UnresolvedAsExprSyntax.self),
+              let typeExpr = elements[2].as(TypeExprSyntax.self)
+        else { return nil }
+        return (ident.identifier, typeExpr.type)
     }
 
     /// Under a `let`/`var`, `case let .foo(a, b)` binds `a`/`b`. Depending on the exact source
@@ -784,23 +840,41 @@ private final class DeclVisitor: SyntaxVisitor {
     /// pattern used to get. A `_` binds nothing but still OCCUPIES a position, so it is counted:
     /// `for (_, row) in rows.enumerated()` must take component 1, not component 0.
     private func registerForInTuplePattern(_ tuple: TuplePatternSyntax, sequence: ExprSyntax) {
-        let elements = Array(tuple.elements)
-        func isFlat(_ p: PatternSyntax) -> Bool {
-            p.is(IdentifierPatternSyntax.self) || p.is(WildcardPatternSyntax.self)
-        }
-        guard elements.count > 1, elements.allSatisfy({ isFlat($0.pattern) }) else {
+        // A single-element parenthesised pattern (`for (x) in …`) is just `x` — not a destructuring.
+        guard tuple.elements.count > 1 else {
             registerDeclarationPattern(PatternSyntax(tuple))
             return
         }
+        registerTuplePatternLeaves(tuple, sequence: sequence, prefix: [])
+    }
+
+    /// Register each IDENTIFIER leaf of a (possibly NESTED) for-in tuple pattern with the PATH of
+    /// `(index, arity)` steps from the element down to it, so TypeInferencePass can walk the element's
+    /// tuple type to the leaf's component. A flat pattern (`for (offset, row) in …`) yields a
+    /// length-1 path (B-FIX-38); a nested one (`for (offset, (idx, cell)) in …`) descends (B5). A
+    /// non-identifier leaf (`_`, or a shape we don't model) is registered without a path — it binds
+    /// nothing renameable or falls back to the plain declaration path, exactly as before.
+    private func registerTuplePatternLeaves(_ tuple: TuplePatternSyntax, sequence: ExprSyntax,
+                                            prefix: [(index: Int, arity: Int)]) {
+        let elements = Array(tuple.elements)
+        let arity = elements.count
         for (index, element) in elements.enumerated() {
-            guard let ident = element.pattern.as(IdentifierPatternSyntax.self) else { continue }
-            registerLocalBinding(ident.identifier)
-            // `registerLocalBinding` skips `_`/`self`; only a symbol it actually created can be typed.
-            guard let sym = currentScope.symbols.last,
-                  sym.declOffset == ident.identifier.positionAfterSkippingLeadingTrivia.utf8Offset
-            else { continue }
-            table.forLoopSequence[sym.id] = sequence
-            table.forLoopTuplePosition[sym.id] = (index: index, arity: elements.count)
+            let path = prefix + [(index: index, arity: arity)]
+            if let nested = element.pattern.as(TuplePatternSyntax.self) {
+                registerTuplePatternLeaves(nested, sequence: sequence, prefix: path)
+            } else if let ident = element.pattern.as(IdentifierPatternSyntax.self) {
+                registerLocalBinding(ident.identifier)
+                // `registerLocalBinding` skips `_`/`self`; only a symbol it actually created can be typed.
+                guard let sym = currentScope.symbols.last,
+                      sym.declOffset == ident.identifier.positionAfterSkippingLeadingTrivia.utf8Offset
+                else { continue }
+                table.forLoopSequence[sym.id] = sequence
+                table.forLoopTuplePosition[sym.id] = path
+            } else {
+                // Wildcard `_` occupies a position but binds nothing; any other shape falls back to
+                // the plain declaration path (registers its names, untyped).
+                registerDeclarationPattern(element.pattern)
+            }
         }
     }
 

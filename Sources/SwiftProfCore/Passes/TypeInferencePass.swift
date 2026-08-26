@@ -41,11 +41,11 @@ public final class TypeInferencePass {
         // 2. For-loop variable inference: element type of the sequence.
         for sym in table.symbols where table.declaredType[sym.id] == nil {
             guard let seq = table.forLoopSequence[sym.id], let scope = sym.scope else { continue }
-            if let position = table.forLoopTuplePosition[sym.id] {
-                if let componentName = inferTupleComponentType(of: seq, position: position, in: scope) {
+            if let path = table.forLoopTuplePosition[sym.id] {
+                if let componentName = inferTupleComponentType(of: seq, path: path, in: scope) {
                     table.declaredType[sym.id] = componentName
                     inferred += 1
-                    logger.log("[infer-loop-tuple] \(sym.name)#\(sym.id)[\(position.index)] → \(componentName)",
+                    logger.log("[infer-loop-tuple] \(sym.name)#\(sym.id)\(path.map { $0.index }) → \(componentName)",
                                verbose: true)
                 }
                 continue
@@ -57,6 +57,18 @@ public final class TypeInferencePass {
             } else {
                 let leaf = leafDeclaredType(of: seq, in: scope)?.name ?? "<nil>"
                 logger.log("[infer-loop-fail] \(sym.name)#\(sym.id) — leaf=\(leaf)", verbose: true)
+            }
+        }
+        // 3. Accessor value binding (`newValue`/`oldValue`) whose owning property has an INFERRED
+        //    type: transfer the owner's now-resolved declaredType to the binding (B3). Runs after
+        //    step 1 has typed the owner from its initializer. A binding with a written accessor type
+        //    never appears in `accessorBindingOwner`, so this only fills the inferred case.
+        for (bindingId, ownerId) in table.accessorBindingOwner where table.declaredType[bindingId] == nil {
+            if let ownerType = table.declaredType[ownerId] {
+                table.declaredType[bindingId] = ownerType
+                inferred += 1
+                logger.log("[infer-accessor] binding#\(bindingId) → \(ownerType) (from owner#\(ownerId))",
+                           verbose: true)
             }
         }
         if inferred > 0 {
@@ -90,21 +102,27 @@ public final class TypeInferencePass {
     /// Fail-closed on everything it cannot read as a tuple of exactly the pattern's arity — a
     /// destructuring we mis-count would type the binding as the WRONG component, which is a wrong
     /// rename RollbackPass cannot catch. Refusing costs a rename instead.
-    private func inferTupleComponentType(of expr: ExprSyntax, position: (index: Int, arity: Int),
+    private func inferTupleComponentType(of expr: ExprSyntax, path: [(index: Int, arity: Int)],
                                          in scope: Scope) -> String? {
         guard let leaf = leafDeclaredType(of: expr, in: scope),
               // The ITERATION element — dictionary-aware, unlike `extractElement`: `for (k, v) in
               // dict` destructures `(key: K, value: V)` while `dict[k]` still yields `V`.
-              let element = CollectionMemberRegistry.iterationElement(of: leaf.name),
-              let components = TupleTypeName.components(of: element),
-              components.count == position.arity, position.index < components.count else { return nil }
-        let component = components[position.index]
+              var current = CollectionMemberRegistry.iterationElement(of: leaf.name) else { return nil }
+        // Walk the tuple type along the pattern's path, descending one nesting level per step
+        // (`for (offset, (idx, cell)) in …` — B5). Fail-closed at every step: a component count that
+        // does not match the pattern's arity there, or an index out of range, would type the binding
+        // as the WRONG component (a wrong rename RollbackPass cannot catch), so refuse instead.
+        for step in path {
+            guard let components = TupleTypeName.components(of: current),
+                  components.count == step.arity, step.index < components.count else { return nil }
+            current = components[step.index]
+        }
         // Qualified in the scope the element name was WRITTEN in, exactly as the element path below —
         // a bare nested name is invisible from the loop body (B-FIX-23).
-        if let sym = resolver.typeSymbol(forQualifiedName: component, in: leaf.scope) {
+        if let sym = resolver.typeSymbol(forQualifiedName: current, in: leaf.scope) {
             return Self.qualifiedName(of: sym)
         }
-        return component
+        return current
     }
 
     private func inferElementType(of expr: ExprSyntax, in scope: Scope) -> String? {
@@ -113,7 +131,11 @@ public final class TypeInferencePass {
         // store IdentifierTypeSyntax base names). Instead, peek at the declared type STRING
         // for the leaf reference and parse it for `[T]` / `Array<T>` / `Set<T>` syntax.
         guard let leaf = leafDeclaredType(of: expr, in: scope),
-              let element = extractElement(from: leaf.name) else { return nil }
+              // The ITERATION element, dictionary-aware: `for pair in dict` binds the whole
+              // `(key: K, value: V)` tuple (a member access `pair.value` then picks the component,
+              // B2), while `dict[k]` still yields `V` (that path stays on `extractElement`). For an
+              // array/set/`enumerated()` result this is identical to `extractElement`.
+              let element = CollectionMemberRegistry.iterationElement(of: leaf.name) else { return nil }
         // The element name is written in the scope of the SEQUENCE's declaration, so a nested type
         // spelled unqualified (`[Section]` on `Container`) is invisible from the loop body. Resolve
         // it there and store the QUALIFIED name, exactly as the initializer-driven inference does —
@@ -136,9 +158,5 @@ public final class TypeInferencePass {
     private func leafDeclaredType(of expr: ExprSyntax, in scope: Scope) -> (name: String, scope: Scope)? {
         guard let info = resolver.receiverTypeInfo(of: expr, in: scope) else { return nil }
         return (info.name, info.declScope)
-    }
-
-    private func extractElement(from typeName: String) -> String? {
-        TypeResolver.extractElement(from: typeName)
     }
 }

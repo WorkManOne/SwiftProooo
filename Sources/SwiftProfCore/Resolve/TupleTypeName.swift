@@ -21,6 +21,15 @@ enum TupleTypeName {
     /// A single parenthesized type (`(Row)`) is deliberately NOT a tuple: Swift treats it as `Row`
     /// itself, and reporting one component would let a 1-name pattern "destructure" a plain type.
     static func components(of typeName: String) -> [String]? {
+        labeledComponents(of: typeName)?.map { $0.type }
+    }
+
+    /// Component (label, type) pairs of a written tuple type, or nil when `typeName` is not a tuple
+    /// of more than one component. Same parse as `components`, but KEEPS the labels so a member
+    /// access on a tuple-typed value (`pair.element`, `pair.offset`) can pick the component by name
+    /// (B2). A component with no label yields `nil` for that slot — a positional access (`pair.0`)
+    /// then indexes by position.
+    static func labeledComponents(of typeName: String) -> [(label: String?, type: String)]? {
         var name = typeName.trimmingCharacters(in: .whitespaces)
         while name.hasSuffix("?") || name.hasSuffix("!") {
             name = String(name.dropLast()).trimmingCharacters(in: .whitespaces)
@@ -31,27 +40,29 @@ enum TupleTypeName {
         guard isBalanced(inner) else { return nil }
         let parts = splitTopLevel(inner)
         guard parts.count > 1 else { return nil }
-        var out: [String] = []
+        var out: [(label: String?, type: String)] = []
         for part in parts {
-            let component = strippingLabel(part).trimmingCharacters(in: .whitespaces)
+            let (label, rawType) = splitLabel(part)
+            let component = rawType.trimmingCharacters(in: .whitespaces)
             guard !component.isEmpty else { return nil }
-            out.append(component)
+            out.append((label, component))
         }
         return out
     }
 
-    /// `offset: Int` → `Int`; `Int` → `Int`. Only a TOP-LEVEL colon is a label separator, so a
-    /// dictionary component (`[String: Row]`) keeps its colon.
-    private static func strippingLabel(_ part: String) -> String {
+    /// `offset: Int` → `(label: "offset", type: "Int")`; `Int` → `(nil, "Int")`. Only a TOP-LEVEL
+    /// colon is a label separator, so a dictionary component (`[String: Row]`) keeps its colon and
+    /// yields no label.
+    private static func splitLabel(_ part: String) -> (label: String?, type: String) {
         let trimmed = part.trimmingCharacters(in: .whitespaces)
-        guard let idx = TypeResolver.topLevelIndex(of: ":", in: trimmed) else { return trimmed }
+        guard let idx = TypeResolver.topLevelIndex(of: ":", in: trimmed) else { return (nil, trimmed) }
         // A label is a plain identifier; anything else (`inout`, an operator) means this is not a
         // `label: Type` pair and must be left alone.
         let label = trimmed[..<idx].trimmingCharacters(in: .whitespaces)
         guard !label.isEmpty, label.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "_" }) else {
-            return trimmed
+            return (nil, trimmed)
         }
-        return String(trimmed[trimmed.index(after: idx)...])
+        return (String(label), String(trimmed[trimmed.index(after: idx)...]))
     }
 
     /// Split on commas at bracket/angle/paren depth 0, so a nested generic or tuple component

@@ -758,8 +758,13 @@ private final class ResolutionVisitor: SyntaxVisitor {
     private static func enumPatternBindings(of pattern: PatternSyntax) -> (String, [String?])? {
         var inner = pattern
         if let valueBinding = inner.as(ValueBindingPatternSyntax.self) { inner = valueBinding.pattern }
-        guard let exprPattern = inner.as(ExpressionPatternSyntax.self),
-              let call = exprPattern.expression.as(FunctionCallExprSyntax.self),
+        guard let exprPattern = inner.as(ExpressionPatternSyntax.self) else { return nil }
+        // `case .calm(let x)? = optSubject` (B4) — an OPTIONAL PATTERN wraps the case call in an
+        // `OptionalChainingExpr` carrying the trailing `?`. Peel it to reach the enum-case call; the
+        // enum itself is the subject's WRAPPED type, which `typeSymbol(of:)` already unwraps.
+        var callExpr = exprPattern.expression
+        if let optional = callExpr.as(OptionalChainingExprSyntax.self) { callExpr = optional.expression }
+        guard let call = callExpr.as(FunctionCallExprSyntax.self),
               let callee = call.calledExpression.as(MemberAccessExprSyntax.self),
               callee.base == nil else { return nil }
         let bindings: [String?] = call.arguments.map { argument in

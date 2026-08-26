@@ -246,6 +246,13 @@ public final class TypeResolver {
                 }
                 return nil
             }
+            // The base is a TUPLE value (`pair.element` where `pair : (offset: Int, element: Row)`,
+            // the shape `enumerated()` / dictionary iteration / `zip` hands out) — a tuple names no
+            // declaration, so `typeSymbol(of: base)` returned nil above; pick the labeled or
+            // positional component (B2).
+            if let comp = tupleComponentType(member: memberName, receiver: base, in: scope) {
+                return typeSymbol(forQualifiedName: comp.name, in: comp.scope)
+            }
             // The base resolved to NO declaration — the stdlib-collection case (`items.first?.m`,
             // `dict.values`): a collection type names no declaration since B-FIX-28, so the member's
             // result shape is the only way through the chain (B-FIX-30). Reached only when the base
@@ -254,6 +261,49 @@ public final class TypeResolver {
                 return typeSymbol(forQualifiedName: info.name, in: info.declScope)
             }
             return nil
+        }
+        return nil
+    }
+
+    /// A member access on a TUPLE-typed value — `pair.element` / `pair.offset` (by label) or
+    /// `pair.0` / `pair.1` (by position) — resolved to the component's type name and the scope it
+    /// resolves in. The tuple string is synthesized by `CollectionMemberRegistry` for `enumerated()`,
+    /// dictionary iteration and `zip`, carrying the stdlib's own labels, so a value bound to one of
+    /// those (a for-in variable, a closure parameter) finally types its component access (B2).
+    ///
+    /// Fail-closed: a non-tuple base (`TupleTypeName.labeledComponents` returns nil), a label that no
+    /// component carries, or an out-of-range `.N` index yields nil, and the member stays untyped.
+    /// The component type resolves in the base value's declaring scope; a component whose type is a
+    /// nested name written in a DIFFERENT scope stays a residual (fail-closed), like every synthesized
+    /// type string that cannot carry a per-leaf scope.
+    /// `zip(a, b)` yields a sequence whose element is the UNLABELED tuple `(a.Element, b.Element)`
+    /// (B6). Reported as `[(A, B)]` so the shared tuple machinery (iteration element, destructuring,
+    /// `pair.0` member access) can pick a component. Fail-closed: not a bare 2-argument `zip`, or an
+    /// argument whose element type cannot be recovered, yields nil. Both element types resolve in the
+    /// FIRST argument's declaring scope (a component whose type is nested in the OTHER argument's
+    /// scope stays a residual, like every synthesized tuple string).
+    private func zipResultType(of call: FunctionCallExprSyntax, in scope: Scope)
+        -> (name: String, declScope: Scope)? {
+        guard let callee = call.calledExpression.as(DeclReferenceExprSyntax.self),
+              Self.stripBackticks(callee.baseName.text) == "zip",
+              call.arguments.count == 2 else { return nil }
+        let args = Array(call.arguments)
+        guard let a = receiverTypeInfo(of: args[0].expression, in: scope),
+              let ea = CollectionMemberRegistry.sequenceElement(of: a.name),
+              let b = receiverTypeInfo(of: args[1].expression, in: scope),
+              let eb = CollectionMemberRegistry.sequenceElement(of: b.name) else { return nil }
+        return ("[(\(ea), \(eb))]", a.declScope)
+    }
+
+    func tupleComponentType(member: String, receiver base: ExprSyntax, in scope: Scope)
+        -> (name: String, scope: Scope)? {
+        guard let recv = receiverTypeInfo(of: base, in: scope),
+              let comps = TupleTypeName.labeledComponents(of: recv.name) else { return nil }
+        if let match = comps.first(where: { $0.label == member }) {
+            return (match.type, recv.declScope)
+        }
+        if let idx = Int(member), idx >= 0, idx < comps.count {
+            return (comps[idx].type, recv.declScope)
         }
         return nil
     }
@@ -1206,6 +1256,10 @@ public final class TypeResolver {
                 }
                 return (t, memberSym.scope ?? scope)
             }
+            // A member access on a TUPLE-typed base (`pair.element`) — pick the component (B2).
+            if let comp = tupleComponentType(member: memberName, receiver: base, in: scope) {
+                return (comp.name, comp.scope)
+            }
             // Stdlib collection member (`items.first`, `dict.values`) — the receiver names no
             // declaration, so the general path above cannot answer it (B-FIX-30).
             return collectionMemberResult(member: memberName, receiver: base, in: scope)
@@ -1226,6 +1280,12 @@ public final class TypeResolver {
             // closure parameter instead of leaving it untyped (the desync class).
             if let mapped = transformingMapResult(of: call, in: scope) {
                 return mapped
+            }
+            // `zip(a, b)` — a stdlib free function whose element is the UNLABELED tuple
+            // `(a.Element, b.Element)` (B6). Modelled as `[(A, B)]` so the iteration / closure /
+            // member-access tuple machinery (B2) picks a component positionally (`pair.0`).
+            if let zipped = zipResultType(of: call, in: scope) {
+                return zipped
             }
             if let callee = calleeCallable(for: call, in: scope),
                let ret = table.functionReturnType[callee.id] {

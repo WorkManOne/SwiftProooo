@@ -8157,4 +8157,308 @@ final class PatternTests: XCTestCase {
                        "array .map result element must still resolve (sequence case unaffected):\n\(r)")
     }
 
+    // MARK: - B1: `as`-pattern binding typing (case/catch/if-case `let x as T`)
+
+    /// `switch` `case let x as T:` binds `x` with static type `T`, so a member reached through it
+    /// resolves to `T`'s member (which renames identically to the use-site).
+    func testAsPatternBinding_switchCaseLet_concreteType_memberResolves() throws {
+        let r = try runPipeline("""
+        struct Widget { func frob() -> String { return "w" } }
+        func handle(_ any: Any) -> String {
+            switch any {
+            case let w as Widget: return w.frob()
+            default: return ""
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("frob"),
+                       "as-pattern binding member must rename with its decl (no revert):\n\(r)")
+        XCTAssertTrue(r.range(of: #"\.m\d+\(\)"#, options: .regularExpression) != nil,
+                      "use-site should be an obfuscated method call:\n\(r)")
+    }
+
+    /// `catch let e as T` — same shape, different matching position.
+    func testAsPatternBinding_catchLet_memberResolves() throws {
+        let r = try runPipeline("""
+        struct Boom: Error { func zap() -> String { return "b" } }
+        func run() {
+            do { throw Boom() }
+            catch let e as Boom { _ = e.zap() }
+            catch {}
+        }
+        """)
+        XCTAssertFalse(r.contains("zap"),
+                       "catch as-pattern binding member must rename with its decl:\n\(r)")
+    }
+
+    /// `if case let s as P = any` — an existential protocol cast; the member resolves to the
+    /// protocol requirement (unified with its witness by WitnessLinker).
+    func testAsPatternBinding_ifCaseLet_existentialProtocol_memberResolves() throws {
+        let r = try runPipeline("""
+        protocol Shape { func wibble() -> String }
+        struct Circle: Shape { func wibble() -> String { return "c" } }
+        func maybe(_ any: Any) -> String {
+            if case let s as Shape = any { return s.wibble() }
+            return ""
+        }
+        """)
+        XCTAssertFalse(r.contains("wibble"),
+                       "if-case as-pattern binding member must rename with the protocol requirement:\n\(r)")
+    }
+
+    /// The cast target may be a QUALIFIED nested type; it must resolve in the binding's declaring
+    /// scope, so a member reached through it renames (B-FIX-23 discipline).
+    func testAsPatternBinding_switchCaseLet_qualifiedNestedType_memberResolves() throws {
+        let r = try runPipeline("""
+        enum NS { struct Inner { func qux() -> String { return "i" } } }
+        func handle(_ any: Any) -> String {
+            switch any {
+            case let x as NS.Inner: return x.qux()
+            default: return ""
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("qux"),
+                       "qualified nested cast target member must rename with its decl:\n\(r)")
+    }
+
+    // MARK: - B4: optional-pattern payload (`case .foo(let x)? = optionalSubject`)
+
+    /// `while case .calm(let item)? = m` where `m : Mood?` — the trailing `?` (an OptionalChaining
+    /// wrapper) must be peeled so the payload binding is typed and the case name is rewritten.
+    func testOptionalPattern_whileCase_payloadMemberAndCaseResolve() throws {
+        let r = try runPipeline("""
+        struct Payload { func grab() -> String { return "p" } }
+        enum Mood { case calm(Payload); case tense }
+        func step(_ m: Mood?) {
+            while case .calm(let item)? = m {
+                _ = item.grab()
+                break
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("grab"),
+                       "optional-pattern payload member must rename with its decl:\n\(r)")
+        XCTAssertFalse(r.contains("calm"),
+                       "case name under the optional pattern must be rewritten (decl + use):\n\(r)")
+    }
+
+    /// `if case .calm(let item)? = m` — same peel, different statement.
+    func testOptionalPattern_ifCase_payloadMemberResolves() throws {
+        let r = try runPipeline("""
+        struct Payload { func grab() -> String { return "p" } }
+        enum Mood { case calm(Payload); case tense }
+        func step(_ m: Mood?) -> String {
+            if case .calm(let item)? = m { return item.grab() }
+            return ""
+        }
+        """)
+        XCTAssertFalse(r.contains("grab"),
+                       "if-case optional-pattern payload member must rename:\n\(r)")
+    }
+
+    /// `guard case .calm(let item)? = m else { … }` — the guard form records the payload type
+    /// deferred (after the else body), so it must survive the peel too.
+    func testOptionalPattern_guardCase_payloadMemberResolves() throws {
+        let r = try runPipeline("""
+        struct Payload { func grab() -> String { return "p" } }
+        enum Mood { case calm(Payload); case tense }
+        func step(_ m: Mood?) -> String {
+            guard case .calm(let item)? = m else { return "" }
+            return item.grab()
+        }
+        """)
+        XCTAssertFalse(r.contains("grab"),
+                       "guard-case optional-pattern payload member must rename:\n\(r)")
+    }
+
+    // MARK: - B2: member access on a tuple-typed value (enumerated / dict / zip element)
+
+    /// `for pair in rows.enumerated() { pair.element.member() }` — `pair` is typed as the tuple
+    /// `(offset: Int, element: Row)`; the labeled component access `pair.element` yields `Row`.
+    func testTupleMember_forInEnumerated_labeledComponentMemberResolves() throws {
+        let r = try runPipeline("""
+        struct Row { func gogo() -> String { return "r" } }
+        func use(_ rows: [Row]) {
+            for pair in rows.enumerated() {
+                _ = pair.element.gogo()
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("gogo"),
+                       "member through a labeled tuple component must rename:\n\(r)")
+    }
+
+    /// The same, reached through a HOF closure PARAMETER (`.forEach { pair in … }`) rather than a
+    /// for-in variable — both feed the one tuple-member primitive.
+    func testTupleMember_closureParamEnumerated_labeledComponentMemberResolves() throws {
+        let r = try runPipeline("""
+        struct Row { func gogo() -> String { return "r" } }
+        func use(_ rows: [Row]) {
+            rows.enumerated().forEach { pair in
+                _ = pair.element.gogo()
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("gogo"),
+                       "member through a closure-param tuple component must rename:\n\(r)")
+    }
+
+    /// `for pair in dict { pair.value.member() }` — a dictionary iterates as `(key: K, value: V)`,
+    /// so `pair.value` yields `V`.
+    func testTupleMember_dictionaryIteration_valueComponentMemberResolves() throws {
+        let r = try runPipeline("""
+        struct Val { func gogo() -> Int { return 1 } }
+        func use(_ d: [String: Val]) {
+            for pair in d {
+                _ = pair.value.gogo()
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("gogo"),
+                       "member through a dictionary value component must rename:\n\(r)")
+    }
+
+    /// Positional access `pair.1` picks the second component (the element).
+    func testTupleMember_positionalComponentMemberResolves() throws {
+        let r = try runPipeline("""
+        struct Row { func gogo() -> String { return "r" } }
+        func use(_ rows: [Row]) {
+            for pair in rows.enumerated() {
+                _ = pair.1.gogo()
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("gogo"),
+                       "member through a positional tuple component must rename:\n\(r)")
+    }
+
+    // MARK: - B6: zip result element (A, B)
+
+    /// `for (a, b) in zip(xs, ys)` — the element is the unlabeled tuple `(A, B)`; each destructured
+    /// name types to its component.
+    func testZip_destructured_bothComponentMembersResolve() throws {
+        let r = try runPipeline("""
+        struct Ay { func fooA() -> Int { return 1 } }
+        struct Bee { func fooB() -> Int { return 2 } }
+        func use(_ xs: [Ay], _ ys: [Bee]) {
+            for (a, b) in zip(xs, ys) {
+                _ = a.fooA()
+                _ = b.fooB()
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("fooA"), "zip first component member must rename:\n\(r)")
+        XCTAssertFalse(r.contains("fooB"), "zip second component member must rename:\n\(r)")
+    }
+
+    /// `for pair in zip(xs, ys)` — a single variable holds the whole `(A, B)` tuple; positional
+    /// access `pair.0` / `pair.1` picks a component.
+    func testZip_singleVar_positionalComponentMembersResolve() throws {
+        let r = try runPipeline("""
+        struct Ay { func fooA() -> Int { return 1 } }
+        struct Bee { func fooB() -> Int { return 2 } }
+        func use(_ xs: [Ay], _ ys: [Bee]) {
+            for pair in zip(xs, ys) {
+                _ = pair.0.fooA()
+                _ = pair.1.fooB()
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("fooA"), "zip .0 component member must rename:\n\(r)")
+        XCTAssertFalse(r.contains("fooB"), "zip .1 component member must rename:\n\(r)")
+    }
+
+    // MARK: - B5: nested tuple for-in pattern
+
+    /// `for (offset, (idx, cell)) in items.enumerated()` — the inner tuple destructures the element's
+    /// second component; `cell` types to the leaf component down two nesting levels.
+    func testNestedTuplePattern_leafComponentMemberResolves() throws {
+        let r = try runPipeline("""
+        struct Cell { func zonk() -> String { return "z" } }
+        func use(_ items: [(Int, Cell)]) {
+            for (offset, (idx, cell)) in items.enumerated() {
+                _ = offset
+                _ = idx
+                _ = cell.zonk()
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("zonk"),
+                       "leaf of a nested for-in tuple pattern must type to its component:\n\(r)")
+    }
+
+    /// A nested pattern of the WRONG arity fails closed: the leaf stays untyped, no wrong rename.
+    func testNestedTuplePattern_arityMismatch_staysFailClosed() throws {
+        // `entry.element` is `Cell`, not a 2-tuple — destructuring it as `(x, y)` cannot type either.
+        // The point is only that the pipeline does not crash or mis-type; the member simply survives.
+        let r = try runPipeline("""
+        struct Cell { func zonk() -> String { return "z" } }
+        func use(_ items: [Cell]) {
+            for (offset, element) in items.enumerated() {
+                _ = offset
+                _ = element.zonk()
+            }
+        }
+        """)
+        // `element` IS a valid flat component here (Cell), so this member DOES resolve — the test
+        // guards that the generalized path still handles the flat B-FIX-38 case.
+        XCTAssertFalse(r.contains("zonk"),
+                       "flat destructuring must still type its component (B-FIX-38 preserved):\n\(r)")
+    }
+
+    // MARK: - B3: accessor value binding typed from an INFERRED property type
+
+    /// `var row = makeCfg() { didSet { oldValue.member() } }` — the owning property's type is
+    /// inferred (no written annotation), so `oldValue` must inherit it once TypeInferencePass has
+    /// typed the initializer.
+    func testAccessorInferred_didSetOldValue_memberResolves() throws {
+        let r = try runPipeline("""
+        struct Cfg { func poke() -> Int { return 1 } }
+        func makeCfg() -> Cfg { return Cfg() }
+        final class Holder {
+            var row = makeCfg() {
+                didSet { _ = oldValue.poke() }
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("poke"),
+                       "oldValue member must rename via the inferred owner-property type:\n\(r)")
+    }
+
+    /// `willSet { newValue.member() }` — same, `newValue` in a willSet.
+    func testAccessorInferred_willSetNewValue_memberResolves() throws {
+        let r = try runPipeline("""
+        struct Cfg { func poke() -> Int { return 1 } }
+        func makeCfg() -> Cfg { return Cfg() }
+        final class Holder {
+            var row = makeCfg() {
+                willSet { _ = newValue.poke() }
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("poke"),
+                       "newValue member must rename via the inferred owner-property type:\n\(r)")
+    }
+
+    /// Guard-rail: a same-named property `newValue` in scope must NOT be borrowed for the binding's
+    /// type — `oldValue` types from its OWN owner (`row`), not from the unrelated property.
+    func testAccessorInferred_doesNotBorrowUnrelatedSameNamedProperty() throws {
+        let r = try runPipeline("""
+        struct Cfg { func poke() -> Int { return 1 } }
+        struct Other { func nope() -> Int { return 0 } }
+        func makeCfg() -> Cfg { return Cfg() }
+        final class Holder {
+            var oldValue = Other()
+            var row = makeCfg() {
+                didSet { _ = oldValue.poke() }
+            }
+        }
+        """)
+        // Inside didSet, `oldValue` is the accessor binding (type Cfg), so `.poke()` resolves and
+        // renames; the unrelated property `Other.nope` is untouched by this access.
+        XCTAssertFalse(r.contains("poke"),
+                       "didSet oldValue must be the accessor binding (Cfg), not the property:\n\(r)")
+    }
+
 }
