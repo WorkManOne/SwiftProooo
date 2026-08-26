@@ -1821,6 +1821,51 @@ public final class TypeResolver {
         return nil
     }
 
+    /// The INPUT type names of a function-type string (`(A, B) -> R` → ["A", "B"], `() -> R` → [],
+    /// `(Choice) -> Void` → ["Choice"]), or nil when `typeName` is not a function type. Splits before
+    /// the first top-level `->` (the same scan `functionTypeReturnName` runs), strips the outer parens,
+    /// and splits the tuple by top-level commas. Function types carry no argument labels, so no label
+    /// stripping is needed. Used to type a shorthand argument to a call whose callee is a subscript of
+    /// function-typed elements (`sinks[0](.case)`, B-FIX-84 — the input twin of B-FIX-83).
+    static func functionTypeInputNames(of typeName: String) -> [String]? {
+        let chars = Array(typeName)
+        var depth = 0
+        var i = 0
+        while i < chars.count {
+            let c = chars[i]
+            if c == "(" || c == "[" || c == "<" { depth += 1 }
+            else if c == ")" || c == "]" { depth -= 1 }
+            else if c == ">" {
+                if depth == 0 && i > 0 && chars[i - 1] == "-" {
+                    let inputPart = String(chars[0..<(i - 1)]).trimmingCharacters(in: .whitespaces)
+                    guard inputPart.hasPrefix("("), inputPart.hasSuffix(")") else { return nil }
+                    let inner = String(inputPart.dropFirst().dropLast()).trimmingCharacters(in: .whitespaces)
+                    if inner.isEmpty { return [] }
+                    return splitTopLevelCommas(inner).map { $0.trimmingCharacters(in: .whitespaces) }
+                }
+                depth -= 1
+            }
+            i += 1
+        }
+        return nil
+    }
+
+    /// Split a string on commas at bracket/angle/paren depth 0 (a nested generic or tuple keeps its
+    /// inner commas). Shared by the function-type input parser.
+    private static func splitTopLevelCommas(_ s: String) -> [String] {
+        var parts: [String] = []
+        var depth = 0
+        var current = ""
+        for c in s {
+            if c == "(" || c == "[" || c == "<" { depth += 1 }
+            else if c == ")" || c == "]" || c == ">" { depth = max(0, depth - 1) }
+            if c == "," && depth == 0 { parts.append(current); current = "" }
+            else { current.append(c) }
+        }
+        parts.append(current)
+        return parts
+    }
+
     public static func extractElement(from typeName: String) -> String? {
         var name = typeName
         while name.hasSuffix("?") || name.hasSuffix("!") {

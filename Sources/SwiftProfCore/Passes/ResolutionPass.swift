@@ -2932,6 +2932,18 @@ private final class ResolutionVisitor: SyntaxVisitor {
             }
             return nil
         }
+        // `sinks[0](.alpha)` — the callee is a SUBSCRIPT whose element is a function type; the input at
+        // `argIndex` types the shorthand (B-FIX-84, the input twin of the return in B-FIX-83). The
+        // subscript resolves to no value Symbol, so `closureValueInputType` (keyed by Symbol) cannot see
+        // it. Peel a trailing `?` on the callee (`sinks["k"]?(.alpha)`, a dictionary of closures).
+        var subCalleeExpr = call.calledExpression
+        if let opt = subCalleeExpr.as(OptionalChainingExprSyntax.self) { subCalleeExpr = opt.expression }
+        if let subCallee = subCalleeExpr.as(SubscriptCallExprSyntax.self),
+           let elem = typeResolver.subscriptResultTypeName(of: subCallee, in: currentScope),
+           let inputs = TypeResolver.functionTypeInputNames(of: elem.name),
+           argIndex < inputs.count, !inputs[argIndex].isEmpty {
+            return ContextualType(name: stripBackticks(inputs[argIndex]), scope: elem.declScope)
+        }
         return nil
     }
 

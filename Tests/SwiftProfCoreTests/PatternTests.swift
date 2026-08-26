@@ -9140,4 +9140,53 @@ final class PatternTests: XCTestCase {
                        "a subscript of plain values must still resolve its member:\n\(r)")
     }
 
+    // MARK: - B-FIX-84: shorthand argument through a subscript-of-closures callee (`sinks[0](.case)`)
+
+    /// `sinks[0](.alpha)` where `sinks: [(Choice) -> Void]` — the shorthand's context is the subscript
+    /// element function's INPUT (`Choice`). Before this the shorthand had no context, so the case name
+    /// stayed original while the case decl renamed, reverting the whole case group.
+    func testSubscriptShorthandArg_arrayOfSinks_caseResolves() throws {
+        let r = try runPipeline("""
+        enum Choice { case alpha, beta }
+        final class Handler {
+            func run(_ sinks: [(Choice) -> Void]) {
+                sinks[0](.alpha)
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("alpha"),
+                       "shorthand arg to a subscript-of-closures callee must rename:\n\(r)")
+    }
+
+    /// The optional dictionary form `sinks["k"]?(.beta)` — the trailing `?` on the callee is peeled.
+    func testSubscriptShorthandArg_dictOfSinks_optionalCall_caseResolves() throws {
+        let r = try runPipeline("""
+        enum Choice { case alpha, beta }
+        final class Handler {
+            func run(_ sinks: [String: (Choice) -> Void]) {
+                sinks["k"]?(.beta)
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("beta"),
+                       "shorthand arg to an optional dict-of-closures callee must rename:\n\(r)")
+    }
+
+    /// Guard-rail: a payload-carrying enum case constructed through a subscript-of-constructors is NOT
+    /// this shape — `builders[0](.alpha)` where the element is `(Choice) -> Cmd` still types the arg
+    /// from the element's input. Confirms multi-arg-position parsing (`(Choice, Int) -> Void`) picks
+    /// the right index.
+    func testSubscriptShorthandArg_multiInput_picksCorrectPosition() throws {
+        let r = try runPipeline("""
+        enum Choice { case alpha, beta }
+        final class Handler {
+            func run(_ sinks: [(Int, Choice) -> Void]) {
+                sinks[0](0, .beta)
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("beta"),
+                       "shorthand at position 1 of a subscript-closure callee must rename:\n\(r)")
+    }
+
 }
