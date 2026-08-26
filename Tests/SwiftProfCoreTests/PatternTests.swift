@@ -9037,4 +9037,58 @@ final class PatternTests: XCTestCase {
                        "a plain for-in loop variable member must still resolve:\n\(r)")
     }
 
+    // MARK: - B-FIX-82: subscript result typed as a collection (binding / local chains)
+
+    /// `if let xs = groups["k"]` where `groups: [String: [Row]]` — the subscript yields the dictionary
+    /// VALUE `[Row]` (a collection), so the binding types as `[Row]` and `xs.first?.member` resolves.
+    /// Before this `receiverTypeInfo` had no subscript branch and `typeSymbol` answered nil for the
+    /// collection result, so the binding stayed untyped.
+    func testSubscriptBinding_dictArrayValue_chainedMemberResolves() throws {
+        let r = try runPipeline("""
+        struct Row { func rowTag() -> String { return "r" } }
+        final class Handler {
+            func run(_ groups: [String: [Row]]) {
+                if let xs = groups["k"] {
+                    _ = xs.first?.rowTag()
+                }
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("rowTag"),
+                       "member through a dict-array-value subscript binding must rename:\n\(r)")
+    }
+
+    /// `let row = grid[0]` where `grid: [[Row]]` — a nested-array subscript yields `[Row]`, so
+    /// `row.first?.member` resolves through the stored collection type.
+    func testSubscriptLocal_nestedArray_chainedMemberResolves() throws {
+        let r = try runPipeline("""
+        struct Row { func rowTag() -> String { return "r" } }
+        final class Handler {
+            func run(_ grid: [[Row]]) {
+                let row = grid[0]
+                _ = row.first?.rowTag()
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("rowTag"),
+                       "member through a nested-array subscript local must rename:\n\(r)")
+    }
+
+    /// Guard-rail: a SCALAR dictionary value (`[String: Row]`, `dict["k"]` → `Row`) still resolves via
+    /// the Symbol path (`typeSymbol` → `subscriptResultType`), unchanged by the collection branch.
+    func testSubscriptBinding_scalarDictValue_stillResolves() throws {
+        let r = try runPipeline("""
+        struct Row { func rowTag() -> String { return "r" } }
+        final class Handler {
+            func run(_ dict: [String: Row]) {
+                if let v = dict["k"] {
+                    _ = v.rowTag()
+                }
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("rowTag"),
+                       "a scalar dict-value subscript binding must still resolve:\n\(r)")
+    }
+
 }

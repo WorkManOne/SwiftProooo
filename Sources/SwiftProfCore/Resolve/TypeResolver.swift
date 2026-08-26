@@ -1359,6 +1359,12 @@ public final class TypeResolver {
                 return (ret, callee.scope ?? scope)
             }
         }
+        // `base[args]` — the subscript's result as a STRING (brackets intact), so a COLLECTION result
+        // (`groups["k"]` → `[Row]`) is kept for the chaseable-composite path (`typeSymbol(of:)` handles
+        // the non-collection case, but answers nil for a collection, B-FIX-28/82).
+        if let sub = expr.as(SubscriptCallExprSyntax.self) {
+            return subscriptResultTypeName(of: sub, in: scope)
+        }
         return nil
     }
 
@@ -1517,6 +1523,27 @@ public final class TypeResolver {
         if let baseSym = typeSymbol(forQualifiedName: raw, in: declScope),
            let ret = subscriptReturnType(ofType: baseSym, forCall: sub) {
             return typeSymbol(forQualifiedName: ret, in: canonicalInnerScope(of: baseSym) ?? declScope)
+        }
+        return nil
+    }
+
+    /// The STRING form of `subscriptResultType` (brackets preserved): `base[args]` → its Element /
+    /// Optional-Wrapped, a Dictionary's Value, or a LOCAL type's declared subscript return, each with
+    /// the scope that string must resolve in. Unlike `subscriptResultType` (which resolves to a Symbol
+    /// and so answers nil for a COLLECTION result — `[Row]` names no declaration, B-FIX-28), this keeps
+    /// the collection string, so a binding initialized by a subscript whose result is a collection
+    /// (`if let xs = groups["k"]`, `groups: [String: [Row]]` → `[Row]`) is typed as that collection and
+    /// a chain through it (`xs.first?.m`) resolves (B-FIX-82). Read only by `receiverTypeInfo`'s
+    /// subscript branch; the Symbol form stays the answer where a declaration is required.
+    func subscriptResultTypeName(of sub: SubscriptCallExprSyntax, in scope: Scope)
+        -> (name: String, declScope: Scope)? {
+        guard let info = receiverTypeInfo(of: sub.calledExpression, in: scope) else { return nil }
+        let raw = info.name, declScope = info.declScope
+        if let elem = Self.extractElement(from: raw) { return (elem, declScope) }
+        if let value = Self.dictionaryValueType(from: raw) { return (value, declScope) }
+        if let baseSym = typeSymbol(forQualifiedName: raw, in: declScope),
+           let ret = subscriptReturnType(ofType: baseSym, forCall: sub) {
+            return (ret, canonicalInnerScope(of: baseSym) ?? declScope)
         }
         return nil
     }
