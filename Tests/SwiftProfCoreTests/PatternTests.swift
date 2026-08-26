@@ -9091,4 +9091,53 @@ final class PatternTests: XCTestCase {
                        "a scalar dict-value subscript binding must still resolve:\n\(r)")
     }
 
+    // MARK: - B-FIX-83: call through a subscript of function-typed elements (`handlers[0]()`)
+
+    /// `makers[0]().rowTag()` where `makers: [() -> Row]` — the subscript element is `() -> Row`, so the
+    /// call's result is `Row` and the member resolves. Before this the subscript callee resolved to no
+    /// value Symbol, so the function-typed-value return path (keyed by Symbol) could not see it.
+    func testSubscriptCallee_arrayOfMakers_resultMemberResolves() throws {
+        let r = try runPipeline("""
+        struct Row { func rowTag() -> String { return "r" } }
+        final class Handler {
+            func run(_ makers: [() -> Row]) {
+                _ = makers[0]().rowTag()
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("rowTag"),
+                       "member on the result of a subscript-of-closures call must rename:\n\(r)")
+    }
+
+    /// `makers["k"]?().rowTag()` where `makers: [String: () -> Row]` — the dictionary subscript yields
+    /// the optional element `(() -> Row)?`, the `?()` calls it; the trailing `?` on the callee is peeled.
+    func testSubscriptCallee_dictOfMakers_optionalCall_resultMemberResolves() throws {
+        let r = try runPipeline("""
+        struct Row { func rowTag() -> String { return "r" } }
+        final class Handler {
+            func run(_ makers: [String: () -> Row]) {
+                _ = makers["k"]?().rowTag()
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("rowTag"),
+                       "member on the result of an optional dict-closure call must rename:\n\(r)")
+    }
+
+    /// Guard-rail: a subscript whose element is NOT a function type (`[Row]`, `makers[0]` is `Row`)
+    /// stays a plain value — calling `.member()` on it resolves via the element Symbol, not the
+    /// function-return path. Here `makers[0].rowTag()` must still rename.
+    func testSubscriptCallee_arrayOfValues_notMistakenForClosure() throws {
+        let r = try runPipeline("""
+        struct Row { func rowTag() -> String { return "r" } }
+        final class Handler {
+            func run(_ rows: [Row]) {
+                _ = rows[0].rowTag()
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("rowTag"),
+                       "a subscript of plain values must still resolve its member:\n\(r)")
+    }
+
 }

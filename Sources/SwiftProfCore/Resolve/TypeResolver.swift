@@ -1327,6 +1327,19 @@ public final class TypeResolver {
             if let ret = functionTypedValueReturn(of: call, in: scope) {
                 return ret
             }
+            // `handlers[0]()` — the callee is a SUBSCRIPT whose element is a function type; the call's
+            // result is that function type's RETURN (B-FIX-83). The subscript resolves to no value
+            // Symbol, so `functionTypedValueReturn` (keyed by Symbol) cannot see it. `subscriptResultTypeName`
+            // gives the element string (`() -> Row`, kept by B-FIX-82), then its return is parsed. Peel a
+            // trailing `?` on the callee (`makers["k"]?()`, a dictionary of closures), whose subscript
+            // yields the optional element.
+            var subCalleeExpr = call.calledExpression
+            if let opt = subCalleeExpr.as(OptionalChainingExprSyntax.self) { subCalleeExpr = opt.expression }
+            if let subCallee = subCalleeExpr.as(SubscriptCallExprSyntax.self),
+               let elem = subscriptResultTypeName(of: subCallee, in: scope),
+               let ret = Self.functionTypeReturnName(of: elem.name) {
+                return (Self.stripBackticks(ret), elem.declScope)
+            }
             if let m = call.calledExpression.as(MemberAccessExprSyntax.self), let base = m.base,
                let result = collectionMemberResult(member: Self.stripBackticks(m.declName.baseName.text),
                                                    receiver: base, in: scope) {
@@ -1782,6 +1795,32 @@ public final class TypeResolver {
     /// Returns nil for unrecognised forms — Dictionaries above all, whose Element is a tuple while
     /// their SUBSCRIPT yields the Value (`CollectionMemberRegistry.iterationElement` is the one that
     /// answers the iteration question).
+    /// The RETURN type of a function-type string (`(A, B) -> R` → "R", `() -> Row` → "Row"), or nil
+    /// when `typeName` is not a function type. Splits at the FIRST top-level `->` — function types are
+    /// right-associative, so `A -> B -> C` is `A -> (B -> C)` and ONE call yields `B -> C`. A `>` at
+    /// depth 0 preceded by `-` is the arrow (a generic close `Foo<Bar>` sits at depth > 0 and its `>`
+    /// is not preceded by `-`). Fail-closed on a non-function type or an empty return. Used to type a
+    /// call whose callee is a subscript of function-typed elements (`handlers[0]()`, B-FIX-83).
+    static func functionTypeReturnName(of typeName: String) -> String? {
+        let chars = Array(typeName)
+        var depth = 0
+        var i = 0
+        while i < chars.count {
+            let c = chars[i]
+            if c == "(" || c == "[" || c == "<" { depth += 1 }
+            else if c == ")" || c == "]" { depth -= 1 }
+            else if c == ">" {
+                if depth == 0 && i > 0 && chars[i - 1] == "-" {
+                    let ret = String(chars[(i + 1)...]).trimmingCharacters(in: .whitespaces)
+                    return ret.isEmpty ? nil : ret
+                }
+                depth -= 1
+            }
+            i += 1
+        }
+        return nil
+    }
+
     public static func extractElement(from typeName: String) -> String? {
         var name = typeName
         while name.hasSuffix("?") || name.hasSuffix("!") {
