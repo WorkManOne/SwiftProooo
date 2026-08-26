@@ -52,6 +52,13 @@ public final class SymbolTable {
     /// call's arguments are positional and the argument index maps directly to the input position.
     /// Input names are WRITTEN in the value's declaring scope (carry `Symbol.scope` when reading). B-FIX-66.
     public internal(set) var valueClosureInput: [Int: [String]] = [:]
+    /// For a VALUE of FUNCTION type, the RETURN type name — the twin of `valueClosureInput`. Lets a
+    /// CALL through the value (`produce()`, `completion()`, `it()`) type its result, so a member chain
+    /// or a switch/case subject reached through such a call resolves. A function-typed value is not a
+    /// callable DECLARATION (no `functionReturnType`) and `WrittenTypeName` reduces no function type
+    /// (no `declaredType`), so this is the only carrier. The name is WRITTEN in the value's declaring
+    /// scope (carry `Symbol.scope` when reading).
+    public internal(set) var valueClosureReturn: [Int: String] = [:]
     /// For a `typealias` whose underlying type is a FUNCTION type (`typealias Handler = (En1) -> Void`),
     /// the closure's input type names, keyed by the typealias symbol id. `functionParamClosureInput`
     /// only sees a LITERAL `FunctionTypeSyntax` on the parameter, so a `func f(_ h: Handler)` records

@@ -8461,4 +8461,49 @@ final class PatternTests: XCTestCase {
                        "didSet oldValue must be the accessor binding (Cfg), not the property:\n\(r)")
     }
 
+    // MARK: - B-FIX-73: result type of calling a function-typed value (produce(), make())
+
+    /// `while case .calm(let item)? = produce()` where `produce : () -> Mood?` — calling a
+    /// function-typed value now types its result, so the subject types, the case name is rewritten
+    /// and the payload binding resolves.
+    func testFunctionTypedValueCall_asOptionalPatternSubject_resolves() throws {
+        let r = try runPipeline("""
+        struct Payload { func grab() -> String { return "p" } }
+        enum Mood { case calm(Payload); case tense }
+        func step(_ produce: () -> Mood?) {
+            while case .calm(let item)? = produce() {
+                _ = item.grab()
+                break
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("grab"), "payload member through produce() must rename:\n\(r)")
+        XCTAssertFalse(r.contains("calm"), "case name over a typed subject must be rewritten:\n\(r)")
+    }
+
+    /// `make().member()` — a member chain through a call to a function-typed parameter.
+    func testFunctionTypedValueCall_memberChain_resolves() throws {
+        let r = try runPipeline("""
+        struct Widget { func plonk() -> Int { return 1 } }
+        func use(_ make: () -> Widget) {
+            _ = make().plonk()
+        }
+        """)
+        XCTAssertFalse(r.contains("plonk"),
+                       "member through a function-typed value call must rename:\n\(r)")
+    }
+
+    /// `self.make().member()` — the callee is a function-typed PROPERTY (member-access callee).
+    func testFunctionTypedValueCall_propertyCallee_memberChainResolves() throws {
+        let r = try runPipeline("""
+        struct Widget { func plonk() -> Int { return 1 } }
+        final class Owner {
+            let make: () -> Widget = { Widget() }
+            func use() { _ = self.make().plonk() }
+        }
+        """)
+        XCTAssertFalse(r.contains("plonk"),
+                       "member through a function-typed property call must rename:\n\(r)")
+    }
+
 }

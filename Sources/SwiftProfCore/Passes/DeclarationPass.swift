@@ -655,6 +655,25 @@ private final class DeclVisitor: SyntaxVisitor {
         return fn.parameters.map { WrittenTypeName.of($0.type) ?? "" }
     }
 
+    /// The RETURN type name of a closure/function-type value: `(X) -> R` → "R", `() -> Mood?` →
+    /// "Mood" (`WrittenTypeName.of` unwraps the optional, matching the table-wide convention). The
+    /// return twin of `closureInputTypeNames` — lets a CALL through such a value (`produce()`,
+    /// `completion()`) type its result, which a function-typed value cannot get from
+    /// `functionReturnType` (that is for callable DECLARATIONS) nor `declaredType` (`WrittenTypeName`
+    /// reduces no function type). Same wrapper unwrapping as the input side. Returns nil when the
+    /// type is not a function type or its return type cannot be reduced (a tuple/function return).
+    static func closureReturnTypeName(of type: TypeSyntax) -> String? {
+        var t = type
+        if let attr = t.as(AttributedTypeSyntax.self) { t = attr.baseType }
+        while let opt = t.as(OptionalTypeSyntax.self) { t = opt.wrappedType }
+        if let tup = t.as(TupleTypeSyntax.self), tup.elements.count == 1 {
+            t = tup.elements.first!.type
+        }
+        if let attr = t.as(AttributedTypeSyntax.self) { t = attr.baseType }
+        guard let fn = t.as(FunctionTypeSyntax.self) else { return nil }
+        return WrittenTypeName.of(fn.returnClause.type)
+    }
+
     /// Register generic parameters (`<T: P, U>`) as NON-renameable `.typealias_` placeholders in
     /// `scope`. Target = the constraint's bare type name so member access through the placeholder
     /// (`r: T` → `r.render()`) resolves via the constraint protocol. Recorded in
@@ -730,6 +749,10 @@ private final class DeclVisitor: SyntaxVisitor {
             // input types from `valueClosureInput`, keyed by its OWN id (B-FIX-66). `declaredType` is
             // nil for it (`WrittenTypeName.of` reduces no function type), so this is the only carrier.
             if let closureInput { table.valueClosureInput[sym.id] = closureInput }
+            // Its RETURN type — so a CALL through it (`produce()`) types its result (gap follow-on).
+            if let closureReturn = Self.closureReturnTypeName(of: param.type) {
+                table.valueClosureReturn[sym.id] = closureReturn
+            }
         }
         table.functionParamTypes[funcId] = paramTypes
         table.functionParamLabels[funcId] = paramLabels
@@ -766,6 +789,11 @@ private final class DeclVisitor: SyntaxVisitor {
                 if let annotation = binding.typeAnnotation,
                    let closureInput = Self.closureInputTypeNames(of: annotation.type) {
                     table.valueClosureInput[sym.id] = closureInput
+                }
+                // Its RETURN type — so a call through the value (`make()`) types its result.
+                if let annotation = binding.typeAnnotation,
+                   let closureReturn = Self.closureReturnTypeName(of: annotation.type) {
+                    table.valueClosureReturn[sym.id] = closureReturn
                 }
                 if let annotation = binding.typeAnnotation,
                    let typeName = WrittenTypeName.of(annotation.type) {

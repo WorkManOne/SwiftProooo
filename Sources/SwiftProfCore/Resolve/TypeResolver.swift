@@ -276,6 +276,31 @@ public final class TypeResolver {
     /// The component type resolves in the base value's declaring scope; a component whose type is a
     /// nested name written in a DIFFERENT scope stays a residual (fail-closed), like every synthesized
     /// type string that cannot carry a per-leaf scope.
+    /// The result type of calling a VALUE of function type — `produce()` / `completion()` / `make()`
+    /// where the callee is a parameter/property/local typed `(…) -> R`. Reads `valueClosureReturn`
+    /// (the return twin of B-FIX-66's input table), resolved in the value's declaring scope. Covers a
+    /// bare DeclRef callee (`produce()`) and a member-access callee whose member is a function-typed
+    /// property (`self.onChange()`). Fail-closed: the callee does not resolve to a value with a
+    /// recorded return, or the return cannot be recovered, → nil.
+    private func functionTypedValueReturn(of call: FunctionCallExprSyntax, in scope: Scope)
+        -> (name: String, declScope: Scope)? {
+        if let ref = call.calledExpression.as(DeclReferenceExprSyntax.self) {
+            let offset = ref.baseName.positionAfterSkippingLeadingTrivia.utf8Offset
+            if let sym = scope.lookup(name: Self.stripBackticks(ref.baseName.text), at: offset),
+               let ret = table.valueClosureReturn[sym.id] {
+                return (ret, sym.scope ?? scope)
+            }
+        }
+        if let m = call.calledExpression.as(MemberAccessExprSyntax.self), let base = m.base,
+           let baseSym = typeSymbol(of: base, in: scope),
+           let baseScope = canonicalInnerScope(of: baseSym),
+           let memberSym = baseScope.member(named: Self.stripBackticks(m.declName.baseName.text)),
+           let ret = table.valueClosureReturn[memberSym.id] {
+            return (ret, memberSym.scope ?? scope)
+        }
+        return nil
+    }
+
     /// `zip(a, b)` yields a sequence whose element is the UNLABELED tuple `(a.Element, b.Element)`
     /// (B6). Reported as `[(A, B)]` so the shared tuple machinery (iteration element, destructuring,
     /// `pair.0` member access) can pick a component. Fail-closed: not a bare 2-argument `zip`, or an
@@ -1268,6 +1293,14 @@ public final class TypeResolver {
         // one of OUR callables, whose declared return type names the receiver of the next step
         // (`makeItems()[0].m`, `makeItems().map { $0.m }`).
         if let call = expr.as(FunctionCallExprSyntax.self) {
+            // `produce()` where `produce` is a VALUE of function type — the call's type is that
+            // function type's RETURN (`valueClosureReturn`, the return twin of B-FIX-66). A
+            // function-typed value is not a callable declaration, so `calleeCallable` below never
+            // finds it. Must precede the collection/map/zip checks: those expect a member/DeclRef
+            // callee naming a collection or `zip`, which a function-typed value is not.
+            if let ret = functionTypedValueReturn(of: call, in: scope) {
+                return ret
+            }
             if let m = call.calledExpression.as(MemberAccessExprSyntax.self), let base = m.base,
                let result = collectionMemberResult(member: Self.stripBackticks(m.declName.baseName.text),
                                                    receiver: base, in: scope) {
