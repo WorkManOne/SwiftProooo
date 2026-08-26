@@ -2968,6 +2968,12 @@ private final class ResolutionVisitor: SyntaxVisitor {
            !inputs[argIndex].isEmpty {
             return ContextualType(name: inputs[argIndex], scope: aliasSym.scope)
         }
+        // `let f = makeHandler()` — f's function type comes from the callee's parsed return, so its
+        // input at `argIndex` types a shorthand `f(.case)` (B-FIX-85, the input twin of the return
+        // handled in `functionTypedValueReturn`).
+        if let input = typeResolver.closureInputOfInitializerCall(of: sym, at: argIndex, in: currentScope) {
+            return ContextualType(name: input.name, scope: input.scope)
+        }
         return nil
     }
 

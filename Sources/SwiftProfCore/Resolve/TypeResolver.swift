@@ -286,9 +286,16 @@ public final class TypeResolver {
         -> (name: String, declScope: Scope)? {
         if let ref = call.calledExpression.as(DeclReferenceExprSyntax.self) {
             let offset = ref.baseName.positionAfterSkippingLeadingTrivia.utf8Offset
-            if let sym = scope.lookup(name: Self.stripBackticks(ref.baseName.text), at: offset),
-               let ret = table.valueClosureReturn[sym.id] {
-                return (ret, sym.scope ?? scope)
+            if let sym = scope.lookup(name: Self.stripBackticks(ref.baseName.text), at: offset) {
+                if let ret = table.valueClosureReturn[sym.id] {
+                    return (ret, sym.scope ?? scope)
+                }
+                // `let f = makeHandler()` — f has no WRITTEN function type, but its INITIALIZER is a
+                // call to a callable returning a function type; the call's result is that function's
+                // return (B-FIX-85). Read the callee's parsed return.
+                if let ret = closureReturnOfInitializerCall(of: sym, in: scope) {
+                    return (ret.name, ret.scope ?? scope)
+                }
             }
         }
         if let m = call.calledExpression.as(MemberAccessExprSyntax.self), let base = m.base,
@@ -299,6 +306,32 @@ public final class TypeResolver {
             return (ret, memberSym.scope ?? scope)
         }
         return nil
+    }
+
+    /// For a local/property `sym` INITIALIZED by a call to a callable that returns a function type
+    /// (`let f = makeHandler()`, `func makeHandler() -> (E) -> R`), the callee's parsed function RETURN
+    /// (B-FIX-85). The callable's function-typed return is not in `functionReturnType` (`WrittenTypeName`
+    /// drops it), so it is read from `callableClosureReturn`. Fail-closed: no call initializer, an
+    /// unresolvable callee, or a callee with no recorded function return → nil.
+    func closureReturnOfInitializerCall(of sym: Symbol, in scope: Scope) -> (name: String, scope: Scope?)? {
+        guard let initExpr = table.initializerExpr[sym.id],
+              let call = initExpr.as(FunctionCallExprSyntax.self),
+              let callee = calleeCallable(for: call, in: sym.scope ?? scope),
+              let ret = table.callableClosureReturn[callee.id] else { return nil }
+        return (ret, callee.scope)
+    }
+
+    /// The INPUT twin of `closureReturnOfInitializerCall`: for `let f = makeHandler()`, the callee's
+    /// parsed function INPUT at `argIndex` (types a shorthand `f(.case)`, B-FIX-85). Fail-closed like
+    /// the return side, plus an out-of-range / empty-input guard.
+    func closureInputOfInitializerCall(of sym: Symbol, at argIndex: Int, in scope: Scope)
+        -> (name: String, scope: Scope?)? {
+        guard let initExpr = table.initializerExpr[sym.id],
+              let call = initExpr.as(FunctionCallExprSyntax.self),
+              let callee = calleeCallable(for: call, in: sym.scope ?? scope),
+              let inputs = table.callableClosureInput[callee.id],
+              argIndex < inputs.count, !inputs[argIndex].isEmpty else { return nil }
+        return (inputs[argIndex], callee.scope)
     }
 
     /// `zip(a, b)` yields a sequence whose element is the UNLABELED tuple `(a.Element, b.Element)`

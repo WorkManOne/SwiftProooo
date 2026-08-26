@@ -9189,4 +9189,58 @@ final class PatternTests: XCTestCase {
                        "shorthand at position 1 of a subscript-closure callee must rename:\n\(r)")
     }
 
+    // MARK: - B-FIX-85: function-typed local inferred from a non-literal (call) initializer
+
+    /// `let f = makeMaker(); f().rowTag()` where `makeMaker() -> () -> Row` — f's function type comes
+    /// from the callee's return, so the call `f()` types as `Row` and the member resolves. The
+    /// callable's function-typed return is not in `functionReturnType` (WrittenTypeName drops it).
+    func testFunctionTypedLocalFromCall_returnMemberResolves() throws {
+        let r = try runPipeline("""
+        struct Row { func rowTag() -> String { return "r" } }
+        final class Handler {
+            func makeMaker() -> () -> Row { return { Row() } }
+            func run() {
+                let f = makeMaker()
+                _ = f().rowTag()
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("rowTag"),
+                       "member on the result of a call to a function-typed-return local must rename:\n\(r)")
+    }
+
+    /// The INPUT twin: `let g = makeSink(); g(.alpha)` where `makeSink() -> (Choice) -> Void` — the
+    /// shorthand's context is the callee's function-return input (`Choice`).
+    func testFunctionTypedLocalFromCall_shorthandInputResolves() throws {
+        let r = try runPipeline("""
+        enum Choice { case alpha, beta }
+        final class Handler {
+            func makeSink() -> (Choice) -> Void { return { _ in } }
+            func run() {
+                let g = makeSink()
+                g(.alpha)
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("alpha"),
+                       "shorthand arg to a function-typed-return local call must rename:\n\(r)")
+    }
+
+    /// Guard-rail: a plain (non-function) return is unaffected — `let x = makeRow(); x.rowTag()` where
+    /// `makeRow() -> Row` still resolves via the normal return-type path, not the closure tables.
+    func testFunctionTypedLocalFromCall_plainReturn_stillResolves() throws {
+        let r = try runPipeline("""
+        struct Row { func rowTag() -> String { return "r" } }
+        final class Handler {
+            func makeRow() -> Row { return Row() }
+            func run() {
+                let x = makeRow()
+                _ = x.rowTag()
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("rowTag"),
+                       "a plain-return local must still resolve its member:\n\(r)")
+    }
+
 }

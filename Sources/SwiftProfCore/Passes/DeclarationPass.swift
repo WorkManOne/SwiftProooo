@@ -657,8 +657,16 @@ private final class DeclVisitor: SyntaxVisitor {
         let kind: SymbolKind = currentScope.kind == .type ? .method : .function
         let sym = makeSymbol(name: node.name.text, kind: kind, identifierToken: node.name)
         if Self.hasModifier(node.modifiers, "override") { table.overrideMemberIds.insert(sym.id) }
-        if let ret = node.signature.returnClause, let t = WrittenTypeName.of(ret.type) {
-            table.functionReturnType[sym.id] = t
+        if let ret = node.signature.returnClause {
+            if let t = WrittenTypeName.of(ret.type) {
+                table.functionReturnType[sym.id] = t
+            } else {
+                // A FUNCTION-typed return (`func makeHandler() -> (E) -> R`) — `WrittenTypeName` drops
+                // it, so its parsed input/return are carried separately for a local initialized by
+                // calling it (`let f = makeHandler()`; `f()` / `f(.case)`, B-FIX-85).
+                if let cret = Self.closureReturnTypeName(of: ret.type) { table.callableClosureReturn[sym.id] = cret }
+                if let cin = Self.closureInputTypeNames(of: ret.type) { table.callableClosureInput[sym.id] = cin }
+            }
         }
         let funcScope = push(.function, owner: sym, node: node)
         registerGenericParameters(node.genericParameterClause, into: funcScope)

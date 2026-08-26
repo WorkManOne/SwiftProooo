@@ -75,6 +75,14 @@ public final class SymbolTable {
     /// through it desynced). This side-table lets `hofClosureParamType` resolve the alias and recover
     /// the inputs. Input names are WRITTEN in the alias's own scope (carry `Symbol.scope` when reading).
     public internal(set) var typealiasClosureInput: [Int: [String]] = [:]
+    /// For a CALLABLE whose RETURN is itself a function type (`func makeHandler() -> (E) -> R`), the
+    /// parsed return / input of that returned function type, keyed by the callable's id. `WrittenTypeName`
+    /// drops a function type, so `functionReturnType` is empty for such a callable — this is the only
+    /// carrier. Consumed only when a local/property is INITIALIZED by calling it (`let f = makeHandler()`),
+    /// to type `f()` (return) and `f(.case)` (input) exactly as a function-typed value is (B-FIX-73/66).
+    /// Names are WRITTEN in the callable's declaring scope (carry `Symbol.scope` when reading). B-FIX-85.
+    public internal(set) var callableClosureReturn: [Int: String] = [:]
+    public internal(set) var callableClosureInput: [Int: [String]] = [:]
     /// Initializer expression for var/let bindings whose type we couldn't infer at declaration
     /// time. TypeInferencePass uses these later, with the full SymbolTable populated.
     public internal(set) var initializerExpr: [Int: ExprSyntax] = [:]
