@@ -1239,6 +1239,21 @@ public final class TypeResolver {
     /// answers nil for every collection (B-FIX-28). Subscript results, HOF element typing, the
     /// for-in element inference and stdlib-collection chains all funnel through it, so a new
     /// expression shape is taught here once rather than at each consumer.
+    /// Is a WRITTEN type-name string a "chaseable composite" — a collection (`[Row]`, `Set<Row>`,
+    /// `[K: V]`), a tuple (`(offset: Int, element: Row)`), or an iterator marker (`$Iterator<E>`)?
+    /// Such a string names no declaration, so `typeSymbol(forQualifiedName:)` returns nil for it, yet
+    /// a chain through it (`x.first?.m`, `pair.element`, `it.next()`) still resolves through the
+    /// collection/tuple/iterator machinery. The single predicate both `TypeInferencePass`
+    /// (initializer-driven local inference, B-FIX-75/76) and `ResolutionPass.bindingType` (optional
+    /// binding, B-FIX-77) gate storage on, so the two stay in agreement about which strings are worth
+    /// persisting.
+    public static func isChaseableComposite(_ name: String) -> Bool {
+        if CollectionMemberRegistry.collectionKind(of: name) != nil { return true }
+        if TupleTypeName.labeledComponents(of: name) != nil { return true }
+        if CollectionMemberRegistry.iteratorElement(of: name) != nil { return true }
+        return false
+    }
+
     public func receiverTypeInfo(of expr: ExprSyntax, in scope: Scope) -> (name: String, declScope: Scope)? {
         // Wrappers that don't change the named type (`items?`, `items!`, `try f()`, `await f()`).
         if let opt = expr.as(OptionalChainingExprSyntax.self) { return receiverTypeInfo(of: opt.expression, in: scope) }

@@ -8703,4 +8703,65 @@ final class PatternTests: XCTestCase {
                        "a user type's own next()/advance() must rename:\n\(r)")
     }
 
+    // MARK: - B-FIX-77: optional binding whose initializer types to a COMPOSITE string
+
+    /// `if let pair = rows.enumerated().first { pair.element.member }` — the initializer types to a
+    /// TUPLE (`(offset: Int, element: Row)?`), which `bindingType`'s Symbol-only path could not name,
+    /// so the binding stayed untyped and `pair.element.member` desynced.
+    func testCompositeBinding_ifLetEnumeratedFirst_tupleComponentResolves() throws {
+        let r = try runPipeline("""
+        struct Row { func title() -> String { return "t" } }
+        func use(_ rows: [Row]) {
+            if let pair = rows.enumerated().first {
+                _ = pair.element.title()
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("title"),
+                       "member through a tuple-typed optional binding must rename:\n\(r)")
+    }
+
+    /// The `guard let` form (deferred recording) over the same composite initializer.
+    func testCompositeBinding_guardLetEnumeratedFirst_tupleComponentResolves() throws {
+        let r = try runPipeline("""
+        struct Row { func title() -> String { return "t" } }
+        func use(_ rows: [Row]) {
+            guard let pair = rows.enumerated().first else { return }
+            _ = pair.element.title()
+        }
+        """)
+        XCTAssertFalse(r.contains("title"),
+                       "member through a guard-let tuple binding must rename:\n\(r)")
+    }
+
+    /// A DICTIONARY iterator `while let pair = it.next()` — the element is the `(key, value)` tuple,
+    /// so `pair.value.member` picks the value component. This is the residual B-FIX-76 left open
+    /// (the array iterator worked there; the tuple-element iterator needed this binding-type step).
+    func testCompositeBinding_dictionaryIteratorWhileLet_valueComponentResolves() throws {
+        let r = try runPipeline("""
+        struct Val { func vv() -> Int { return 1 } }
+        func use(_ dict: [String: Val]) {
+            var it = dict.makeIterator()
+            while let pair = it.next() { _ = pair.value.vv() }
+        }
+        """)
+        XCTAssertFalse(r.contains("vv"),
+                       "member through a dictionary-iterator tuple binding must rename:\n\(r)")
+    }
+
+    /// Non-regression guard-rail: an ELEMENT binding (`if let first = rows.first`) still resolves via
+    /// the Symbol path — the new composite step runs AFTER `typeSymbol` and must not shadow it.
+    func testCompositeBinding_elementBinding_stillResolvesViaSymbolPath() throws {
+        let r = try runPipeline("""
+        struct Row { func title() -> String { return "t" } }
+        func use(_ rows: [Row]) {
+            if let first = rows.first {
+                _ = first.title()
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("title"),
+                       "an element binding must still resolve through the Symbol path:\n\(r)")
+    }
+
 }

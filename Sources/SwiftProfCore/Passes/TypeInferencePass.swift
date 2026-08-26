@@ -172,11 +172,12 @@ public final class TypeInferencePass {
     }
 
     /// The WRITTEN type-name string of an initializer expression, but ONLY when that string is a
-    /// "chaseable composite": a collection (`[Row]`, `Set<Row>`, `[K: V]`) or a tuple
-    /// (`(offset: Int, element: Row)`). Such a string names no declaration, so `typeSymbol(of:)`
-    /// returns nil for it and step 1's Symbol-only inference could not persist it (B-FIX-75). Storing
-    /// it lets a chain through the local — `xs.first?.m`, a for-in over `pairs` — resolve, exactly as
-    /// the for-loop path (step 2) already does for the loop variable's SEQUENCE.
+    /// "chaseable composite" (`TypeResolver.isChaseableComposite` — a collection `[Row]` / `Set<Row>`
+    /// / `[K: V]`, a tuple `(offset: Int, element: Row)`, or an iterator marker `$Iterator<E>`). Such
+    /// a string names no declaration, so `typeSymbol(of:)` returns nil for it and step 1's Symbol-only
+    /// inference could not persist it (B-FIX-75/76). Storing it lets a chain through the local —
+    /// `xs.first?.m`, a for-in over `pairs`, `it.next()` — resolve, exactly as the for-loop path
+    /// (step 2) already does for the loop variable's SEQUENCE.
     ///
     /// Gated to those shapes on purpose: an external SCALAR (`URL`) that `receiverTypeInfo` can also
     /// name gives no chain to type and is left unstored, keeping the change's surface minimal. The
@@ -184,13 +185,8 @@ public final class TypeInferencePass {
     /// type is a nested name written in a scope where the local cannot see it stays a residual
     /// (fail-closed, under-obfuscation) — the same limit every synthesized tuple string already carries.
     private func storableCompositeType(of expr: ExprSyntax, in scope: Scope) -> String? {
-        guard let info = resolver.receiverTypeInfo(of: expr, in: scope) else { return nil }
-        let name = info.name
-        if CollectionMemberRegistry.collectionKind(of: name) != nil { return name }
-        if TupleTypeName.labeledComponents(of: name) != nil { return name }
-        // An iterator (`var it = arr.makeIterator()`) — the marker `$Iterator<E>` names no
-        // declaration but `it.next()` chases it to the element (B-FIX-76).
-        if CollectionMemberRegistry.iteratorElement(of: name) != nil { return name }
-        return nil
+        guard let info = resolver.receiverTypeInfo(of: expr, in: scope),
+              TypeResolver.isChaseableComposite(info.name) else { return nil }
+        return info.name
     }
 }

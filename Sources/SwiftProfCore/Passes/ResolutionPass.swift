@@ -820,6 +820,18 @@ private final class ResolutionVisitor: SyntaxVisitor {
         if let sym = typeResolver.typeSymbol(of: initializer, in: currentScope) {
             return (sym.name, sym.scope ?? currentScope)
         }
+        // The initializer types to a COMPOSITE STRING that names no declaration — a collection
+        // (`if let xs = rows.filter { … }`), a tuple (`if let pair = rows.enumerated().first`), or an
+        // iterator element (`while let pair = it.next()` over a Dictionary iterator) — so `typeSymbol`
+        // above returned nil. Store the string with the scope it was written in, exactly as
+        // `TypeInferencePass` does for a plain-`let` local (B-FIX-75/76); a member reached through the
+        // binding (`pair.element.m`, `xs.first?.m`) then resolves via the tuple/collection machinery.
+        // B-FIX-77. Runs before `declaredTypeName`, which cannot name a composite call result and
+        // would answer nil here anyway.
+        if let info = typeResolver.receiverTypeInfo(of: initializer, in: currentScope),
+           TypeResolver.isChaseableComposite(info.name) {
+            return (info.name, info.declScope)
+        }
         if let name = typeResolver.declaredTypeName(of: initializer, in: currentScope) {
             return (name, currentScope)
         }
