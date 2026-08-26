@@ -34,6 +34,18 @@ enum CollectionMemberRegistry {
     /// the receiver's WRITTEN type name (`[Item]`, `Array<Item>`, `Set<Item>`, `[String: Item]`).
     /// nil when the receiver is not a collection we parse or the member is not in the table.
     static func resultTypeName(member: String, receiverType: String) -> String? {
+        // Iterator (B-FIX-76): `it.next()` yields the iterator's Element, and `x.makeIterator()`
+        // yields an iterator OVER the iteration element (dictionary-aware, so a dict iterator's
+        // element is the `(key, value)` tuple). The iterator is a synthetic marker string that names
+        // no declaration and that every other parser here (`collectionKind`, `sequenceElement`,
+        // `dictionaryKeyType`, `TupleTypeName`) leaves inert, so ONLY these two members act on it and
+        // a user type's own `next()` / `makeIterator()` — resolved through its real declaration — is
+        // never mistaken for the stdlib shape (that path only reaches here when the receiver names no
+        // local type). Checked BEFORE the dictionary branch, whose `default: nil` would swallow them.
+        if member == "next", let element = iteratorElement(of: receiverType) { return element }
+        if member == "makeIterator", let element = iterationElement(of: receiverType) {
+            return iteratorType(ofElement: element)
+        }
         // Dictionary first: it also matches no sequence shape, but its Element is a `(key, value)`
         // tuple, so the sequence members below must NOT be applied to it.
         if let key = TypeResolver.dictionaryKeyType(from: receiverType),
@@ -99,6 +111,26 @@ enum CollectionMemberRegistry {
             return element.isEmpty ? nil : element
         }
         return nil
+    }
+
+    /// The SYNTHETIC type-name marker for an iterator over `element` — the result of a
+    /// `makeIterator()` call (B-FIX-76). Deliberately NOT a real stdlib spelling (`IndexingIterator`,
+    /// `DictionaryIterator`, …) because we neither know nor care which concrete iterator a Sequence
+    /// hands out — only that `it.next()` yields `element`. The `$` prefix keeps it out of every real
+    /// type name, and no other parser in this file recognises the shape, so the marker is inert
+    /// everywhere except `iteratorElement` / the `next` and `makeIterator` cases above.
+    static func iteratorType(ofElement element: String) -> String { "$Iterator<\(element)>" }
+
+    /// The Element an iterator marker (`$Iterator<E>`) yields from `next()`, or nil when the name is
+    /// not an iterator marker. Trailing optionals are peeled first (an iterator value is never
+    /// optional in practice, but the convention costs nothing and matches the other parsers).
+    static func iteratorElement(of typeName: String) -> String? {
+        var name = typeName.trimmingCharacters(in: .whitespaces)
+        while name.hasSuffix("?") || name.hasSuffix("!") { name = String(name.dropLast()) }
+        let prefix = "$Iterator<"
+        guard name.hasPrefix(prefix), name.hasSuffix(">") else { return nil }
+        let inner = String(name.dropFirst(prefix.count).dropLast()).trimmingCharacters(in: .whitespaces)
+        return inner.isEmpty ? nil : inner
     }
 
     /// Generic spellings whose single type argument IS the Element.

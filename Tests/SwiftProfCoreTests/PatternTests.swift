@@ -8629,4 +8629,78 @@ final class PatternTests: XCTestCase {
                        "genuine collection member must still rename while the scalar local is inert:\n\(r)")
     }
 
+    // MARK: - B-FIX-76: stdlib iterator (`makeIterator()` / `next()`)
+
+    /// `var it = arr.makeIterator(); while let x = it.next() { x.member }` — the iterator carries the
+    /// sequence's Element, so `it.next()` yields it and the member through the `while let` binding
+    /// resolves.
+    func testIterator_whileLetNext_elementMemberResolves() throws {
+        let r = try runPipeline("""
+        struct Payload { func grab() -> String { return "p" } }
+        func step(_ arr: [Payload]) {
+            var it = arr.makeIterator()
+            while let p = it.next() { _ = p.grab() }
+        }
+        """)
+        XCTAssertFalse(r.contains("grab"),
+                       "member through an iterator's next() binding must rename:\n\(r)")
+    }
+
+    /// The optional-pattern form (B-FIX-68) over an iterator subject: `while case .calm(let item)? =
+    /// it.next()` — the iterator element is the enum, so both the case name and the payload member
+    /// resolve. This is the exact shape the B-FIX-68 report left open as needing iterator modelling.
+    func testIterator_whileCaseOptionalPattern_payloadAndCaseResolve() throws {
+        let r = try runPipeline("""
+        struct Payload { func grab() -> String { return "p" } }
+        enum Mood { case calm(Payload); case tense }
+        func step(_ arr: [Mood]) {
+            var it = arr.makeIterator()
+            while case .calm(let item)? = it.next() {
+                _ = item.grab()
+                break
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("grab"),
+                       "payload member through an iterator optional-pattern subject must rename:\n\(r)")
+        XCTAssertFalse(r.contains("case calm") && r.contains(".calm"),
+                       "enum case reached through an iterator subject must rename consistently:\n\(r)")
+    }
+
+    /// `guard let x = it.next() else { … }` — the guard binding (deferred recording) types off the
+    /// same iterator element.
+    func testIterator_guardLetNext_elementMemberResolves() throws {
+        let r = try runPipeline("""
+        struct Row { func title() -> String { return "t" } }
+        func d(_ rows: [Row]) {
+            var it = rows.makeIterator()
+            guard let x = it.next() else { return }
+            _ = x.title()
+        }
+        """)
+        XCTAssertFalse(r.contains("title"),
+                       "member through a guard-let iterator binding must rename:\n\(r)")
+    }
+
+    /// Fail-closed guard-rail: a USER type with its OWN `next()` / `makeIterator()` is resolved
+    /// through its real declaration (its base names a local type), never mistaken for the stdlib
+    /// iterator marker, so its members rename normally.
+    func testIterator_userTypeWithOwnNext_notMistakenForStdlib() throws {
+        let r = try runPipeline("""
+        struct Row { func title() -> String { return "t" } }
+        struct Cursor {
+            func next() -> Row { return Row() }
+            func advance() -> String { return "a" }
+        }
+        func u(_ c: Cursor) {
+            _ = c.next().title()
+            _ = c.advance()
+        }
+        """)
+        XCTAssertFalse(r.contains("title"),
+                       "member off a user next()'s return must rename:\n\(r)")
+        XCTAssertFalse(r.contains("advance"),
+                       "a user type's own next()/advance() must rename:\n\(r)")
+    }
+
 }

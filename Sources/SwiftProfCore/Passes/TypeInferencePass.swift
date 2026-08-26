@@ -188,6 +188,9 @@ public final class TypeInferencePass {
         let name = info.name
         if CollectionMemberRegistry.collectionKind(of: name) != nil { return name }
         if TupleTypeName.labeledComponents(of: name) != nil { return name }
+        // An iterator (`var it = arr.makeIterator()`) — the marker `$Iterator<E>` names no
+        // declaration but `it.next()` chases it to the element (B-FIX-76).
+        if CollectionMemberRegistry.iteratorElement(of: name) != nil { return name }
         return nil
     }
 }
