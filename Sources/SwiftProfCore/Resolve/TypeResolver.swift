@@ -1273,8 +1273,19 @@ public final class TypeResolver {
             // All three type sources (B-FIX-37). This branch is the one that must keep a collection
             // name intact, so a binding typed `[Row]` reaches element extraction, subscript results
             // and the collection-member registry instead of dying at a missing `declaredType`.
-            return bareValueTypeInfo(named: lookupName, from: ref, in: scope)
-                .map { (name: $0.name, declScope: $0.scope) }
+            if let info = bareValueTypeInfo(named: lookupName, from: ref, in: scope) {
+                return (name: info.name, declScope: info.scope)
+            }
+            // A TUPLE-typed declaration (`pair: (offset: Int, element: Row)`) — its type lives in a
+            // SEPARATE side table (`WrittenTypeName.of` drops tuples, B-FIX-27), read ONLY here so the
+            // tuple-component / tuple-pattern paths can chase it while witness linking and overload
+            // disambiguation (which never call `receiverTypeInfo`) stay untouched (B-FIX-78).
+            let refOffset = ref.positionAfterSkippingLeadingTrivia.utf8Offset
+            if let sym = scope.lookup(name: lookupName, at: refOffset),
+               let tuple = table.tupleDeclaredType[sym.id] {
+                return (name: tuple, declScope: sym.scope ?? scope)
+            }
+            return nil
         }
         if let member = expr.as(MemberAccessExprSyntax.self), let base = member.base {
             let memberName = Self.stripBackticks(member.declName.baseName.text)

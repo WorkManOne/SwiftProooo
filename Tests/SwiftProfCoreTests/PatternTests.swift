@@ -8764,4 +8764,47 @@ final class PatternTests: XCTestCase {
                        "an element binding must still resolve through the Symbol path:\n\(r)")
     }
 
+    // MARK: - B-FIX-78: tuple-typed declarations (member access on a written tuple param/property)
+
+    /// A TUPLE-typed PARAMETER (`pair: (offset: Int, element: Row)`) — `WrittenTypeName.of` drops
+    /// tuples, so the parameter was untyped and `pair.element.member` desynced. The `tupleDeclaredType`
+    /// side table now carries it, so the labeled component resolves.
+    func testTupleDecl_parameter_labeledComponentMemberResolves() throws {
+        let r = try runPipeline("""
+        struct Row { func title() -> String { return "t" } }
+        func use(_ pair: (offset: Int, element: Row)) {
+            _ = pair.element.title()
+        }
+        """)
+        XCTAssertFalse(r.contains("title"),
+                       "member through a tuple-typed parameter component must rename:\n\(r)")
+    }
+
+    /// A TUPLE-typed LOCAL with an annotation (`let pair: (Int, Row) = …`) — positional access
+    /// `pair.1` picks the element.
+    func testTupleDecl_annotatedLocal_positionalComponentMemberResolves() throws {
+        let r = try runPipeline("""
+        struct Row { func title() -> String { return "t" } }
+        func use() {
+            let pair: (Int, Row) = (0, Row())
+            _ = pair.1.title()
+        }
+        """)
+        XCTAssertFalse(r.contains("title"),
+                       "member through a tuple-typed local component must rename:\n\(r)")
+    }
+
+    /// Guard-rail: a plain (non-tuple) parameter still resolves via `declaredType` — the tuple side
+    /// table is only consulted when `WrittenTypeName.of` gave nil, so normal params are untouched.
+    func testTupleDecl_plainParameter_stillResolvesNormally() throws {
+        let r = try runPipeline("""
+        struct Row { func title() -> String { return "t" } }
+        func use(_ row: Row) {
+            _ = row.title()
+        }
+        """)
+        XCTAssertFalse(r.contains("title"),
+                       "a plain parameter must still resolve through declaredType:\n\(r)")
+    }
+
 }

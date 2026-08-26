@@ -11,6 +11,14 @@ public final class SymbolTable {
     public private(set) var enumCasesByName: [String: [Symbol]] = [:]
     /// Declared type name for property/parameter symbols (best-effort — IdentifierType only).
     public internal(set) var declaredType: [Int: String] = [:]
+    /// Declared TUPLE type of a property/parameter/local (`(offset: Int, element: Row)`), kept SEPARATE
+    /// from `declaredType` because `WrittenTypeName.of` deliberately returns nil for a tuple (a tuple in
+    /// `declaredType` / `functionParamTypes` would reach witness linking and overload disambiguation,
+    /// whose nil-as-wildcard semantics it must not disturb — the B-FIX-27 hazard). Read only by the
+    /// tuple-component / tuple-pattern paths through `TypeResolver.receiverTypeInfo`, never by those
+    /// matchers, so member access `pair.element` and a tuple-pattern binding resolve without touching
+    /// them (B-FIX-78).
+    public internal(set) var tupleDeclaredType: [Int: String] = [:]
     /// Raw type of an `enum X: String { … }` (or Int etc.). Populated during DeclarationPass when
     /// the enum's first inherited type is a basic raw type. Used by ResolutionPass's overload
     /// disambiguator to type `x.rawValue` arguments without full semantic analysis — without it,

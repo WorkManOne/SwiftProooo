@@ -409,7 +409,28 @@ private final class DeclVisitor: SyntaxVisitor {
         table.register(sym)
         if let type, let t = WrittenTypeName.of(type) {
             table.declaredType[sym.id] = t
+        } else if let type, let tup = Self.tupleTypeName(of: type) {
+            table.tupleDeclaredType[sym.id] = tup
         }
+    }
+
+    /// The WRITTEN name of a TUPLE type (`(offset: Int, element: Row)`), unwrapping an optional /
+    /// attribute wrapper first so `(A, B)?` is stored bare. `WrittenTypeName.of` deliberately returns
+    /// nil for a tuple (the B-FIX-27 hazard — a tuple in `declaredType` / `functionParamTypes` would
+    /// reach witness linking and overload disambiguation, whose nil-as-wildcard semantics it must not
+    /// disturb), so tuple types get their OWN side table `SymbolTable.tupleDeclaredType`, read only by
+    /// the tuple-component and tuple-pattern paths (via `receiverTypeInfo`), never by those matchers
+    /// (B-FIX-78). Requires at least two elements — `(A)` is just `A`, not a tuple.
+    static func tupleTypeName(of type: TypeSyntax) -> String? {
+        var t = type
+        var changed = true
+        while changed {
+            changed = false
+            if let attr = t.as(AttributedTypeSyntax.self) { t = attr.baseType; changed = true }
+            if let opt = t.as(OptionalTypeSyntax.self) { t = opt.wrappedType; changed = true }
+        }
+        guard let tuple = t.as(TupleTypeSyntax.self), tuple.elements.count >= 2 else { return nil }
+        return tuple.trimmedDescription
     }
 
     /// A `switch` case body is a lexical scope of its own: `case .foo(let value):` bindings are
@@ -767,6 +788,8 @@ private final class DeclVisitor: SyntaxVisitor {
             table.register(sym)
             if let t = WrittenTypeName.of(param.type) {
                 table.declaredType[sym.id] = t
+            } else if let tup = Self.tupleTypeName(of: param.type) {
+                table.tupleDeclaredType[sym.id] = tup
             }
             // The internal name is safely renameable iff the parameter has a DISTINCT external
             // label. Forms `func f(_ x:)` and `func f(label x:)` have secondName set — renaming
@@ -840,6 +863,11 @@ private final class DeclVisitor: SyntaxVisitor {
                 if let annotation = binding.typeAnnotation,
                    let typeName = WrittenTypeName.of(annotation.type) {
                     table.declaredType[sym.id] = typeName
+                } else if let annotation = binding.typeAnnotation,
+                          let tup = Self.tupleTypeName(of: annotation.type) {
+                    // A tuple-typed property/local (`let pair: (offset: Int, element: Row) = …`) —
+                    // its own side table so member access `pair.element` resolves (B-FIX-78).
+                    table.tupleDeclaredType[sym.id] = tup
                 } else if let init_ = binding.initializer {
                     // Try the cheap initializer-call shortcut first; otherwise defer to TypeInferencePass.
                     if let typeName = Self.inferTypeFromInitializer(init_.value) {
