@@ -674,6 +674,36 @@ private final class DeclVisitor: SyntaxVisitor {
         return WrittenTypeName.of(fn.returnClause.type)
     }
 
+    /// Input type names of a CLOSURE LITERAL that carries a typed parameter clause
+    /// (`{ (c: Choice) -> Void in … }` → ["Choice"]). The initializer-side twin of
+    /// `closureInputTypeNames` (which reads a WRITTEN function TYPE): a local/property with no
+    /// annotation, only a closure-literal initializer (`let sink = { (c: Choice) in … }`), has no
+    /// function TYPE to read, so its inputs come from the literal's own signature — otherwise a call
+    /// through it (`sink(.case)`) gets no contextual type (B-FIX-74, the local twin of B-FIX-66).
+    /// Only the typed `(c: Choice)` parameter clause is handled; a shorthand list (`{ c in … }`)
+    /// carries no types, so it yields nil (fail-closed — a wrong input is a wrong rename). Each
+    /// param's type is reduced through `WrittenTypeName.of` (nil → "", positionally fail-closed at
+    /// that index, matching `closureInputTypeNames`).
+    static func closureLiteralInputNames(of expr: ExprSyntax) -> [String]? {
+        guard let closure = expr.as(ClosureExprSyntax.self),
+              let signature = closure.signature,
+              case .parameterClause(let clause)? = signature.parameterClause else { return nil }
+        let names = clause.parameters.map { param in param.type.flatMap { WrittenTypeName.of($0) } ?? "" }
+        return names.isEmpty ? nil : names
+    }
+
+    /// The RETURN type name of a CLOSURE LITERAL that declares one (`{ () -> Widget in … }` →
+    /// "Widget"). The initializer-side twin of `closureReturnTypeName`: a local/property typed only
+    /// by such a literal (`let make = { () -> Widget in … }`) has no function TYPE to read, so a call
+    /// through it (`make().member`) can only type its result from the literal's own return clause
+    /// (B-FIX-74, the local twin of B-FIX-73). `WrittenTypeName.of` unwraps the optional, matching the
+    /// table-wide convention. nil when the literal declares no return type or it cannot be reduced.
+    static func closureLiteralReturnName(of expr: ExprSyntax) -> String? {
+        guard let closure = expr.as(ClosureExprSyntax.self),
+              let ret = closure.signature?.returnClause?.type else { return nil }
+        return WrittenTypeName.of(ret)
+    }
+
     /// Register generic parameters (`<T: P, U>`) as NON-renameable `.typealias_` placeholders in
     /// `scope`. Target = the constraint's bare type name so member access through the placeholder
     /// (`r: T` → `r.render()`) resolves via the constraint protocol. Recorded in
@@ -786,13 +816,25 @@ private final class DeclVisitor: SyntaxVisitor {
                 // types under its own id so a call through it as a callee can type a shorthand argument
                 // (B-FIX-66). `WrittenTypeName.of` reduces no function type, so the annotation branch
                 // below records no `declaredType` for it — this is the only carrier.
+                // A written function-type annotation is the primary carrier; when there is none but
+                // the initializer is a CLOSURE LITERAL with a typed signature (`let sink = { (c: E1)
+                // in … }`), read the literal's own signature — otherwise a call through the inferred
+                // local (`sink(.case)`) gets no contextual type (B-FIX-74, the local twin of B-FIX-66).
                 if let annotation = binding.typeAnnotation,
                    let closureInput = Self.closureInputTypeNames(of: annotation.type) {
                     table.valueClosureInput[sym.id] = closureInput
+                } else if binding.typeAnnotation == nil, let init_ = binding.initializer,
+                          let closureInput = Self.closureLiteralInputNames(of: init_.value) {
+                    table.valueClosureInput[sym.id] = closureInput
                 }
-                // Its RETURN type — so a call through the value (`make()`) types its result.
+                // Its RETURN type — so a call through the value (`make()`) types its result. Same
+                // annotation-first / closure-literal-fallback split (B-FIX-74, the local twin of
+                // B-FIX-73: `let make = { () -> Widget in … }; make().member`).
                 if let annotation = binding.typeAnnotation,
                    let closureReturn = Self.closureReturnTypeName(of: annotation.type) {
+                    table.valueClosureReturn[sym.id] = closureReturn
+                } else if binding.typeAnnotation == nil, let init_ = binding.initializer,
+                          let closureReturn = Self.closureLiteralReturnName(of: init_.value) {
                     table.valueClosureReturn[sym.id] = closureReturn
                 }
                 if let annotation = binding.typeAnnotation,

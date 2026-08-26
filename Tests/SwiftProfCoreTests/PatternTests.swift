@@ -8506,4 +8506,52 @@ final class PatternTests: XCTestCase {
                        "member through a function-typed property call must rename:\n\(r)")
     }
 
+    // MARK: - B-FIX-74: function-typed local inferred from a closure LITERAL (no annotation)
+
+    /// `let make = { () -> Widget in Widget() }` — no written annotation, but the literal declares a
+    /// return type, so a call through it (`make().member()`) types its result (local twin of B-FIX-73).
+    func testClosureLiteralLocal_returnTypedFromLiteral_memberChainResolves() throws {
+        let r = try runPipeline("""
+        struct Widget { func plonk() -> Int { return 1 } }
+        func run() {
+            let make = { () -> Widget in Widget() }
+            _ = make().plonk()
+        }
+        """)
+        XCTAssertFalse(r.contains("plonk"),
+                       "member through a closure-literal-typed local call must rename:\n\(r)")
+    }
+
+    /// `let sink = { (c: Choice) in … }` — the literal's typed parameter clause supplies the input,
+    /// so a shorthand `.case` argument to `sink(.alpha)` resolves (local twin of B-FIX-66).
+    func testClosureLiteralLocal_inputTypedFromLiteral_shorthandArgResolves() throws {
+        let r = try runPipeline("""
+        enum Choice { case alpha, beta }
+        func run() {
+            let sink = { (c: Choice) in _ = c }
+            sink(.alpha)
+        }
+        """)
+        XCTAssertFalse(r.contains("alpha"),
+                       "shorthand arg to a closure-literal-typed local must resolve:\n\(r)")
+    }
+
+    /// Fail-closed guard: a shorthand-parameter closure literal (`{ c in … }`, no types) records no
+    /// input, so nothing is mistyped — the local simply stays untyped.
+    func testClosureLiteralLocal_untypedShorthandParams_staysFailClosed() throws {
+        // No crash, no wrong rename; the enum case has no contextual type here and is left as-is
+        // (there is no call feeding it a type), so this only guards that the fallback declines cleanly.
+        let r = try runPipeline("""
+        enum Choice { case alpha, beta }
+        func run() {
+            let sink = { c in _ = c }
+            sink(Choice.alpha)
+        }
+        """)
+        // Qualified `Choice.alpha` resolves normally; the point is the pipeline does not crash or
+        // mis-handle the untyped-shorthand local.
+        XCTAssertFalse(r.contains(".alpha") && r.contains("case alpha"),
+                       "qualified case use should still rename its declaration:\n\(r)")
+    }
+
 }
