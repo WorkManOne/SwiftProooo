@@ -294,7 +294,7 @@ public final class Protector {
                 let reason = "conforms to unknown external '\(unknownExternal.joined(separator: ","))'"
                 protect(sym.id, reason: reason)
                 protectAllMembers(of: sym, in: inner, reason: reason,
-                                  except: localProtocolRequirementNames(for: sym))
+                                  except: localProtocolRequirements(for: sym))
                 continue
             }
 
@@ -330,9 +330,16 @@ public final class Protector {
     }
 
     private func protectAllMembers(of sym: Symbol, in inner: Scope, reason: String,
-                                   except explained: Set<String> = []) {
+                                   except localReqs: [Symbol] = []) {
         for member in inner.symbols {
-            if explained.contains(member.name) { continue }   // witness of a local protocol — leave it
+            // A member that WITNESSES a local protocol requirement is that protocol's business —
+            // WitnessLinker renames it as a coordinated group — so the unknown-external protect-all
+            // net must not swallow it. The match is by KIND (and, for a method, argument labels),
+            // NOT by bare name (B-FIX-89, the B-FIX-33/34 family): a local `var webView` PROPERTY
+            // requirement must NOT release the same-BASE-NAMED methods `webView(_:start:)` /
+            // `webView(_:stop:)` that witness the UNKNOWN external protocol — releasing those renamed
+            // the witnesses and broke the conformance ("does not conform to 'WKURLSchemeHandler'").
+            if witnessesLocalRequirement(member, localReqs) { continue }
             protect(member.id, reason: reason)
             if isTypeKind(member.kind),
                let nested = inner.children.first(where: { $0.owner?.id == member.id }) {
@@ -341,14 +348,43 @@ public final class Protector {
         }
     }
 
-    /// Names of all requirements of the LOCAL protocols `sym` conforms to (directly or via
-    /// extensions). A member of `sym` matching one is a witness of a protocol we DO understand —
-    /// WitnessLinker renames it as a coordinated group — so the unknown-external protect-all net must
-    /// not swallow it. ConformanceVisibility (runs before Protector) has already folded inherited
-    /// requirements into each local protocol's scope, so inner-scope members cover transitively-
-    /// inherited requirements too.
-    private func localProtocolRequirementNames(for sym: Symbol) -> Set<String> {
-        var names: Set<String> = []
+    /// Does `member` witness one of the local protocol requirements `reqs`? Mirrors
+    /// `WitnessLinker.matchRequirement` (B-FIX-34), the reason a bare-name test is wrong here: a
+    /// property witnesses a property, a method a method with the SAME argument labels, a nested type
+    /// or typealias an associatedtype/typealias. A member whose base name merely COLLIDES with a
+    /// requirement of another kind (the reported `var webView` property vs the `webView(_:start:)`
+    /// methods) does NOT witness it and must stay protected. Erring toward "not a witness" is the
+    /// safe direction: a missed local witness is force-protected, so WitnessLinker reverts its group
+    /// (green under-obf), whereas a wrongly-released external witness is a red build.
+    private func witnessesLocalRequirement(_ member: Symbol, _ reqs: [Symbol]) -> Bool {
+        for req in reqs where req.name == member.name {
+            switch member.kind {
+            case .method:
+                if req.kind == .method,
+                   (table.functionParamLabels[req.id] ?? []) == (table.functionParamLabels[member.id] ?? []) {
+                    return true
+                }
+            case .property:
+                if req.kind == .property { return true }
+            case .typealias_, .struct, .enum, .class:
+                if req.kind == .associatedtype_ || req.kind == .typealias_ { return true }
+            default:
+                break
+            }
+        }
+        return false
+    }
+
+    /// The requirement SYMBOLS of the LOCAL protocols `sym` conforms to (directly or via extensions).
+    /// A member of `sym` that WITNESSES one (matched by kind + labels in `witnessesLocalRequirement`,
+    /// NOT by bare name) is a witness of a protocol we DO understand — WitnessLinker renames it as a
+    /// coordinated group — so the unknown-external protect-all net must not swallow it.
+    /// ConformanceVisibility (runs before Protector) has already folded inherited requirements into
+    /// each local protocol's scope, so inner-scope members cover transitively-inherited requirements
+    /// too. Returning the SYMBOLS (not bare names) is what lets the exemption be kind/signature-aware
+    /// instead of colliding on a shared base name (B-FIX-89).
+    private func localProtocolRequirements(for sym: Symbol) -> [Symbol] {
+        var reqs: [Symbol] = []
         for name in conformanceNames(for: sym) {
             guard let proto = ConformanceVisibility.preferredProtocol(in: table, named: name, forModule: sym.module.name),
                   let protoParent = proto.scope,
@@ -356,10 +392,10 @@ public final class Protector {
             else { continue }
             for m in protoScope.symbols
             where m.kind == .method || m.kind == .property || m.kind == .typealias_ || m.kind == .associatedtype_ {
-                names.insert(m.name)
+                reqs.append(m)
             }
         }
-        return names
+        return reqs
     }
 
     private func isTypeKind(_ k: SymbolKind) -> Bool {

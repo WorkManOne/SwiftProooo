@@ -1399,6 +1399,38 @@ final class PatternTests: XCTestCase {
                        "f1 (local P1 witness) must be obfuscated despite the unknown external:\n\(r)")
     }
 
+    /// The reported red build (B-FIX-89): a class conforming to an UNKNOWN external protocol
+    /// (`WKURLSchemeHandler` — an @objc WebKit protocol with no registry entry) is protected
+    /// fail-closed (protect-all), EXCEPT members that witness a LOCAL protocol. That exemption was
+    /// bare-NAME, so a local `var webView` PROPERTY requirement wrongly RELEASED the same-base-named
+    /// `webView(_:start:)` / `webView(_:stop:)` METHODS that witness the external protocol — they
+    /// renamed and the conformance broke ("does not conform to 'WKURLSchemeHandler'"). The exemption
+    /// is now kind/label-aware (`witnessesLocalRequirement`): a property requirement releases only a
+    /// property witness, so the methods stay protected while the genuine local witnesses still rename.
+    /// `SchemeHandler` is undeclared → unknown external, which drives protect-all regardless of the
+    /// objc mode; masked historically because every run was `strict` on NSObject descendants.
+    func testUnknownExternalConformance_localPropertyDoesNotReleaseSameNamedWitnessMethods() throws {
+        let r = try runPipeline("""
+        protocol LocalProto {
+            var localTitle: String { get }
+            var webView: Int { get set }
+        }
+        final class C10: SchemeHandler, LocalProto {
+            var localTitle: String = "x"
+            var webView: Int = 0
+            func webView(_ w: Int, start s: Int) {}
+            func webView(_ w: Int, stop s: Int) {}
+        }
+        """)
+        // Both external-protocol witness methods keep their base name (protected).
+        let kept = r.components(separatedBy: "func webView(").count - 1
+        XCTAssertEqual(kept, 2,
+                       "webView(_:start:)/webView(_:stop:) witness the unknown external protocol and must stay protected:\n\(r)")
+        // The genuine LOCAL-protocol property witness still renames (no over-protection).
+        XCTAssertFalse(r.contains("localTitle"),
+                       "the local-protocol property witness localTitle must still rename:\n\(r)")
+    }
+
     func testEnumCaseShorthand_inParameterDefaultValue_resolved() throws {
         // `.a` in a parameter default value must resolve to its enum (the parameter's declared type),
         // so the case + the `.a` use-site rename together. Was unresolved → original `a` survived →
