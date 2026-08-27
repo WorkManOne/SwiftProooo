@@ -1177,8 +1177,79 @@ public final class TypeResolver {
                   let recvScope = canonicalInnerScope(of: recvType) else { return nil }
             let cands = recvScope.members(named: methodName).filter { isCallable($0.kind) && labelsMatch($0) }
             if cands.count == 1 { return cands[0] }
+            // Not on the receiver's OWN type — walk the LOCAL superclass chain for an INHERITED
+            // method whose return types the value (`Cell().makeSelf()` where `makeSelf() -> Self`
+            // is declared on a project base class, then `x.render()` on the result — B-FIX-87). The
+            // receiver's own scope is checked FIRST, so a subclass override wins; among ancestors the
+            // nearest declaring one wins (Swift's shadowing). This is TYPING only — the return type is
+            // read, nothing is renamed — so it can only ADD a type where there was none, never
+            // mis-resolve a call. Fail-closed: an ambiguous level stops the walk.
+            if cands.isEmpty {
+                for ancestor in SuperclassChain.ancestors(of: recvType, in: table) {
+                    guard let ancScope = canonicalInnerScope(of: ancestor) else { continue }
+                    let inherited = ancScope.members(named: methodName)
+                        .filter { isCallable($0.kind) && labelsMatch($0) }
+                    if inherited.count == 1 { return inherited[0] }
+                    if !inherited.isEmpty { return nil }   // ambiguous local ancestor: fail-closed
+                }
+                // Still not found on any LOCAL type — the method may live in an EXTERNAL extension on
+                // the receiver's EXTERNAL superclass (`extension UIView { func f1() -> Self }` reached
+                // from `C2().f1()` where `C2: UIView`, the extension shipped read-only via --auto-spm).
+                // The two steps above only see LOCAL scopes, so match it by the receiver's written
+                // superclass NAMES against `table.externalExtensions` (B-FIX-88). TYPING only — the
+                // found method is external (never renamed) — and it feeds the SAME `-> Self` handling
+                // in `receiverTypeInfo` that a local builder does, so `p1` types to the receiver.
+                if let ext = externalSuperclassMethod(named: methodName, on: recvType,
+                                                      labelsMatch: labelsMatch) {
+                    return ext
+                }
+            }
         }
         return nil
+    }
+
+    /// A `receiver.method(...)` whose `method` is declared in an EXTERNAL extension on the receiver's
+    /// EXTERNAL superclass — `extension UIView { @discardableResult func f1() -> Self }` reached from
+    /// `C2().f1()` where `C2: UIView` and the extension is shipped read-only (e.g. an SPM package via
+    /// --auto-spm). `calleeCallable`'s first two steps only search LOCAL scopes (the receiver's own
+    /// type and its LOCAL superclass chain), so this one matches the method by the receiver's written
+    /// superclass NAMES against `table.externalExtensions` — the same collection `resolveExternal
+    /// ExtensionMember` uses for use-site renaming, except that pass matches the receiver's OWN name,
+    /// never a superclass, which is exactly the axis this adds (B-FIX-88).
+    ///
+    /// TYPING ONLY: the found method is external (a read-only module), so it is never renamed; it is
+    /// read solely for its return type, which `receiverTypeInfo` then feeds to `selfReturnType` so a
+    /// value typed from the call (`let p1 = C2().f1()`) becomes the RECEIVER's type. Fail-closed: no
+    /// unique callable across the matched extensions ⇒ nil, so a call that resolves nowhere stays
+    /// untyped rather than being mistyped from a guessed extension (a wrong type is a wrong rename
+    /// RollbackPass cannot catch).
+    private func externalSuperclassMethod(named methodName: String, on recvType: Symbol,
+                                          labelsMatch: (Symbol) -> Bool) -> Symbol? {
+        guard !table.externalExtensions.isEmpty else { return nil }
+        // The written base NAMES of the receiver's inheritance chain: its own bases plus each LOCAL
+        // ancestor's. A LOCAL base was already handled by the superclass-chain walk above, so only an
+        // EXTERNAL base name can match an external extension here.
+        var baseNames = Set<String>()
+        func addBases(of sym: Symbol) {
+            for name in InheritanceClause.names(atOffset: sym.declOffset, in: sym.file.syntax) {
+                var base = name
+                if let lt = base.firstIndex(of: "<") { base = String(base[..<lt]) }   // strip `Base<T>`
+                baseNames.insert(base)
+            }
+        }
+        addBases(of: recvType)
+        for ancestor in SuperclassChain.ancestors(of: recvType, in: table) { addBases(of: ancestor) }
+        guard !baseNames.isEmpty else { return nil }
+        var found: [Symbol] = []
+        var seen = Set<Int>()
+        for ext in table.externalExtensions
+        where ext.elementConstraint == nil && baseNames.contains(ext.baseName) {
+            for m in ext.scope.members(named: methodName)
+            where (m.kind == .function || m.kind == .method) && labelsMatch(m) {
+                if seen.insert(m.id).inserted { found.append(m) }
+            }
+        }
+        return found.count == 1 ? found[0] : nil
     }
 
     /// The type a closure parameter takes from an HOF's `HOFParamSource`, PLUS the scope that type
@@ -1285,6 +1356,35 @@ public final class TypeResolver {
         if TupleTypeName.labeledComponents(of: name) != nil { return true }
         if CollectionMemberRegistry.iteratorElement(of: name) != nil { return true }
         return false
+    }
+
+    /// A method whose declared return type is `Self` (`func f1() -> Self` — the builder idiom, e.g.
+    /// `C2().f1().f2()` on a UIView subclass) returns the RECEIVER's static type, not a type named
+    /// "Self". The stored return string is the literal "Self" (or a `Self.Inner` chain), which names
+    /// NO declaration, so `typeSymbol(forQualifiedName: "Self")` answers nil — and a value typed from
+    /// such a call (`let p1 = C2().f1()`) was left untyped, so every member reached through it
+    /// (`p1.f2()`) stayed original while its declaration renamed (the desync class; reverted-green
+    /// where nothing shields the surviving name, RED where a shield holds it — the reported bug).
+    ///
+    /// Resolve the leading `Self` segment against the receiver's type (`typeSymbol(of: recv)` — so it
+    /// is COVARIANT: `sub.f1()` where `f1() -> Self` is inherited from a base yields `sub`'s type, not
+    /// the base's), or, for a bare / implicit-self call (`f1()` / `self.f1()` with no receiver
+    /// expression), against the use-site's enclosing type. Fail-closed: not a `Self` return, or no
+    /// receiver type and no enclosing type → nil, and the callee branch falls through unchanged.
+    private func selfReturnType(_ ret: String, call: FunctionCallExprSyntax, in scope: Scope)
+        -> (name: String, declScope: Scope)? {
+        guard ret == "Self" || ret.hasPrefix("Self.") else { return nil }
+        let selfSym: Symbol?
+        if let m = call.calledExpression.as(MemberAccessExprSyntax.self), let recv = m.base {
+            selfSym = typeSymbol(of: recv, in: scope)
+        } else {
+            selfSym = Self.enclosingTypeScope(of: scope)?.owner
+        }
+        guard let sym = selfSym else { return nil }
+        let base = TypeInferencePass.qualifiedName(of: sym)
+        // `Self.Inner` — keep the tail so the nested type resolves off the concrete Self type.
+        let full = ret == "Self" ? base : base + String(ret.dropFirst("Self".count))
+        return (full, sym.scope ?? scope)
     }
 
     public func receiverTypeInfo(of expr: ExprSyntax, in scope: Scope) -> (name: String, declScope: Scope)? {
@@ -1394,6 +1494,10 @@ public final class TypeResolver {
             }
             if let callee = calleeCallable(for: call, in: scope),
                let ret = table.functionReturnType[callee.id] {
+                // A `Self` return names the receiver's static type, not a declaration called "Self"
+                // (the builder idiom `C2().f1() -> Self`). Resolve it before anything else, since
+                // "Self" is neither a generic parameter nor a nameable type.
+                if let selfT = selfReturnType(ret, call: call, in: scope) { return selfT }
                 // A generic method's return may BE the receiver base's generic parameter
                 // (`func get() -> Item` on a `Store<Payload>` receiver) — substitute the concrete
                 // argument (B-FIX-63). Only for a `receiver.method()` call: a free function has no

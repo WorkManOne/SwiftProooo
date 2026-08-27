@@ -9243,4 +9243,216 @@ final class PatternTests: XCTestCase {
                        "a plain-return local must still resolve its member:\n\(r)")
     }
 
+    // MARK: - `Self` return type (builder idiom) — a value typed from `x.f() -> Self` resolves
+
+    /// The reported shape (masked under `--objc-protection strict`, since the real class was a
+    /// UIView subclass whose members are then all protected): a local typed from a Self-returning
+    /// method call, then a member call through it. `f1() -> Self` on the same class as `f2`; the
+    /// return names the receiver's type (C2), not a declaration called "Self", so `p1.f2()` must
+    /// resolve to `C2.f2` and rename to the SAME obf as its declaration.
+    func testSelfReturn_localTypedFromSelfReturningMethod_memberResolves() throws {
+        let r = try runPipeline("""
+        final class C1 {
+            func go() {
+                let p1 = C2().configure()
+                p1.render()
+            }
+        }
+        final class C2 {
+            func configure() -> Self { return self }
+            func render() { }
+        }
+        """)
+        XCTAssertFalse(r.contains("render"),
+                       "render (f2) must rename at BOTH decl and the p1.render() use-site:\n\(r)")
+        // The use-site member obf must equal the void-method (render) DECL obf — proving it resolved
+        // to C2.render, not accidentally to the Self-returning `configure`.
+        let useObf = try firstGroup(#"p\d+\.(\w+)\(\)"#, in: r)
+        XCTAssertTrue(r.contains("func \(useObf)() { }"),
+                      "p1.render() must resolve to the C2.render decl, got \(useObf):\n\(r)")
+    }
+
+    /// A chain with no intermediate local: `self.configure().render()` — the first call's `Self`
+    /// return types the receiver of `.render()`.
+    func testSelfReturn_chainedWithoutLocal_memberResolves() throws {
+        let r = try runPipeline("""
+        final class C2 {
+            func configure() -> Self { return self }
+            func render() { }
+            func go() {
+                self.configure().render()
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("render"),
+                       "render must rename at the self.configure().render() use-site:\n\(r)")
+        let useObf = try firstGroup(#"self\.\w+\(\)\.(\w+)\(\)"#, in: r)
+        XCTAssertTrue(r.contains("func \(useObf)() { }"),
+                      "the chained .render() must resolve to C2.render, got \(useObf):\n\(r)")
+    }
+
+    /// Bare / implicit-self call: `let p1 = configure(); p1.render()` — no receiver expression, so
+    /// `Self` resolves to the use-site's ENCLOSING type.
+    func testSelfReturn_bareCall_memberResolves() throws {
+        let r = try runPipeline("""
+        final class C2 {
+            func configure() -> Self { return self }
+            func render() { }
+            func go() {
+                let p1 = configure()
+                p1.render()
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("render"),
+                       "render must rename through a bare-call Self return:\n\(r)")
+        let useObf = try firstGroup(#"p\d+\.(\w+)\(\)"#, in: r)
+        XCTAssertTrue(r.contains("func \(useObf)() { }"),
+                      "p1.render() must resolve to C2.render, got \(useObf):\n\(r)")
+    }
+
+    /// Guard-rail: a CONCRETE return type is unaffected — `f1() -> C2` still resolves the member
+    /// through the normal return-type path (the fix only intercepts the literal `Self`).
+    func testSelfReturn_concreteReturn_stillResolves() throws {
+        let r = try runPipeline("""
+        final class C1 {
+            func go() {
+                let p1 = C2().configure()
+                p1.render()
+            }
+        }
+        final class C2 {
+            func configure() -> C2 { return self }
+            func render() { }
+        }
+        """)
+        XCTAssertFalse(r.contains("render"),
+                       "a concrete-return chain must keep resolving its member:\n\(r)")
+    }
+
+    // MARK: - Inherited builder call types the value (calleeCallable walks the superclass chain)
+
+    /// The verbatim reported shape (`--explain`: the member use-site was `receiver-untyped`): the
+    /// builder `makeSelf() -> Self` is INHERITED from a project superclass, so it is not in the
+    /// receiver's own scope; `calleeCallable` must walk the superclass chain to find it and read its
+    /// return, or `x` stays untyped and `x.render()` desyncs. With the walk + the `Self` resolution,
+    /// `x` types as `Cell` and the member renames.
+    func testInheritedBuilder_selfReturn_memberResolves() throws {
+        let r = try runPipeline("""
+        class Base {
+            func makeSelf() -> Self { return self }
+        }
+        final class Cell: Base {
+            func render() { print("r") }
+        }
+        final class Owner {
+            func go() {
+                let x = Cell().makeSelf()
+                x.render()
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("render"),
+                       "the member reached through an inherited Self-builder must resolve:\n\(r)")
+        let useObf = try firstGroup(#"p\d+\.(\w+)\(\)"#, in: r)
+        XCTAssertTrue(r.contains("func \(useObf)() { print(\"r\") }"),
+                      "x.render() must resolve to Cell.render, got \(useObf):\n\(r)")
+    }
+
+    /// The builder inherited from a project superclass returning a CONCRETE subclass type
+    /// (`makeCell() -> Cell`) — the superclass-chain walk finds it and reads the concrete return,
+    /// no `Self` involved.
+    func testInheritedBuilder_concreteReturn_memberResolves() throws {
+        let r = try runPipeline("""
+        class Base {
+            func makeCell() -> Cell { return Cell() }
+        }
+        final class Cell: Base {
+            func render() { print("r") }
+        }
+        final class Owner {
+            func go() {
+                let x = Cell().makeCell()
+                x.render()
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("render"),
+                       "the member reached through an inherited concrete-return builder must resolve:\n\(r)")
+    }
+
+    /// Guard-rail: a builder on the receiver's OWN type is still found first (the walk only fires
+    /// when the own scope has no match), so a subclass override is not skipped for a base version.
+    func testInheritedBuilder_ownTypeBuilderStillWins() throws {
+        let r = try runPipeline("""
+        class Base {
+            func make() -> Base { return self }
+        }
+        final class Cell: Base {
+            func make() -> Cell { return self }
+            func render() { print("r") }
+        }
+        final class Owner {
+            func go() {
+                let x = Cell().make()
+                x.render()
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("render"),
+                       "the own-type builder result must resolve its member:\n\(r)")
+    }
+
+    /// The reported red build (B-FIX-88): a value typed from a `-> Self` builder that lives in an
+    /// EXTERNAL extension on the receiver's EXTERNAL superclass (`extension UIView { func f1() ->
+    /// Self }`, shipped read-only via --auto-spm). `calleeCallable`'s LOCAL steps (own scope + LOCAL
+    /// superclass chain) can't reach it; the external-extension match by superclass NAME does, and
+    /// `selfReturnType` then types `p1` as the receiver `C2`, so `p1.f2()` renames with the `C2.f2`
+    /// declaration. Runs under `objc off`: under `strict` a `UIView` subclass keeps every member, so
+    /// no desync could form — which is exactly why the bug was masked for the tool's whole life.
+    func testExternalSuperclassBuilder_selfReturn_memberResolves() throws {
+        let r = try runPipeline("""
+        extension UIView {
+            @discardableResult func f1() -> Self { return self }
+        }
+        final class C2: UIView {
+            func f2() { print("x") }
+        }
+        final class C1 {
+            func use() {
+                let p1 = C2().f1()
+                p1.f2()
+            }
+        }
+        """, objcProtection: .off)
+        XCTAssertFalse(r.contains("func f2()"),
+                       "C2.f2 must be renamed:\n\(r)")
+        let useObf = try firstGroup(#"p\d+\.(\w+)\(\)"#, in: r)
+        XCTAssertTrue(r.contains("func \(useObf)() { print(\"x\") }"),
+                      "p1.f2() must resolve to C2.f2's obf \(useObf):\n\(r)")
+    }
+
+    /// Guard-rail: an external extension on a DIFFERENT external base (`extension UILabel`) is NOT
+    /// applied to a `C2: UIView` receiver — the builder must match the receiver's OWN superclass
+    /// chain, so a mismatched extension leaves `p1` untyped and `p1.f2()` reverts (green under-obf),
+    /// never a guessed rename (a wrong type is a wrong rename RollbackPass cannot catch).
+    func testExternalSuperclassBuilder_wrongBase_notApplied() throws {
+        let r = try runPipeline("""
+        extension UILabel {
+            @discardableResult func f1() -> Self { return self }
+        }
+        final class C2: UIView {
+            func f2() { print("x") }
+        }
+        final class C1 {
+            func use() {
+                let p1 = C2().f1()
+                p1.f2()
+            }
+        }
+        """, objcProtection: .off)
+        XCTAssertTrue(r.contains("func f2()"),
+                      "C2.f2 must stay original (reverted) — a wrong-base extension must not type p1:\n\(r)")
+    }
+
 }
