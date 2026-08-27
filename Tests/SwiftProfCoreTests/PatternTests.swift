@@ -1457,6 +1457,47 @@ final class PatternTests: XCTestCase {
                       "handle(_:String) witnesses the unknown external protocol (different param type) and must stay protected:\n\(r)")
     }
 
+    /// B-FIX-91: the exemption also compares the RETURN type, for the case B-FIX-90 cannot reach — a
+    /// method with NO distinguishing parameters. A local protocol requires `snapshot() -> Data`; the
+    /// class also has `snapshot() -> UIImage` (same name, no params) which witnesses the UNKNOWN
+    /// external protocol. Param comparison sees zero params on both → identical, so it would release
+    /// BOTH; comparing the return keeps `snapshot() -> UIImage` protected (different external return).
+    func testUnknownExternalConformance_sameParamsDifferentReturn_witnessStaysProtected() throws {
+        let r = try runPipeline("""
+        protocol LocalProto {
+            func snapshot() -> Data
+        }
+        final class C10: SchemeHandler, LocalProto {
+            func snapshot() -> Data { fatalError() }
+            func snapshot() -> UIImage { fatalError() }
+        }
+        """)
+        // The external witness keeps its name and return; before the fix it was released and renamed.
+        let externalWitnessSurvives = r.range(of: #"func snapshot\(\) -> UIImage"#,
+                                              options: .regularExpression) != nil
+        XCTAssertTrue(externalWitnessSurvives,
+                      "snapshot() -> UIImage witnesses the unknown external protocol (different return) and must stay protected:\n\(r)")
+    }
+
+    /// B-FIX-91 guard-rail: a COVARIANT local witness must NOT be over-protected. The witness returns
+    /// `Dog`, the requirement `Animal`, and `Dog: Animal` — legal Swift, `Dog` is a subtype — so
+    /// `TypeSubtyping.isSubtype` keeps it exempted and it still renames (return comparison must accept
+    /// a subtype, not demand exact equality).
+    func testUnknownExternalConformance_covariantReturnWitness_stillRenames() throws {
+        let r = try runPipeline("""
+        class Animal {}
+        final class Dog: Animal {}
+        protocol LocalProto {
+            func make() -> Animal
+        }
+        final class C10: SchemeHandler, LocalProto {
+            func make() -> Dog { Dog() }
+        }
+        """)
+        XCTAssertFalse(r.contains("func make("),
+                       "the covariant local witness make() -> Dog must still rename (Dog <: Animal), not be over-protected:\n\(r)")
+    }
+
     func testEnumCaseShorthand_inParameterDefaultValue_resolved() throws {
         // `.a` in a parameter default value must resolve to its enum (the parameter's declared type),
         // so the case + the `.a` use-site rename together. Was unresolved → original `a` survived →

@@ -351,19 +351,22 @@ public final class Protector {
     /// Does `member` witness one of the local protocol requirements `reqs`? Mirrors
     /// `WitnessLinker.matchRequirement` (B-FIX-34), the reason a bare-name test is wrong here: a
     /// property witnesses a property, a method a method with a COMPATIBLE SIGNATURE (labels + known
-    /// parameter types, via the shared `SignatureMatch` — B-FIX-90), a nested type or typealias an
-    /// associatedtype/typealias. A member whose base name merely COLLIDES with a requirement of
-    /// another kind (the reported `var webView` property vs the `webView(_:start:)` methods), or with
-    /// a same-labelled method requirement of DIFFERENT known parameter types, does NOT witness it and
-    /// must stay protected. Erring toward "not a witness" is the safe direction: a missed local
-    /// witness is force-protected, so WitnessLinker reverts its group (green under-obf), whereas a
-    /// wrongly-released external witness is a red build.
+    /// parameter types via the shared `SignatureMatch` — B-FIX-90 — AND a compatible RETURN type,
+    /// B-FIX-91), a nested type or typealias an associatedtype/typealias. A member whose base name
+    /// merely COLLIDES with a requirement of another kind (the reported `var webView` property vs the
+    /// `webView(_:start:)` methods), of DIFFERENT known parameter types, or — for a method with no
+    /// distinguishing parameters — of a DIFFERENT return type (a `snapshot() -> UIImage` external
+    /// @objc witness against a local `snapshot() -> Data` requirement), does NOT witness it and must
+    /// stay protected. Erring toward "not a witness" is the safe direction: a missed local witness is
+    /// force-protected, so WitnessLinker reverts its group (green under-obf), whereas a wrongly-
+    /// released external witness is a red build.
     private func witnessesLocalRequirement(_ member: Symbol, _ reqs: [Symbol]) -> Bool {
         for req in reqs where req.name == member.name {
             switch member.kind {
             case .method:
                 if req.kind == .method,
-                   SignatureMatch.compatibleParameters(member, req, in: table, arityMismatch: false) {
+                   SignatureMatch.compatibleParameters(member, req, in: table, arityMismatch: false),
+                   returnsCompatibleForExemption(member, req) {
                     return true
                 }
             case .property:
@@ -375,6 +378,33 @@ public final class Protector {
             }
         }
         return false
+    }
+
+    /// Return-type half of the method-witness test (B-FIX-91). A witness's return may be the
+    /// requirement's return OR a SUBTYPE of it (covariant witness — `func make() -> Dog` legally
+    /// witnesses `func make() -> Animal`), so both count as "still the local witness → exempt". A
+    /// DIFFERENT return (not equal, not a subtype) means the member witnesses something ELSE — for a
+    /// method with no distinguishing parameters that "something else" is the UNKNOWN external @objc
+    /// protocol (`snapshot() -> UIImage` vs a local `snapshot() -> Data`), which must stay protected.
+    ///
+    /// Fail-SAFE toward the green direction, both readings deliberate:
+    ///   - an UNTRACKED return on either side (a `Void`/tuple/function return, or one `WrittenTypeName`
+    ///     could not reduce) is a WILDCARD → treat as compatible, so a witness whose return we cannot
+    ///     compare is still exempted (obfuscatable) rather than force-protected;
+    ///   - `TypeSubtyping.isSubtype` is LOCAL-only, so an EXTERNAL return that is not textually equal
+    ///     is treated as DIFFERENT (protect). That is what closes the residual — the external @objc
+    ///     witness returns an external type, textually unequal to the local requirement's return — at
+    ///     the cost of protecting the astronomically rare BOTH-external genuine covariant pair we
+    ///     cannot see the hierarchy of (green over-protection).
+    private func returnsCompatibleForExemption(_ member: Symbol, _ req: Symbol) -> Bool {
+        guard let mRet = table.functionReturnType[member.id],
+              let rRet = table.functionReturnType[req.id] else { return true }   // wildcard
+        if TypeNameEquivalence.sameType(mRet, inScope: member.scope, module: member.module.name,
+                                        rRet, inScope: req.scope, module: req.module.name, table: table) {
+            return true
+        }
+        return TypeSubtyping.isSubtype(mRet, inScope: member.scope, module: member.module.name,
+                                       of: rRet, inScope: req.scope, module: req.module.name, in: table)
     }
 
     /// The requirement SYMBOLS of the LOCAL protocols `sym` conforms to (directly or via extensions).
