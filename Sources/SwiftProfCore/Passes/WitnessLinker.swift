@@ -183,20 +183,8 @@ public final class WitnessLinker {
     /// on it) misses the witness link and lets both sides mint their own obf ⇒ "does not conform"
     /// (B-FIX-27).
     private func signaturesCompatible(_ a: Symbol, _ b: Symbol) -> Bool {
-        guard (table.functionParamLabels[a.id] ?? []) == (table.functionParamLabels[b.id] ?? []) else {
-            return false
-        }
-        let ta = table.functionParamTypes[a.id] ?? []
-        let tb = table.functionParamTypes[b.id] ?? []
-        guard ta.count == tb.count else { return true }
-        for (x, y) in zip(ta, tb) {
-            guard let x, let y else { continue }   // wildcard
-            if TypeNameEquivalence.sameType(x, inScope: a.scope, module: a.module.name,
-                                            y, inScope: b.scope, module: b.module.name,
-                                            table: table) { continue }
-            return false
-        }
-        return true
+        // arityMismatch: true — never MISS a genuine witness whose type we couldn't model.
+        SignatureMatch.compatibleParameters(a, b, in: table, arityMismatch: true)
     }
 
     private func membersOfType(_ sym: Symbol) -> [Symbol] {

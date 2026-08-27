@@ -350,18 +350,20 @@ public final class Protector {
 
     /// Does `member` witness one of the local protocol requirements `reqs`? Mirrors
     /// `WitnessLinker.matchRequirement` (B-FIX-34), the reason a bare-name test is wrong here: a
-    /// property witnesses a property, a method a method with the SAME argument labels, a nested type
-    /// or typealias an associatedtype/typealias. A member whose base name merely COLLIDES with a
-    /// requirement of another kind (the reported `var webView` property vs the `webView(_:start:)`
-    /// methods) does NOT witness it and must stay protected. Erring toward "not a witness" is the
-    /// safe direction: a missed local witness is force-protected, so WitnessLinker reverts its group
-    /// (green under-obf), whereas a wrongly-released external witness is a red build.
+    /// property witnesses a property, a method a method with a COMPATIBLE SIGNATURE (labels + known
+    /// parameter types, via the shared `SignatureMatch` — B-FIX-90), a nested type or typealias an
+    /// associatedtype/typealias. A member whose base name merely COLLIDES with a requirement of
+    /// another kind (the reported `var webView` property vs the `webView(_:start:)` methods), or with
+    /// a same-labelled method requirement of DIFFERENT known parameter types, does NOT witness it and
+    /// must stay protected. Erring toward "not a witness" is the safe direction: a missed local
+    /// witness is force-protected, so WitnessLinker reverts its group (green under-obf), whereas a
+    /// wrongly-released external witness is a red build.
     private func witnessesLocalRequirement(_ member: Symbol, _ reqs: [Symbol]) -> Bool {
         for req in reqs where req.name == member.name {
             switch member.kind {
             case .method:
                 if req.kind == .method,
-                   (table.functionParamLabels[req.id] ?? []) == (table.functionParamLabels[member.id] ?? []) {
+                   SignatureMatch.compatibleParameters(member, req, in: table, arityMismatch: false) {
                     return true
                 }
             case .property:

@@ -135,20 +135,8 @@ public final class OverrideLinker {
     /// differently (bare vs qualified, through a typealias). The old plain string compare missed
     /// those pairs → no local base found → the whole chain reverted (under-obfuscation).
     private func signaturesCompatible(_ a: Symbol, _ b: Symbol) -> Bool {
-        guard (table.functionParamLabels[a.id] ?? []) == (table.functionParamLabels[b.id] ?? []) else {
-            return false
-        }
-        let ta = table.functionParamTypes[a.id] ?? []
-        let tb = table.functionParamTypes[b.id] ?? []
-        guard ta.count == tb.count else { return false }
-        for (x, y) in zip(ta, tb) {
-            guard let x, let y else { continue }            // wildcard
-            if TypeNameEquivalence.sameType(x, inScope: a.scope, module: a.module.name,
-                                            y, inScope: b.scope, module: b.module.name,
-                                            table: table) { continue }
-            return false
-        }
-        return true
+        // arityMismatch: false — a differing arity is not the base I override.
+        SignatureMatch.compatibleParameters(a, b, in: table, arityMismatch: false)
     }
 
     // MARK: - Indexes

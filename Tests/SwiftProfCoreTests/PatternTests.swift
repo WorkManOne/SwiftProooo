@@ -1431,6 +1431,32 @@ final class PatternTests: XCTestCase {
                        "the local-protocol property witness localTitle must still rename:\n\(r)")
     }
 
+    /// B-FIX-90: the exemption compares the full method SIGNATURE (labels + known parameter types),
+    /// not just labels. A local protocol requires `handle(_:Int)`; the class also has
+    /// `handle(_:String)` (same base name AND same labels) which witnesses the UNKNOWN external
+    /// protocol. Label-only matching (B-FIX-89) released BOTH — so the external witness renamed and
+    /// its conformance broke; comparing the KNOWN parameter types keeps `handle(_:String)` protected
+    /// (it is NOT the local `Int` witness). The base-name collision then makes RollbackPass keep the
+    /// whole `handle` overload set at its original name (green), so the OBSERVABLE proof is that the
+    /// String witness survives with its name — before the fix it was renamed away.
+    func testUnknownExternalConformance_sameLabelsDifferentParamType_witnessStaysProtected() throws {
+        let r = try runPipeline("""
+        protocol LocalProto {
+            func handle(_ x: Int)
+        }
+        final class C10: SchemeHandler, LocalProto {
+            func handle(_ x: Int) {}
+            func handle(_ x: String) {}
+        }
+        """)
+        // The external witness (different KNOWN param type) keeps its name `handle`; before the fix
+        // it was exempted by labels alone and renamed away.
+        let stringWitnessSurvives = r.range(of: #"func handle\(_ \w+: String\)"#,
+                                            options: .regularExpression) != nil
+        XCTAssertTrue(stringWitnessSurvives,
+                      "handle(_:String) witnesses the unknown external protocol (different param type) and must stay protected:\n\(r)")
+    }
+
     func testEnumCaseShorthand_inParameterDefaultValue_resolved() throws {
         // `.a` in a parameter default value must resolve to its enum (the parameter's declared type),
         // so the case + the `.a` use-site rename together. Was unresolved → original `a` survived →
