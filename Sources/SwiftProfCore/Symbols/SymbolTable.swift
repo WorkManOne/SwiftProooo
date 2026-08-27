@@ -19,6 +19,13 @@ public final class SymbolTable {
     /// matchers, so member access `pair.element` and a tuple-pattern binding resolve without touching
     /// them (B-FIX-78).
     public internal(set) var tupleDeclaredType: [Int: String] = [:]
+    /// Written protocol/class COMPOSITION type of a property/parameter/local (`p: A & B`), kept OUT
+    /// of `declaredType` for the same reason as a tuple (`WrittenTypeName.of` returns nil for a
+    /// composition — the B-FIX-27 hazard). Stored as the "A & B" component string, read only by
+    /// member resolution through `TypeResolver.receiverTypeInfo`, which tries each component
+    /// (B-FIX-93). The flow-sensitive condition-binding form (`if let p: A & B = …`) is carried by
+    /// `ResolutionPass.bindingType` instead, not here.
+    public internal(set) var compositionDeclaredType: [Int: String] = [:]
     /// Raw type of an `enum X: String { … }` (or Int etc.). Populated during DeclarationPass when
     /// the enum's first inherited type is a basic raw type. Used by ResolutionPass's overload
     /// disambiguator to type `x.rawValue` arguments without full semantic analysis — without it,

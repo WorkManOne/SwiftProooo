@@ -411,6 +411,8 @@ private final class DeclVisitor: SyntaxVisitor {
             table.declaredType[sym.id] = t
         } else if let type, let tup = Self.tupleTypeName(of: type) {
             table.tupleDeclaredType[sym.id] = tup
+        } else if let type, let comp = CompositionTypeName.of(type) {
+            table.compositionDeclaredType[sym.id] = comp
         }
     }
 
@@ -864,6 +866,8 @@ private final class DeclVisitor: SyntaxVisitor {
                 table.declaredType[sym.id] = t
             } else if let tup = Self.tupleTypeName(of: param.type) {
                 table.tupleDeclaredType[sym.id] = tup
+            } else if let comp = CompositionTypeName.of(param.type) {
+                table.compositionDeclaredType[sym.id] = comp
             }
             // The internal name is safely renameable iff the parameter has a DISTINCT external
             // label. Forms `func f(_ x:)` and `func f(label x:)` have secondName set — renaming
@@ -942,6 +946,11 @@ private final class DeclVisitor: SyntaxVisitor {
                     // A tuple-typed property/local (`let pair: (offset: Int, element: Row) = …`) —
                     // its own side table so member access `pair.element` resolves (B-FIX-78).
                     table.tupleDeclaredType[sym.id] = tup
+                } else if let annotation = binding.typeAnnotation,
+                          let comp = CompositionTypeName.of(annotation.type) {
+                    // A composition-typed property/local (`let p: A & B = …`) — its own side table so
+                    // member access on it tries each component (B-FIX-93).
+                    table.compositionDeclaredType[sym.id] = comp
                 } else if let init_ = binding.initializer {
                     // Try the cheap initializer-call shortcut first; otherwise defer to TypeInferencePass.
                     if let typeName = Self.inferTypeFromInitializer(init_.value) {

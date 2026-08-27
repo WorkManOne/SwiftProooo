@@ -9607,4 +9607,63 @@ final class PatternTests: XCTestCase {
         XCTAssertFalse(r.contains("func f3()"), "C3.f3 must rename at its decl and use-site:\n\(r)")
     }
 
+    /// B-FIX-93 reported shape: a condition binding typed as a protocol/class COMPOSITION
+    /// (`if let p2: LocalProto & UIViewController = generic()`). `WrittenTypeName.of` drops a
+    /// composition (nil), so `p2` was untyped and `p2.f1(with:)` was receiver-untyped while
+    /// `LocalProto.f1` renamed. The binding now carries the "A & B" string, and member access tries
+    /// each LOCAL component, so `f1` (on the local protocol) renames at its decl and use-site.
+    func testCompositionBinding_localComponentMemberResolves() throws {
+        let r = try runPipeline("""
+        protocol LocalProto {
+            func f1(with par1: String)
+        }
+        final class Owner {
+            private var flag = false
+            private func generic<T>() -> T? { return nil }
+            func use() throws {
+                if !flag,
+                   let p2: LocalProto & UIViewController = generic() {
+                    p2.f1(with: "s1")
+                }
+            }
+        }
+        """, objcProtection: .off)
+        XCTAssertFalse(r.contains("f1"),
+                       "LocalProto.f1 must rename at its decl and the composition-binding use-site:\n\(r)")
+    }
+
+    /// B-FIX-93: the same for a PARAMETER typed as a composition (the declaration side table, not the
+    /// flow-sensitive binding). A member of the local component resolves.
+    func testCompositionParameter_localComponentMemberResolves() throws {
+        let r = try runPipeline("""
+        protocol LocalProto {
+            func f1(with par1: String)
+        }
+        final class Owner {
+            func use(p: LocalProto & UIViewController) {
+                p.f1(with: "s1")
+            }
+        }
+        """, objcProtection: .off)
+        XCTAssertFalse(r.contains("f1"),
+                       "LocalProto.f1 must rename through a composition-typed parameter:\n\(r)")
+    }
+
+    /// B-FIX-93: a composition of TWO LOCAL protocols — a member of EITHER component resolves (the
+    /// candidates are the union across components, not just the first).
+    func testCompositionParameter_twoLocalProtocols_memberOnEitherResolves() throws {
+        let r = try runPipeline("""
+        protocol PA { func fa() }
+        protocol PB { func fb() }
+        final class Owner {
+            func use(p: PA & PB) {
+                p.fa()
+                p.fb()
+            }
+        }
+        """)
+        XCTAssertFalse(r.contains("func fa()"), "PA.fa must rename (member of the first component):\n\(r)")
+        XCTAssertFalse(r.contains("func fb()"), "PB.fb must rename (member of the second component):\n\(r)")
+    }
+
 }

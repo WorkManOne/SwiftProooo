@@ -1418,6 +1418,13 @@ public final class TypeResolver {
                let tuple = table.tupleDeclaredType[sym.id] {
                 return (name: tuple, declScope: sym.scope ?? scope)
             }
+            // A COMPOSITION-typed declaration (`p: A & B`) — also a SEPARATE side table (B-FIX-93),
+            // read here so member access can split it and try each component; kept away from the
+            // witness/overload matchers exactly like the tuple form.
+            if let sym = scope.lookup(name: lookupName, at: refOffset),
+               let comp = table.compositionDeclaredType[sym.id] {
+                return (name: comp, declScope: sym.scope ?? scope)
+            }
             return nil
         }
         if let member = expr.as(MemberAccessExprSyntax.self), let base = member.base {

@@ -933,6 +933,13 @@ private final class ResolutionVisitor: SyntaxVisitor {
         if let annotation, let written = WrittenTypeName.of(annotation.type) {
             return (written, currentScope)
         }
+        // A protocol/class COMPOSITION annotation (`if let p: A & B = …`) — `WrittenTypeName.of`
+        // drops it (nil), like a tuple, so carry the "A & B" string; member access on the binding
+        // then tries each component (B-FIX-93). Ground truth like any written annotation, so it
+        // precedes the initializer-inference fallbacks below.
+        if let annotation, let comp = CompositionTypeName.of(annotation.type) {
+            return (comp, currentScope)
+        }
         if let sym = typeResolver.typeSymbol(of: initializer, in: currentScope) {
             return (sym.name, sym.scope ?? currentScope)
         }
@@ -2540,6 +2547,13 @@ private final class ResolutionVisitor: SyntaxVisitor {
             }
             return
         }
+        // A COMPOSITION-typed receiver (`p2: A & B`) has no single Symbol, so `resolveTypeSymbol`
+        // returned nil; try each LOCAL component for the member (B-FIX-93). Before the external
+        // fallbacks: a member from a local component is a real rename, not an external-extension one.
+        if let member = resolveCompositionMember(memberName, base: base, node: node) {
+            emitRename(for: token, target: member)
+            return
+        }
         // No typeable receiver. `resolveExternalExtensionMember` still matches on the receiver's
         // WRITTEN type (a collection has no Symbol since B-FIX-28 but does have a written type);
         // `uniqueExternalMember` is the last resort for receivers that cannot be typed at all —
@@ -2551,6 +2565,40 @@ private final class ResolutionVisitor: SyntaxVisitor {
         } else {
             reportUnresolved(.receiverUntyped, name: memberName, token: token)
         }
+    }
+
+    /// A member reached through a value typed as a protocol/class COMPOSITION (`p2: A & B`,
+    /// `p2.f1(...)`). The value has no single Symbol, so member resolution tries each LOCAL component
+    /// type and unions their candidates — a member declared in ANY component is the value's member.
+    /// The external part of a composition (`UIViewController`) resolves to nothing and is left alone;
+    /// a member of a LOCAL component (`LocalProto.f1`) renames with its declaration (B-FIX-93).
+    ///
+    /// Fail-closed exactly like `resolveExternalExtensionMember`: an untypeable receiver, a component
+    /// that is not a local type, several candidates in DIFFERENT modules or with different obfs, or a
+    /// mixed-kind set all leave the use-site original (RollbackPass then reverts the group — under-
+    /// obfuscation, never a wrong rename).
+    private func resolveCompositionMember(_ name: String, base: ExprSyntax,
+                                          node: MemberAccessExprSyntax) -> Symbol? {
+        guard let info = typeResolver.receiverTypeInfo(of: base, in: currentScope),
+              let components = CompositionTypeName.components(info.name) else { return nil }
+        var declared: [Symbol] = []
+        var seen = Set<Int>()
+        for comp in components {
+            guard let typeSym = typeResolver.typeSymbol(forQualifiedName: comp, in: info.declScope),
+                  let scope = innerScope(of: typeSym) else { continue }
+            for m in scope.members(named: name) where seen.insert(m.id).inserted { declared.append(m) }
+        }
+        guard !declared.isEmpty else { return nil }
+        let call = enclosingCall(of: node)
+        var candidates = Self.narrowed(declared, to: call != nil ? .callee : .value)
+        if candidates.count == 1 { return candidates[0] }
+        guard candidates.count > 1 else { return nil }
+        let sameModule = candidates.filter { $0.module.name == file.module.name }
+        if sameModule.count == 1 { return sameModule[0] }
+        if !sameModule.isEmpty { candidates = sameModule }
+        if let shared = unambiguousSharedObfTarget(candidates) { return shared }
+        guard candidates.allSatisfy({ Self.isCallable($0.kind) }), let call else { return nil }
+        return chooseOverload(candidates, call: call)
     }
 
     // MARK: - Members of extensions on EXTERNAL types (B-FIX-31)
