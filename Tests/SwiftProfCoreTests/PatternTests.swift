@@ -9554,4 +9554,57 @@ final class PatternTests: XCTestCase {
                       "C2.f2 must stay original (reverted) — a wrong-base extension must not type p1:\n\(r)")
     }
 
+    /// B-FIX-92: a property initialized by an IMMEDIATELY-INVOKED closure (`private let w = { let
+    /// made = Widget(); return made }()`) is typed by the closure's RETURN — here the local `made`.
+    /// Needs BOTH halves: `receiverTypeInfo` typing a call whose callee is a closure literal, AND
+    /// TypeInferencePass step 1 iterating to a fixpoint (the closure-local `made` is registered AFTER
+    /// the outer property `w`, so a single pass typed `w` while `made` was still nil).
+    func testIIFEProperty_typedFromClosureLocalReturn_memberResolves() throws {
+        let r = try runPipeline("""
+        final class Widget {
+            func render() { print("r") }
+        }
+        final class Owner {
+            private let w = {
+                let made = Widget()
+                return made
+            }()
+            func use() { w.render() }
+        }
+        """)
+        XCTAssertFalse(r.contains("func render()"),
+                       "Widget.render must rename — w is typed from the IIFE's returned local:\n\(r)")
+    }
+
+    /// B-FIX-92 reported shape: the IIFE returns a value typed through an EXTERNAL `-> Self` builder
+    /// on the receiver's external superclass (B-FIX-88) — `let p2 = C3().f1(); return p2` where `f1`
+    /// is `extension UIView { func f1() -> Self }`. p2 types to C3, the IIFE to C3, and `p1.f2()` /
+    /// `p1.f3()` rename with their declarations. Under `off` (a UIView subclass keeps every member
+    /// under strict, which is why the shape only shows there).
+    func testIIFEProperty_externalSelfBuilderReturn_reportedShape_memberResolves() throws {
+        let r = try runPipeline("""
+        extension UIView {
+            @discardableResult func f1() -> Self { return self }
+        }
+        final class C3: UIView {
+            func f2() { print("2") }
+            func f3() { print("3") }
+        }
+        final class C1: UICollectionViewCell {
+            private let p1 = {
+                let p2 = C3().f1()
+                return p2
+            }()
+            func use() {
+                p1.f3()
+                p1.f2()
+            }
+        }
+        """, objcProtection: .off)
+        // If p1 stayed untyped, the surviving `p1.f2()` / `p1.f3()` use-sites would make RollbackPass
+        // revert the C3.f2 / C3.f3 declarations, so `func f2()` / `func f3()` would reappear.
+        XCTAssertFalse(r.contains("func f2()"), "C3.f2 must rename at its decl and use-site:\n\(r)")
+        XCTAssertFalse(r.contains("func f3()"), "C3.f3 must rename at its decl and use-site:\n\(r)")
+    }
+
 }

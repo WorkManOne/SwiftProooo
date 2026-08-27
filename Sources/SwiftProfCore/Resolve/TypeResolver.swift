@@ -1452,6 +1452,14 @@ public final class TypeResolver {
         // one of OUR callables, whose declared return type names the receiver of the next step
         // (`makeItems()[0].m`, `makeItems().map { $0.m }`).
         if let call = expr.as(FunctionCallExprSyntax.self) {
+            // `{ … }()` — an IMMEDIATELY-INVOKED closure literal, the common property-initializer
+            // idiom (`private let p = { let x = …; return x }()`). Its type is the type the closure
+            // RETURNS, typed in the closure's OWN scope (where its locals live). None of the callee
+            // shapes below match a closure literal, so this is the first check (B-FIX-92).
+            if let closure = call.calledExpression.as(ClosureExprSyntax.self),
+               let ret = closureReturnType(of: closure, in: scope) {
+                return (TypeInferencePass.qualifiedName(of: ret), ret.scope ?? scope)
+            }
             // `produce()` where `produce` is a VALUE of function type — the call's type is that
             // function type's RETURN (`valueClosureReturn`, the return twin of B-FIX-66). A
             // function-typed value is not a callable declaration, so `calleeCallable` below never

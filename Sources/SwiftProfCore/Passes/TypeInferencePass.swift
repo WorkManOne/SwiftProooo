@@ -22,31 +22,41 @@ public final class TypeInferencePass {
 
     public func run() {
         var inferred = 0
-        // 1. Initializer-driven inference.
-        for sym in table.symbols where table.declaredType[sym.id] == nil {
-            guard let expr = table.initializerExpr[sym.id], let scope = sym.scope else { continue }
-            if let typeSym = resolver.typeSymbol(of: expr, in: scope) {
-                // Store the QUALIFIED name (`NS.Widget`), not the simple one: `declaredType` is a
-                // string re-resolved later from a possibly-different scope, and a bare nested-type
-                // name (`Widget`) is invisible outside its own nesting. Top-level types qualify to
-                // just their name (no change). Fixes inference from `var x = NS.Widget(...)`.
-                let name = Self.qualifiedName(of: typeSym)
-                table.declaredType[sym.id] = name
-                inferred += 1
-                logger.log("[infer-init] \(sym.name)#\(sym.id) → \(name)", verbose: true)
-            } else if let composite = storableCompositeType(of: expr, in: scope) {
-                // `typeSymbol` names only LOCAL declarations, so a local whose initializer types to a
-                // COLLECTION / TUPLE string (`let xs = rows.filter { … }` → `[Row]`,
-                // `let pairs = zip(a, b)` → `[(A, B)]`) was left untyped, and every chain through it
-                // (`xs.first?.m`, a for-in over `pairs`) stayed un-renamed while the member declaration
-                // renamed — the desync class (B-FIX-75). The for-loop path (step 2) already stores such
-                // strings via `receiverTypeInfo`; this gives the initializer path the same reach, gated
-                // to the "chaseable composite" shapes so an external scalar (`URL`) is not persisted.
-                table.declaredType[sym.id] = composite
-                inferred += 1
-                logger.log("[infer-init-composite] \(sym.name)#\(sym.id) → \(composite)", verbose: true)
-            } else {
-                logger.log("[infer-init-fail] \(sym.name)#\(sym.id) — could not resolve init expr", verbose: true)
+        // 1. Initializer-driven inference, iterated to a FIXPOINT. A local whose initializer depends
+        //    on ANOTHER inferred local (`private let p = { let x = C().build(); return x }()` — the
+        //    IIFE's type IS x's type) resolves only once that other local is typed, and registration
+        //    order does not guarantee the dependency comes first (here the outer property `p` is
+        //    registered BEFORE the closure-local `x`). One pass typed `p` while `x` was still nil;
+        //    looping until nothing new resolves types `x` first, then `p` (B-FIX-92). A single pass is
+        //    the first iteration, so a non-dependent initializer is unaffected.
+        var progressed = true
+        while progressed {
+            progressed = false
+            for sym in table.symbols where table.declaredType[sym.id] == nil {
+                guard let expr = table.initializerExpr[sym.id], let scope = sym.scope else { continue }
+                if let typeSym = resolver.typeSymbol(of: expr, in: scope) {
+                    // Store the QUALIFIED name (`NS.Widget`), not the simple one: `declaredType` is a
+                    // string re-resolved later from a possibly-different scope, and a bare nested-type
+                    // name (`Widget`) is invisible outside its own nesting. Top-level types qualify to
+                    // just their name (no change). Fixes inference from `var x = NS.Widget(...)`.
+                    let name = Self.qualifiedName(of: typeSym)
+                    table.declaredType[sym.id] = name
+                    inferred += 1
+                    progressed = true
+                    logger.log("[infer-init] \(sym.name)#\(sym.id) → \(name)", verbose: true)
+                } else if let composite = storableCompositeType(of: expr, in: scope) {
+                    // `typeSymbol` names only LOCAL declarations, so a local whose initializer types to a
+                    // COLLECTION / TUPLE string (`let xs = rows.filter { … }` → `[Row]`,
+                    // `let pairs = zip(a, b)` → `[(A, B)]`) was left untyped, and every chain through it
+                    // (`xs.first?.m`, a for-in over `pairs`) stayed un-renamed while the member declaration
+                    // renamed — the desync class (B-FIX-75). The for-loop path (step 2) already stores such
+                    // strings via `receiverTypeInfo`; this gives the initializer path the same reach, gated
+                    // to the "chaseable composite" shapes so an external scalar (`URL`) is not persisted.
+                    table.declaredType[sym.id] = composite
+                    inferred += 1
+                    progressed = true
+                    logger.log("[infer-init-composite] \(sym.name)#\(sym.id) → \(composite)", verbose: true)
+                }
             }
         }
         // 2. For-loop variable inference: element type of the sequence.
