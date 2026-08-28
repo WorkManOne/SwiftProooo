@@ -26,14 +26,14 @@
 # Имя лучше делать совпадающим с реальным именем модуля Swift.
 module:
   - App:./App
-  # - Widget:./Widget
-  # - SharedKit:./SharedKit
+#  - Widget:./Widget
+#  - SharedKit:./SharedKit
 
 # Модули "только для чтения": из них берутся объявления (чтобы правильно
 # переименовать использования), но сами файлы НЕ трогаются. Обычно это
 # SPM-пакеты из DerivedData. Формат тот же — имя:путь.
-# readonly:
-#   - SomePackage:~/Library/Developer/Xcode/DerivedData/MyApp-abc/SourcePackages/checkouts/SomePackage
+#readonly:
+#  - SomePackage:~/Library/Developer/Xcode/DerivedData/MyApp-abc/SourcePackages/checkouts/SomePackage
 
 # ============================================================================
 #  2. ВЫВОД
@@ -41,16 +41,16 @@ module:
 
 # Куда положить ConversionMap.json + CoverageReport.txt (и отчёты --explain).
 # По умолчанию: ./out
-# output: ./out
+#output: ./out
 
 # Только отчёты, файлы НЕ переписывать. Удобно посмотреть, что будет сделано,
 # ничего не меняя. По умолчанию: false
-# dry-run: true
+#dry-run: true
 
 # Короткие читаемые имена (T0, m0, p0) вместо случайных 32-символьных токенов.
 # ТОЛЬКО для инспекции/отладки — в бою оставляйте выключенным.
 # По умолчанию: false
-# debug-names: true
+#debug-names: true
 
 # ============================================================================
 #  3. SDK / INTROSPECTION
@@ -58,21 +58,21 @@ module:
 
 # Имя SDK для интроспекции: iphonesimulator / iphoneos / macosx.
 # По умолчанию: iphonesimulator
-# sdk: iphonesimulator
+#sdk: iphonesimulator
 
 # Явный путь к корню SDK (перебивает автопоиск через xcrun). Обычно не нужен.
-# sdk-path: /Applications/Xcode.app/.../iPhoneSimulator.sdk
+#sdk-path: /Applications/Xcode.app/.../iPhoneSimulator.sdk
 
 # Отключить разбор .swiftinterface из SDK (быстрее ~на 30 секунд, но SwiftProf
 # меньше "знает" о протоколах фреймворков → чаще перестраховывается и меньше
 # обфусцирует). По умолчанию интроспекция ВКЛЮЧЕНА (значит здесь false).
-# no-sdk-introspect: true
+#no-sdk-introspect: true
 
 # Дополнительные модули SDK для интроспекции СВЕРХ набора по умолчанию и
 # автоопределённых импортов проекта. По умолчанию: пусто.
-# sdk-modules:
-#   - MapKit
-#   - QuickLook
+#sdk-modules:
+#  - MapKit
+#  - QuickLook
 
 # ============================================================================
 #  4. СПИСКИ ИСКЛЮЧЕНИЙ  (совместимы со SwiftShield)
@@ -80,20 +80,20 @@ module:
 
 # Имена, которые НИКОГДА не переименовывать. Пишите рядом ПОЧЕМУ — это ценно.
 # По умолчанию: пусто.
-# ignore-names:
-#   - AppDelegate       # зарегистрирован в Info.plist
-#   - SceneDelegate     # то же
-#   - GADApplicationIdentifier
+#ignore-names:
+#  - AppDelegate       # зарегистрирован в Info.plist
+#  - SceneDelegate     # то же
+#  - GADApplicationIdentifier
 
 # Фрагменты путей: файл, путь которого содержит любой фрагмент, пропускается.
 # По умолчанию: пусто.
-# ignore-files:
-#   - Generated/        # сгенерированный код
-#   - .pb.swift         # protobuf
+#ignore-files:
+#  - Generated/        # сгенерированный код
+#  - .pb.swift         # protobuf
 
 # Имена таргетов/модулей, которые не загружать вообще. По умолчанию: пусто.
-# ignore-targets:
-#   - LegacyKit
+#ignore-targets:
+#  - LegacyKit
 
 # ============================================================================
 #  5. ПАКЕТЫ / DerivedData  (удобства для Xcode-проектов)
@@ -101,10 +101,10 @@ module:
 
 # Автоматически найти SPM-пакеты в DerivedData для указанного имени
 # Xcode-проекта и добавить их как readonly-модули. По умолчанию: выключено.
-# auto-spm: MyApp
+#auto-spm: MyApp
 
 # Переопределить корень DerivedData (по умолчанию ~/Library/Developer/Xcode/DerivedData).
-# derived-data-path: /custom/DerivedData
+#derived-data-path: /custom/DerivedData
 
 # ============================================================================
 #  6. РЕЖИМЫ / ЗЕЛЁНАЯ СБОРКА
@@ -113,22 +113,41 @@ module:
 # Отключить RollbackPass — оставить все переименования, даже если какие-то
 # использования рассинхронизировались (быстрее, но сборка может покраснеть).
 # Только для отладки. По умолчанию RollbackPass ВКЛЮЧЁН (значит здесь false).
-# no-rollback: true
+#no-rollback: true
 
 # Обфусцировать ТОЛЬКО перечисленные виды символов. Пусто = все виды.
 # Помогает бисекцией найти, какой вид ломает сборку.
 # Допустимо: class, struct, enum, protocol, typealias, associatedtype,
 #            method, function, property, enumCase, parameter
 # По умолчанию: пусто (все).
-# kinds:
-#   - class
-#   - struct
+#kinds:
+#  - class
+#  - struct
 
 # Обфускация raw-значений String-энумов: off / safe / all.
 #   off  — не трогать (по умолчанию)
 #   safe — только явные литералы, пропуская Codable
 #   all  — каждый String-энум (материализует и неявные raw-значения)
-# raw-values: off
+#raw-values: off
+
+# Уровень защиты от Objective-C рантайма: strict / relaxed / off. Влияет ТОЛЬКО
+# на objc-мотивированные защиты — Codable-ключи, property-wrapper'ы, raw-энумы,
+# операторы и конформансы протоколов ей НЕ подчиняются.
+#   strict  — (по умолчанию) класс, помеченный @objc-подобным ИЛИ наследующий
+#             ObjC-корень (NSObject, UIView, ...), сохраняет ИМЯ и ВСЕ члены.
+#             На UIKit-проекте это почти каждый класс — главный источник
+#             недообфускации.
+#   relaxed — защищать члены только где экспозиция ОБЪЯВЛЕНА: @objc / @objcMembers
+#             / @IBDesignable класс, экспонирующий атрибут на члене (@objc,
+#             @IBOutlet, @IBAction, @NSManaged), #selector-имя, @objc extension,
+#             потомок NSManagedObject. Класс, помеченный только НАСЛЕДОВАНИЕМ,
+#             сохраняет ИМЯ (в storyboard он строка), а члены отдаёт под
+#             обфускацию. Безопасно с SE-0160; НЕ покрывает имя-строковый
+#             рефлекшн (KVC-ключи, ручные селекторы без #selector).
+#   off     — снять все objc-мотивированные защиты. Для проектов без имя-
+#             зависимостей от ObjC. НЕ для Core Data и storyboard.
+# По умолчанию: strict
+#objc-protection: relaxed
 
 # ============================================================================
 #  7. РЫЧАГИ ПОД ПЕРЕГРУЖЕННЫЕ ФУНКЦИИ  (обычно НЕ нужны — включайте по факту)
@@ -139,17 +158,17 @@ module:
 # Заранее пропускать переименование любой функции/метода, у которой в проекте
 # >1 одноимённого варианта. Полностью убирает риск рассинхрона перегрузок.
 # По умолчанию: false
-# skip-overloaded-callables: true
+#skip-overloaded-callables: true
 
 # Более агрессивная страховка RollbackPass для проектов с обилием перегрузок.
 # По умолчанию: false
-# aggressive-rollback: true
+#aggressive-rollback: true
 
 # Переименовывать обращение к члену ПО ИМЕНИ, когда имя объявлено в проекте ровно
 # один раз и принадлежит расширению внешнего типа, а тип получателя вычислить
 # нельзя (идиома SwiftUI: extension View { func myModifier() -> some View }).
 # По умолчанию: true. Выключите, чтобы локализовать причину красной сборки.
-# unique-external-members: false
+#unique-external-members: false
 
 # ============================================================================
 #  8. СЛОЙ ИНДЕКСА КОМПИЛЯТОРА  (опционально; точность на больших проектах)
@@ -161,13 +180,13 @@ module:
 
 # Путь к индексу (DataStore). Обычно это DerivedData вашего проекта.
 # Fail-closed: отсутствующий/устаревший индекс — явная ошибка, а не догадки.
-# index-store-path: ~/Library/Developer/Xcode/DerivedData/MyApp-abc/Index.noindex/DataStore
+#index-store-path: ~/Library/Developer/Xcode/DerivedData/MyApp-abc/Index.noindex/DataStore
 
 # Строгий гейт A5: пропускать переименование символов, у которых нет USR в
 # индексе. По умолчанию ВЫКЛ — на реальных проектах индекс неполный, и гейт
 # сильно роняет покрытие без выигрыша в безопасности. Только для отладки
 # красной сборки или максимально-параноидального релиза. По умолчанию: false
-# index-store-gate: true
+#index-store-gate: true
 
 # ============================================================================
 #  9. ОТЧЁТНОСТЬ / ЛОГИ
@@ -177,7 +196,7 @@ module:
 # каждого объявления — почему оно обфусцировано / защищено / пропущено /
 # откачено. Полезно ответить "почему X не переименовался?". На больших
 # проектах файл большой. По умолчанию: false
-# explain: true
+#explain: true
 
 # Подробный лог в stderr. По умолчанию: false
-# verbose: true
+#verbose: true
