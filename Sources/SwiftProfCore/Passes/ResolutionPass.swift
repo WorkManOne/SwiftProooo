@@ -153,11 +153,12 @@ public final class ResolutionPass {
                    && projectNames.contains(site.name) {
                     if covered.contains(site.offset), let tid = indexTargets[site.offset] {
                         log.record(UseSiteRecord(filePath: file.url.path, offset: site.offset,
-                                                 name: site.name,
+                                                 name: site.name, position: site.position,
                                                  outcome: .rewritten(targetSymbolId: tid)))
                     } else {
                         log.record(UseSiteRecord(
                             filePath: file.url.path, offset: site.offset, name: site.name,
+                            position: site.position,
                             outcome: .kept(cause: .noDecision, receiver: nil, candidateIds: [])))
                     }
                 }
@@ -442,23 +443,26 @@ private final class ResolutionVisitor: SyntaxVisitor {
         // two contradicting records at one source position.
         guard useSiteLog != nil, cause != .candidateHasNoObf else { return }
         let offset = token.positionAfterSkippingLeadingTrivia.utf8Offset
+        let position = UseSitePosition.classify(token)
         // The index-driven emitter renamed this position, so the syntactic decline is not what
         // happened here: record the rewrite the index made, not a `receiver-untyped` survivor.
         if let tid = indexTargetByOffset[offset], indexCoveredOffsets.contains(offset) {
-            recordUseSite(name: name, offset: offset, outcome: .rewritten(targetSymbolId: tid))
+            recordUseSite(name: name, offset: offset, position: position,
+                          outcome: .rewritten(targetSymbolId: tid))
             return
         }
-        recordUseSite(name: name, offset: offset,
+        recordUseSite(name: name, offset: offset, position: position,
                       outcome: .kept(cause: cause, receiver: receiver, candidateIds: candidateIds))
     }
 
     /// The ONE place a use-site becomes a record. Costs nothing when `useSiteLog` is nil.
-    func recordUseSite(name: String, offset: Int, outcome: UseSiteRecord.Outcome) {
+    func recordUseSite(name: String, offset: Int, position: UseSitePosition,
+                       outcome: UseSiteRecord.Outcome) {
         guard let log = useSiteLog else { return }
         recordedOffsets.insert(offset)
         guard projectNames.contains(name) else { return }
         log.record(UseSiteRecord(filePath: file.url.path, offset: offset,
-                                 name: name, outcome: outcome))
+                                 name: name, position: position, outcome: outcome))
     }
 
     /// Report a `LookupOutcome` that carries a cause. Returns the outcome's symbol so call sites
@@ -979,6 +983,7 @@ private final class ResolutionVisitor: SyntaxVisitor {
         if useSiteLog != nil {
             recordUseSite(name: stripBackticks(token.text),
                           offset: token.positionAfterSkippingLeadingTrivia.utf8Offset,
+                          position: UseSitePosition.classify(token),
                           outcome: obf != nil ? .rewritten(targetSymbolId: target.id)
                                               : .resolvedNotRenamed(targetSymbolId: target.id))
         }

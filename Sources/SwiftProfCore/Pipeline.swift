@@ -181,6 +181,8 @@ public struct PipelineResult {
     /// What `RollbackPass` observed: reverted vs. shield-blocked survivors and which shields
     /// claimed them. `.empty` when `--no-rollback` disabled the pass.
     public let rollback: RollbackResult
+    /// Use-site resolution summary (position -> cause). nil unless `--explain` was on.
+    public let useSiteReport: UseSiteReport?
 }
 
 public enum PipelineError: Error, CustomStringConvertible {
@@ -421,6 +423,7 @@ public final class Pipeline {
         let coverage = CoverageReport(table: table, map: map, protector: protector)
         try coverage.write(to: options.outputDirectory.appendingPathComponent("CoverageReport.txt"))
 
+        var useSiteReport: UseSiteReport? = nil
         if options.explain {
             let decisions = DecisionReport(table: table, map: map, protector: protector,
                                            plannerSkip: planner.skipReason,
@@ -440,11 +443,23 @@ public final class Pipeline {
                 .write(to: options.outputDirectory.appendingPathComponent("Decisions-files.txt"),
                        atomically: true, encoding: .utf8)
             logger.log("wrote decisions for \(decisions.byFile.count) files (--explain)")
+
+            let report = UseSiteReport(records: useSiteLog?.records ?? [], table: table,
+                                       map: map, protector: protector,
+                                       plannerSkip: planner.skipReason)
+            try report.formatted(identity: .real)
+                .write(to: options.outputDirectory.appendingPathComponent("UseSiteReport.txt"),
+                       atomically: true, encoding: .utf8)
+            try report.formatted(identity: .anonymized)
+                .write(to: options.outputDirectory.appendingPathComponent("UseSiteReport-anon.txt"),
+                       atomically: true, encoding: .utf8)
+            useSiteReport = report
         }
 
         return PipelineResult(project: project, table: table, renameMap: map,
                               renames: renames, coverage: coverage,
                               useSites: useSiteLog?.records ?? [],
-                              rollback: rollbackResult)
+                              rollback: rollbackResult,
+                              useSiteReport: useSiteReport)
     }
 }

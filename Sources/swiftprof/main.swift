@@ -196,6 +196,9 @@ struct Obfuscate: ParsableCommand {
         )
         let result = try Pipeline(options: options, logger: logger).run()
         FileHandle.standardOutput.write(Data(result.coverage.formatted().utf8))
+        if let useSiteReport = result.useSiteReport {
+            FileHandle.standardOutput.write(Data(("\n" + useSiteReport.formatted(identity: .real)).utf8))
+        }
     }
 
     private func parseRawValueMode(_ s: String) throws -> RawValueMode {

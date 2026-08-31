@@ -2661,6 +2661,139 @@ final class PatternTests: XCTestCase {
         entries.first { $0.name == name && $0.role == "declaration" }
     }
 
+    // MARK: - Use-site position classification
+
+    private func runUseSites(_ source: String) throws -> [UseSiteRecord] {
+        let tempRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SwiftProf-\(UUID().uuidString)")
+        let moduleRoot = tempRoot.appendingPathComponent("M")
+        try FileManager.default.createDirectory(at: moduleRoot, withIntermediateDirectories: true)
+        try source.write(to: moduleRoot.appendingPathComponent("Sample.swift"),
+                         atomically: true, encoding: .utf8)
+        let options = PipelineOptions(
+            modules: [ModuleSpec(name: "M", root: moduleRoot, writable: true)],
+            outputDirectory: tempRoot.appendingPathComponent("out"), dryRun: false,
+            nameStyle: .debug, introspectSDK: false, explain: true)
+        return try Pipeline(options: options, logger: StderrLogger(verbose: false)).run().useSites
+    }
+
+    func testUseSitePosition_classifiesEachShape() throws {
+        let records = try runUseSites("""
+        struct Widget {
+            var title: Int
+            func render() {}
+        }
+        func drive(w: Widget) {
+            w.render()
+            _ = w.title
+        }
+        func make() -> Widget { Widget(title: 1) }
+        func mystery(x: Unknown) { x.render() }
+        """)
+        func has(_ name: String, _ position: UseSitePosition,
+                 where pred: (UseSiteRecord.Outcome) -> Bool) -> Bool {
+            records.contains { $0.name == name && $0.position == position && pred($0.outcome) }
+        }
+        // member-access, resolved method call
+        XCTAssertTrue(has("render", .memberAccess) { if case .rewritten = $0 { return true }; return false })
+        // member-access, unresolved receiver (x: Unknown)
+        XCTAssertTrue(has("render", .memberAccess) {
+            if case .kept(.receiverUntyped, _, _) = $0 { return true }; return false })
+        // type-reference: `Widget` in `w: Widget` / `-> Widget`
+        XCTAssertTrue(records.contains { $0.name == "Widget" && $0.position == .typeReference })
+        // bare-call: the constructor `Widget(title:)`
+        XCTAssertTrue(records.contains { $0.name == "Widget" && $0.position == .bareCall })
+    }
+
+    // MARK: - Use-site report
+
+    private func runUseSiteReport(_ source: String) throws -> UseSiteReport {
+        let tempRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SwiftProf-\(UUID().uuidString)")
+        let moduleRoot = tempRoot.appendingPathComponent("M")
+        try FileManager.default.createDirectory(at: moduleRoot, withIntermediateDirectories: true)
+        try source.write(to: moduleRoot.appendingPathComponent("Sample.swift"),
+                         atomically: true, encoding: .utf8)
+        let options = PipelineOptions(
+            modules: [ModuleSpec(name: "M", root: moduleRoot, writable: true)],
+            outputDirectory: tempRoot.appendingPathComponent("out"), dryRun: false,
+            nameStyle: .debug, introspectSDK: false, explain: true)
+        let result = try Pipeline(options: options, logger: StderrLogger(verbose: false)).run()
+        return try XCTUnwrap(result.useSiteReport)
+    }
+
+    func testUseSiteReport_bucketsByPositionCauseAndKind() throws {
+        // `ping` is the unresolved-receiver member — kept a distinct name from the resolved
+        // `render`/`title`, so RollbackPass reverting the surviving `ping` does not revert them.
+        let report = try runUseSiteReport("""
+        struct Widget {
+            var title: Int
+            func render() {}
+        }
+        struct Gadget { func ping() {} }
+        func drive(w: Widget) {
+            w.render()
+            _ = w.title
+        }
+        func mystery(x: Unknown) { x.ping() }
+        """)
+        XCTAssertGreaterThan(report.totalRewritten, 0)
+        let member = try XCTUnwrap(report.positions.first { $0.position == .memberAccess })
+        // rewritten split by kind: a method (render) and a property (title)
+        let kinds = Dictionary(uniqueKeysWithValues: member.rewrittenByKind.map { ($0.kind, $0.count) })
+        XCTAssertGreaterThanOrEqual(kinds["method"] ?? 0, 1)
+        XCTAssertGreaterThanOrEqual(kinds["property"] ?? 0, 1)
+        // the unresolved receiver shows up as a precise receiver-untyped cause naming `ping`
+        let untyped = try XCTUnwrap(member.causes.first { $0.cause == .receiverUntyped })
+        XCTAssertTrue(untyped.topNames.contains { $0.name == "ping" })
+    }
+
+    func testUseSiteReport_formattedRealAndAnon() throws {
+        let report = try runUseSiteReport("""
+        struct Widget { func render() {} }
+        func drive(w: Widget) { w.render() }
+        func mystery(x: Unknown) { x.render() }
+        """)
+        let real = report.formatted(identity: .real)
+        XCTAssertTrue(real.contains("=== Use-site resolution ==="))
+        XCTAssertTrue(real.contains("member-access"))
+        XCTAssertTrue(real.contains("render"))          // real names present
+        let anon = report.formatted(identity: .anonymized)
+        XCTAssertTrue(anon.contains("member-access"))   // engine vocabulary stays
+        XCTAssertTrue(anon.contains("receiver-untyped"))
+        XCTAssertFalse(anon.contains("render"))         // every project name hashed
+    }
+
+    /// Drift guard: `UseSiteReport.bucket` and `DecisionReport`'s use-site loop each classify a
+    /// record's outcome. Pin their totals to agree so the two representations cannot drift.
+    func testUseSiteReport_reconcilesWithDecisionReport() throws {
+        let source = """
+        struct Widget {
+            var title: Int
+            func render() {}
+            static func == (a: Widget, b: Widget) -> Bool { a.title == b.title }
+        }
+        struct Gadget { func ping() {} }
+        func drive(w: Widget) {
+            w.render()
+            _ = w.title
+        }
+        func mystery(x: Unknown) { x.ping() }
+        func make() -> Widget { Widget(title: 1) }
+        """
+        let report = try runUseSiteReport(source)
+        let entries = try runDecisions(source).filter { $0.role == "use-site" }
+
+        let decisionRewritten = entries.filter { $0.decision == "rewritten" && $0.reason != "reverted" }.count
+        let decisionReverted = entries.filter { $0.decision == "rewritten" && $0.reason == "reverted" }.count
+        let decisionKept = entries.filter { $0.decision == "kept" }.count
+
+        XCTAssertEqual(report.totalRewritten, decisionRewritten)
+        XCTAssertEqual(report.totalReverted, decisionReverted)
+        XCTAssertEqual(report.totalKept, decisionKept)
+        XCTAssertEqual(report.totalUseSites, entries.count)
+    }
+
     func testDecisionReport_obfuscatedProtectedSkipped() throws {
         let entries = try runDecisions("""
         struct Vec {

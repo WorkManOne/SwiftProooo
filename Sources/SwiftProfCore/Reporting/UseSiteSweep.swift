@@ -12,7 +12,7 @@ import SwiftSyntax
 /// resolver's traversal decisions, so its list is the ground truth the resolver's records are
 /// diffed against.
 final class UseSiteSweep: SyntaxVisitor {
-    private(set) var sites: [(name: String, offset: Int)] = []
+    private(set) var sites: [(name: String, offset: Int, position: UseSitePosition)] = []
 
     init() { super.init(viewMode: .sourceAccurate) }
 
@@ -44,6 +44,7 @@ final class UseSiteSweep: SyntaxVisitor {
     private func add(_ token: TokenSyntax) {
         guard case .identifier = token.tokenKind else { return }
         sites.append((TypeResolver.stripBackticks(token.text),
-                      token.positionAfterSkippingLeadingTrivia.utf8Offset))
+                      token.positionAfterSkippingLeadingTrivia.utf8Offset,
+                      UseSitePosition.classify(token)))
     }
 }
