@@ -6,7 +6,7 @@ struct SwiftProfCLI: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "swiftprof",
         abstract: "Swift identifier obfuscator (SwiftSyntax-based).",
-        subcommands: [Obfuscate.self],
+        subcommands: [Obfuscate.self, Deobfuscate.self],
         defaultSubcommand: Obfuscate.self
     )
 }

@@ -6,9 +6,14 @@ Package.resolved
 out/
 Temp.swift
 
+# Built binary copied next to the scripts for easy manual runs (obfuscate.sh / deobfuscate.sh)
+/swiftprof/
+
 # Not tracked: docs/reports and the large end-to-end sample-app fixtures (kept on
 # disk for manual CLI runs; the automated SwiftProfCoreTests suite does not use them).
 *.docx
+# ...except the user-facing obfuscation/deobfuscation manual, which IS tracked.
+!/SwiftProf_Obfuscation_Manual.docx
 /docs/
 
 /propertyReports/
@@ -22,3 +27,6 @@ Temp.swift
 /Tests/IceTrays/
 /Tests/IceTrays1/
 /Tests/PullTheTicket/
+
+# Built historical swiftprof binaries for the use-site impact runner
+/tools/use-site-impact/bin/
